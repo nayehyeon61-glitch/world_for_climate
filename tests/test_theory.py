@@ -193,5 +193,11 @@ def test_hybrid_program_explains_trains_and_transfers():
     assert "phys_share" in se and len(se["phys_usage"]["per_shell"]) == 3
     tr = transfer.analog_transfer(model, pairs, ex, transfer.find_analogs(pairs, 12.0), batch_size=3)
     assert all(math.isfinite(v) for v in tr.values() if isinstance(v, float))
-    assert "physics codes" in transfer.markdown({"experiment": "t", "lead_hours": 6.0,
-                                                  "self_explainability": se, "analog_transfer": tr})
+    # intervention tests: forcing counterfactual and family knock-outs
+    ca = transfer.causal_tests(model, pairs, ex, lat, 0, -1.5, {"t2m": 0}, batch_size=3)
+    assert set(ca["knockout"]) == {"radiation", "mixing", "surface"}
+    assert "t2m" in ca["counterfactual"]["decoded_channel_change"]
+    assert math.isfinite(ca["counterfactual"]["effect"]["all"])
+    md = transfer.markdown({"experiment": "t", "lead_hours": 6.0, "self_explainability": se,
+                            "analog_transfer": tr, "causal": ca})
+    assert "physics codes" in md and "knocked-out family" in md

@@ -28,6 +28,7 @@ import torch
 from torch import Tensor
 
 from ..models.latent import Latent
+from ..models.physics_codes import FAMILIES, code_family
 from ..models.world_model import ClimateWorldModel
 
 
@@ -306,6 +307,110 @@ def length_ood(model: ClimateWorldModel, pairs_long: PairSet, steps: Sequence[in
     return out
 
 
+def _family_used(exp: Explained, family: int, num_codes: int) -> Tensor:
+    """[N, S, P] mask: the selected program of the patch uses a code of `family`."""
+    k = torch.arange(exp.phys_indices.shape[0])[:, None, None, None]
+    active = (k < exp.lengths[None]) & (code_family(exp.phys_indices, num_codes) == family)
+    return active.any(0)
+
+
+def _by_region(x: Tensor, patch_lat: Optional[Tensor]) -> Dict[str, object]:
+    """Means of a [N, S, P] field: overall, per shell and tropics vs extratropics."""
+    out = {"all": float(x.mean()), "per_shell": [float(v) for v in x.mean((0, 2))]}
+    if patch_lat is not None:
+        tropics = patch_lat.abs() < 23.5
+        if tropics.any() and (~tropics).any():
+            out["tropics"] = float(x[..., tropics].mean())
+            out["extratropics"] = float(x[..., ~tropics].mean())
+    return out
+
+
+@torch.no_grad()
+def causal_tests(model: ClimateWorldModel, pairs: PairSet, exp: Explained,
+                 patch_lat: Optional[Tensor], forcing_channel: int, forcing_value: float,
+                 report_channels: Dict[str, int], device="cpu", batch_size: int = 4
+                 ) -> Dict[str, object]:
+    """Intervention tests on the inferred programs (phase 2 models only).
+
+    counterfactual   re-executes every pair's own program with forcing channel
+                     `forcing_channel` set to `forcing_value` (e.g. TOA solar
+                     radiation = night); only codes that read the forcing can
+                     respond, so the effect should sit on patches that used
+                     radiation or surface codes, and the decoded change of the
+                     channels in `report_channels` (e.g. 2 m temperature) gives
+                     the sign of the learned response.
+    knockout         sets one physics family to the identity and measures how
+                     much the explanation error grows (necessity of the family),
+                     overall, per shell and tropics vs extratropics.
+    """
+    th, graphs = model.theory, model.graphs
+    if th.physics is None or exp.phys_indices is None:
+        return {}
+    n = len(pairs)
+    fact_loss, cf_effect, cf_chan, ko_loss = [], [], {}, {f: [] for f in range(len(FAMILIES))}
+    ko_err = {f: [] for f in range(len(FAMILIES))}
+    fact_err = []
+    for b in range(0, n, batch_size):
+        ii = torch.arange(b, min(b + batch_size, n))
+        sub = pairs.subset(ii)
+        s, s_y = _to(sub.s, device), _to(sub.s_y, device)
+        nf, target = sub.nf.to(device), sub.target.to(device)
+        ns = None if sub.ns is None else sub.ns.to(device)
+        prog, lens = exp.program[:, ii].to(device), exp.lengths[ii].to(device)
+        phys = exp.phys_indices[:, ii].to(device)
+        z_fact = th.execute(graphs, s, prog, lens, phys, nf, ns)
+        pred_fact = model.decode(z_fact)
+        fact_loss.append(torch.stack([model.loss_fn(pred_fact[j:j + 1], target[j:j + 1])
+                                      for j in range(len(ii))]).cpu())
+        fact_err.append(th._patch_error(graphs, z_fact, s_y).cpu())
+        # counterfactual forcing
+        nf_cf = nf.clone()
+        nf_cf[..., forcing_channel] = forcing_value
+        z_cf = th.execute(graphs, s, prog, lens, phys, nf_cf, ns)
+        cf_effect.append(th._patch_error(graphs, z_cf, z_fact).cpu())
+        diff = (model.decode(z_cf) - pred_fact).mean((-2, -1)).cpu()  # [B, C]
+        for name, c in report_channels.items():
+            cf_chan.setdefault(name, []).append(diff[:, c])
+        # family knock-outs
+        fam = code_family(phys, th.cfg.physics_codes)
+        for f in range(len(FAMILIES)):
+            z_ko = th.execute(graphs, s, prog, lens, torch.where(fam == f, torch.zeros_like(phys), phys),
+                              nf, ns)
+            pred_ko = model.decode(z_ko)
+            ko_loss[f].append(torch.stack([model.loss_fn(pred_ko[j:j + 1], target[j:j + 1])
+                                           for j in range(len(ii))]).cpu())
+            ko_err[f].append(th._patch_error(graphs, z_ko, s_y).cpu())
+    fact_loss, fact_err = torch.cat(fact_loss), torch.cat(fact_err)
+    effect = torch.cat(cf_effect)  # [N, S, P] latent effect of the intervention
+    out: Dict[str, object] = {
+        "loss_factual_replay": float(fact_loss.mean()),
+        "counterfactual": {
+            "forcing_channel": forcing_channel, "forcing_value": forcing_value,
+            "effect": _by_region(effect, patch_lat),
+            "effect_where_family_used": {},
+            "decoded_channel_change": {k: float(torch.cat(v).mean()) for k, v in cf_chan.items()},
+        },
+        "knockout": {},
+    }
+    any_phys = torch.zeros_like(effect, dtype=torch.bool)
+    for f, name in enumerate(FAMILIES):
+        used = _family_used(exp, f, th.cfg.physics_codes)
+        any_phys |= used
+        if used.any():
+            out["counterfactual"]["effect_where_family_used"][name] = float(effect[used].mean())
+    if (~any_phys).any():
+        out["counterfactual"]["effect_where_family_used"]["none"] = float(effect[~any_phys].mean())
+    for f, name in enumerate(FAMILIES):
+        loss_ko = torch.cat(ko_loss[f])
+        err_ko = torch.cat(ko_err[f])
+        out["knockout"][name] = {
+            "loss_increase": float((loss_ko - fact_loss).mean()),
+            "loss_increase_pct": float(100 * ((loss_ko - fact_loss) / fact_loss.clamp_min(1e-8)).mean()),
+            "patch_error_increase": _by_region(err_ko - fact_err, patch_lat),
+        }
+    return out
+
+
 def markdown(results: Dict[str, object]) -> str:
     se, tr = results["self_explainability"], results.get("analog_transfer", {})
     lines = [f"**{results.get('experiment', '')}** — {se['pairs']} pairs at {results['lead_hours']:.0f} h",
@@ -345,6 +450,25 @@ def markdown(results: Dict[str, object]) -> str:
                   f"persistence on {100 * tr['win_vs_persistence']:.0f}%, a random program on "
                   f"{100 * tr['win_vs_random']:.0f}%; gain vs oracle: transfer {tr['transfer_gain']:.3f}, "
                   f"delta {tr['delta_gain']:.3f}"]
+    ca = results.get("causal")
+    if ca:
+        cf, ko = ca["counterfactual"], ca["knockout"]
+        lines += ["", f"Intervention tests (factual replay loss {ca['loss_factual_replay']:.4f}):", "",
+                  f"- counterfactual forcing (channel {cf['forcing_channel']} := {cf['forcing_value']:.2f}): "
+                  f"latent effect {cf['effect']['all']:.2e} overall"
+                  + (f", tropics {cf['effect']['tropics']:.2e} / extratropics {cf['effect']['extratropics']:.2e}"
+                     if "tropics" in cf["effect"] else "")
+                  + "; where a family was used: "
+                  + ", ".join(f"{k} {v:.2e}" for k, v in cf["effect_where_family_used"].items())
+                  + "; decoded change: "
+                  + ", ".join(f"{k} {v:+.4f}" for k, v in cf["decoded_channel_change"].items()),
+                  "", "| knocked-out family | loss increase | % | patch error increase: tropics / extratropics | per shell (surface → top) |",
+                  "|---|---|---|---|---|"]
+        for name, v in ko.items():
+            pe = v["patch_error_increase"]
+            region = (f"{pe['tropics']:.2e} / {pe['extratropics']:.2e}" if "tropics" in pe else "–")
+            lines.append(f"| {name} | {v['loss_increase']:+.4f} | {v['loss_increase_pct']:+.2f}% | {region} | "
+                         + ", ".join(f"{x:.1e}" for x in pe["per_shell"]) + " |")
     ood = results.get("length_ood")
     if ood:
         lines += ["", f"Length OOD ({ood['lead_hours']:.0f} h pairs):", "",

@@ -69,6 +69,16 @@ def main():
     analogs = transfer.find_analogs(pairs, 24.0 * args.min_gap_days)
     results["analog_transfer"] = transfer.analog_transfer(model, pairs, exp, analogs,
                                                           args.device, args.batch_size)
+    if th.physics is not None:  # intervention tests: TOA solar radiation := 0 (night), family knock-outs
+        mean, std = stats.arrays(layout.forcings)
+        tisr = [i for i, c in enumerate(layout.forcings) if c.name == "toa_incident_solar_radiation"]
+        report = {c.name: i for i, c in enumerate(layout.targets)
+                  if c.name in ("2m_temperature", "mean_sea_level_pressure")}
+        if tisr:
+            night = float(-mean[tisr[0]] / std[tisr[0]])
+            print(f"[causal] counterfactual TISR = 0 (normalised {night:.2f}); knock-outs")
+            results["causal"] = transfer.causal_tests(model, pairs, exp, patch_lat, tisr[0], night,
+                                                      report, args.device, args.batch_size)
     pairs12 = transfer.collect_pairs(model, val_ds, indices, 1, args.device, args.batch_size, print)
     steps = args.ood_steps or [th.cfg.max_steps, 2 * th.cfg.max_steps]
     results["length_ood"] = transfer.length_ood(model, pairs12, steps, args.device,
