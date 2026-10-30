@@ -1,0 +1,116 @@
+{
+ "experiment": "wb2_64x32_pyramid_noskip",
+ "checkpoint": "/tmp/claude-0/-home-claude/8817c18a-98ff-5ca4-b084-959138521b1a/scratchpad/runs/pyramid_noskip/checkpoint.pt",
+ "levels": [
+  1
+ ],
+ "rot_levels": [
+  0,
+  1
+ ],
+ "pairs": 183,
+ "energy": {
+  "levels": [
+   {
+    "level": 0,
+    "patches": 12,
+    "energy": 0.00041904006502591074,
+    "share": 0.569778218322629,
+    "rms_deg": 1.1728714278966785,
+    "tropics": 0.00018152667325921357,
+    "midlat": 0.0006565534276887774,
+    "polar": NaN,
+    "by_shell": {
+     "surface": 0.0012665209360420704,
+     "boundary_layer": 0.00039921567076817155,
+     "lower_troposphere": 0.00025274622021242976,
+     "upper_troposphere": 9.197191684506834e-05,
+     "stratosphere": 8.47455594339408e-05
+    }
+   },
+   {
+    "level": 1,
+    "patches": 42,
+    "energy": 0.0003164040972478688,
+    "share": 0.4302217803176485,
+    "rms_deg": 1.0191630780277694,
+    "tropics": 0.00017887164722196758,
+    "midlat": 0.00037560140481218696,
+    "polar": 0.0005514095537364483,
+    "by_shell": {
+     "surface": 0.0009664728422649205,
+     "boundary_layer": 0.0001863579818746075,
+     "lower_troposphere": 0.00017253516125492752,
+     "upper_troposphere": 0.00011753787839552388,
+     "stratosphere": 0.00013911660062149167
+    }
+   }
+  ],
+  "monotone": true,
+  "fine_midlat_over_tropics": 2.099837568701378
+ },
+ "transfer": {
+  "pairs": 183,
+  "coarse_levels": [
+   0
+  ],
+  "fine_level": 1,
+  "loss_persistence": 1.344496250152588,
+  "latent_persistence": 0.010881810449063778,
+  "levels_persistence": [
+   0.010881810449063778
+  ],
+  "loss_own": 1.3425170183181763,
+  "latent_own": 0.010691524483263493,
+  "levels_own": [
+   0.010691524483263493
+  ],
+  "loss_all": 1.3425484895706177,
+  "latent_all": 0.010707703419029713,
+  "levels_all": [
+   0.010707703419029713
+  ],
+  "gain_all": 0.5078223347663879,
+  "win_all": 0.8961748480796814,
+  "loss_coarse": 1.3425363302230835,
+  "latent_coarse": 0.010692110285162926,
+  "levels_coarse": [
+   0.010692110285162926
+  ],
+  "gain_coarse": 0.5570061802864075,
+  "win_coarse": 0.9289617538452148,
+  "loss_fine": 1.3424944877624512,
+  "latent_fine": 0.010698644444346428,
+  "levels_fine": [
+   0.010698644444346428
+  ],
+  "gain_fine": 0.5398908257484436,
+  "win_fine": 0.9071038365364075,
+  "loss_random_all": 1.3426872491836548,
+  "latent_random_all": 0.010703743435442448,
+  "levels_random_all": [
+   0.010703743435442448
+  ],
+  "gain_random_all": 0.7522448897361755,
+  "win_random_all": 0.9234972596168518,
+  "loss_random_coarse": 1.342637300491333,
+  "latent_random_coarse": 0.010688433423638344,
+  "levels_random_coarse": [
+   0.010688433423638344
+  ],
+  "gain_random_coarse": 0.6576510667800903,
+  "win_random_coarse": 0.9289617538452148,
+  "loss_random_fine": 1.3425010442733765,
+  "latent_random_fine": 0.010689834132790565,
+  "levels_random_fine": [
+   0.010689834132790565
+  ],
+  "gain_random_fine": 0.890160083770752,
+  "win_random_fine": 0.9289617538452148,
+  "gain_own": 1.0,
+  "explained_fraction_own": 0.017283111810684204,
+  "coarse_gap": -0.10064488649368286,
+  "fine_gap": -0.35026925802230835,
+  "all_gap": -0.2444225549697876
+ }
+}

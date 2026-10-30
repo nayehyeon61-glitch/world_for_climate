@@ -1,0 +1,153 @@
+{
+ "experiment": "wb2_64x32_pyramid",
+ "checkpoint": "/tmp/claude-0/-home-claude/8817c18a-98ff-5ca4-b084-959138521b1a/scratchpad/runs/pyramid_P/checkpoint.pt",
+ "levels": [
+  1,
+  2,
+  3
+ ],
+ "rot_levels": [
+  0,
+  1,
+  2
+ ],
+ "pairs": 183,
+ "energy": {
+  "levels": [
+   {
+    "level": 0,
+    "patches": 12,
+    "energy": 4.8044606955954805e-05,
+    "share": 0.03215872096245806,
+    "rms_deg": 0.39714121014927023,
+    "tropics": 4.16060647694394e-05,
+    "midlat": 5.4483156418427825e-05,
+    "polar": NaN,
+    "by_shell": {
+     "surface": 8.647816866869107e-05,
+     "boundary_layer": 6.242255039978772e-05,
+     "lower_troposphere": 2.8634280170081183e-05,
+     "upper_troposphere": 3.9241855120053515e-05,
+     "stratosphere": 2.3446222257916816e-05
+    }
+   },
+   {
+    "level": 1,
+    "patches": 42,
+    "energy": 2.5403192921658047e-05,
+    "share": 0.017003660649612982,
+    "rms_deg": 0.28877978293812817,
+    "tropics": 2.2013562556821853e-05,
+    "midlat": 2.377213240833953e-05,
+    "polar": 4.046525646117516e-05,
+    "by_shell": {
+     "surface": 2.9459537472575903e-05,
+     "boundary_layer": 2.9890998121118173e-05,
+     "lower_troposphere": 1.4315471162262838e-05,
+     "upper_troposphere": 2.6355624868301675e-05,
+     "stratosphere": 2.69943102466641e-05
+    }
+   },
+   {
+    "level": 2,
+    "patches": 162,
+    "energy": 0.0014205359620973468,
+    "share": 0.9508376177185777,
+    "rms_deg": 2.159477825029285,
+    "tropics": 0.000691502180416137,
+    "midlat": 0.0022520506754517555,
+    "polar": 0.002101246500387788,
+    "by_shell": {
+     "surface": 0.0008971185889095068,
+     "boundary_layer": 0.0013379727024585009,
+     "lower_troposphere": 0.0008680202881805599,
+     "upper_troposphere": 0.0033038021065294743,
+     "stratosphere": 0.0006957653677091002
+    }
+   }
+  ],
+  "monotone": false,
+  "fine_midlat_over_tropics": 3.2567513729262587
+ },
+ "transfer": {
+  "pairs": 183,
+  "coarse_levels": [
+   0,
+   1
+  ],
+  "fine_level": 2,
+  "loss_persistence": 0.8796679973602295,
+  "latent_persistence": 0.0406939871609211,
+  "levels_persistence": [
+   0.010294351726770401,
+   0.00731457257643342,
+   0.05110559239983559
+  ],
+  "loss_own": 0.7716839909553528,
+  "latent_own": 0.03317311778664589,
+  "levels_own": [
+   0.010227750986814499,
+   0.007562041748315096,
+   0.04113682359457016
+  ],
+  "loss_all": 0.7988149523735046,
+  "latent_all": 0.03566023334860802,
+  "levels_all": [
+   0.010229313746094704,
+   0.007801418658345938,
+   0.04435373470187187
+  ],
+  "gain_all": 0.6583734154701233,
+  "win_all": 1.0,
+  "loss_coarse": 0.7721433639526367,
+  "latent_coarse": 0.03323304280638695,
+  "levels_coarse": [
+   0.010229313746094704,
+   0.007572385016828775,
+   0.04121307656168938
+  ],
+  "gain_coarse": 0.9916933178901672,
+  "win_coarse": 1.0,
+  "loss_fine": 0.7983526587486267,
+  "latent_fine": 0.035650499165058136,
+  "levels_fine": [
+   0.010227750986814499,
+   0.007805353961884975,
+   0.044340018182992935
+  ],
+  "gain_fine": 0.6596819758415222,
+  "win_fine": 1.0,
+  "loss_random_all": 0.8118211030960083,
+  "latent_random_all": 0.03658108785748482,
+  "levels_random_all": [
+   0.010228229686617851,
+   0.007856053300201893,
+   0.04555349051952362
+  ],
+  "gain_random_all": 0.5303917527198792,
+  "win_random_all": 1.0,
+  "loss_random_coarse": 0.7723808288574219,
+  "latent_random_coarse": 0.03325876221060753,
+  "levels_random_coarse": [
+   0.010228229686617851,
+   0.007580602541565895,
+   0.04124496504664421
+  ],
+  "gain_random_coarse": 0.9883377552032471,
+  "win_random_coarse": 1.0,
+  "loss_random_fine": 0.8110736012458801,
+  "latent_random_fine": 0.03655587136745453,
+  "levels_random_fine": [
+   0.010227750986814499,
+   0.00785577017813921,
+   0.0455203540623188
+  ],
+  "gain_random_fine": 0.5338099598884583,
+  "win_random_fine": 1.0,
+  "gain_own": 1.0,
+  "explained_fraction_own": 0.18296919763088226,
+  "coarse_gap": 0.003355562686920166,
+  "fine_gap": 0.12587201595306396,
+  "all_gap": 0.12798166275024414
+ }
+}

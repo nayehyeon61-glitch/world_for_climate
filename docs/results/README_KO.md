@@ -7,8 +7,8 @@
 | 1 | Lie 군 Shell-GNN + DIAMOND 잠재 세계 모델. 쉘을 "액체 지네 로봇"처럼 사슬로 결합 | 완료: 2018 GraphCast 비교, 결합 절제 실험 | `stage1_world_model/` |
 | 2 | 학습된 세계 모델을 새 연도 데이터로 RL(검증 보상 정책 개선) 보강 | 완료: 2020 held-out 시험, 지도학습 대조군 | `stage2_rl_refinement/` |
 | 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 완료: 1차(VQ-Lie vs 연속), 2차(잔차 physics 코드 미지지, 2020 불변성 확인) | `stage3_theory/` |
-| 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 구현 완료, P 학습 중, P−skip 대기 | `stage4_pyramid/` |
-| 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | 구현 완료(복합 군·진단·critic·평가), G1–G3 학습 대기 | `stage5_causal_lie/` |
+| 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 완료: P·P−skip 2018 GraphCast 비교, 예측 1–3 판정(1 미지지, 2 부분, 3 P 미지지·P−skip 형식상 지지) | `stage4_pyramid/` |
+| 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | 구현 완료(복합 군·진단·critic·평가), G1 학습 중, G2·G3 대기 | `stage5_causal_lie/` |
 
 ---
 
@@ -155,7 +155,26 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 - so(3) 피라미드 전이: 쌓인 그래프 위의 Shell-GNN 하나가 속도장을 내고, 계층적 Killing 사영(부모 원소를 사전값으로, 작은 패치가 못 보는 축 방향 성분 보완)으로 ω⁽⁰⁾, δ⁽¹⁾, δ⁽²⁾를 얻어 스케일 사슬 g = exp(ω⁽⁰⁾)exp(δ⁽¹⁾)exp(δ⁽²⁾)로 모든 레벨을 이송합니다. 세부 회전은 joint 벌칙, latent 손실은 레벨 가중(1.0/0.5/0.25).
 - 평가 `scripts/eval_pyramid.py` + `report_pyramid.py`: 레벨별 회전 에너지(위도대·쉘별), 레벨별 유사 상태 전이(거친/미세 레벨을 섞어 실행, 무작위 쌍 대조), 1단계 GraphCast 프로토콜과 결합한 S·P·P−skip 스코어카드.
 
-**검증할 예측:** (1) 거친 레벨 회전의 전이 이득은 무작위 대비 크고(격차 ≥ 0.2) 미세 레벨은 작다(< 0.1); (2) 레벨별 에너지는 L0 > L1 > L2, L2는 중위도 > 열대; (3) P는 S(1단계 independent)보다 72–120h z500 RMSE가 낮고 ACC가 높다. 결과는 `stage4_pyramid/`에 추가합니다.
+**검증할 예측:** (1) 거친 레벨 회전의 전이 이득은 무작위 대비 크고(격차 ≥ 0.2) 미세 레벨은 작다(< 0.1); (2) 레벨별 에너지는 L0 > L1 > L2, L2는 중위도 > 열대; (3) P는 S(1단계 independent)보다 72–120h z500 RMSE가 낮고 ACC가 높다.
+
+### 4.1 결과: S vs P vs P−skip (`stage4_pyramid/pyramid.md`, 2018년 61개 초기 시각, 1단계 프로토콜 그대로)
+
+| 지표 | S (단일 스케일) | P (피라미드 + skip) | P−skip (레벨 1만) |
+|---|---|---|---|
+| z500 RMSE 6h / 72h / 120h (m²/s²) | **260** / 823 / 1032 | 353 / 862 / 1145 | 435 / **811** / **876** |
+| z500 72–120h 평균 RMSE (S 대비) / ACC 변화 | 933 | +7.3% / −0.014 | **−9.3% / +0.015** |
+| t2m RMSE 72h / 120h (K) | 4.21 / 5.45 | 3.90 / 4.80 | **3.89 / 4.23** |
+| mslp RMSE 72h / 120h (hPa) | **7.46 / 8.36** | 7.80 / 9.91 | 7.87 / 8.99 |
+| z500 spread/skill 72h (1이 이상적) | 0.255 | **0.320** | 0.255 |
+| 학습 끝 복원 손실 (dynamics 단계 rec) | **0.26** | 0.53 | 0.73 |
+| 레벨별 회전 에너지 비율 L0 / L1 / L2 | – | 3% / 2% / **95%** | 57% / 43% |
+| 전이 이득 일치 − 무작위: 거친 / 미세 | – | +0.003 / **+0.126** | −0.10 / −0.35 (자기 회전 설명 1.7%, 잡음 수준) |
+
+- **예측 1 (거친 레벨이 전이, 미세 레벨은 아님): 미지지, 오히려 반대.** P에서 12·42 패치 레벨의 회전은 전체 에너지의 5%뿐이라 바꿔 넣어도 결과가 그대로입니다(0.992 vs 무작위 0.988). 상태 특이적 정보는 162 패치 레벨 δ⁽²⁾에 있습니다(일치 0.660 vs 무작위 0.534). 물리적으로도 말이 됩니다: 미세 레벨 rms 2.16°/6h는 10 m/s 이송(약 1.9°/6h)과 같은 크기이고, 행성 규모 패치 위의 Killing 사영은 파동의 회전이 서로 상쇄되어 거의 0입니다. 즉 "전역 공통 운동"은 거의 강체 회전이 없고, 이송은 종관 규모에서 일어납니다.
+- **예측 2 (에너지 L0 > L1 > L2, L2는 중위도 > 열대): 부분 지지.** 위도 구조는 맞습니다(P의 L2 중위도/열대 3.26, P−skip 2.10). 그러나 P의 에너지는 미세 레벨로 갈수록 커집니다. P−skip의 단조 감소는 레벨이 둘뿐인 결과입니다.
+- **예측 3 (72–120h z500 개선): P는 미지지(+7.3%), P−skip은 형식상 지지(−9.3%)지만 해석에 주의가 필요합니다.** 세 팔 모두 72h 이후 z500 RMSE가 기후값(789)보다 큽니다. 이 구간의 RMSE 차이는 예보 기술이 아니라 오차가 포화되는 속도의 차이입니다. P−skip은 42 노드 상태라 복원이 가장 나쁘고(6h z500 +67%) 예측이 매끄러워 오차가 천천히 커집니다. 72h ACC는 오히려 S보다 낮고(0.295 vs 0.335) 평균 ACC 이득은 96–120h에서만 나옵니다. 자기 회전이 설명하는 몫이 1.7%뿐이라 so(3) 이송도 거의 쓰이지 않습니다.
+- **P의 짧은 리드 손해는 V-Net 자동부호화기 때문입니다.** dynamics 단계 끝 복원 손실이 S의 두 배(0.53 vs 0.26)이고, 6h RMSE가 변수에 따라 5–40% 나쁩니다(z500 +35%, q700 +40%). 대신 P는 t2m(72h −7.4%, 120h −11.8%)과 z500 spread/skill(72h 0.32 vs 0.26)이 낫습니다.
+- **5단계에 주는 의미:** 5단계 G 팔은 P 위에 복합 군을 얹으므로 G0 = P와 비교합니다(같은 자동부호화기). 미세 레벨 δ⁽²⁾가 이송을 담당한다는 결과는 5단계의 Vert·Fib 생성자를 같은 Cartan 좌표에서 읽는 근거가 됩니다. 자동부호화기 용량(레벨 2·3 skip의 복원)을 늘리는 것은 별도 후속 과제로 남깁니다.
 
 ---
 
@@ -206,7 +225,8 @@ python scripts/train.py --config configs/wb2_pyramid.yaml --data-dir DATA       
 python scripts/compare_graphcast.py --checkpoint runs/wb2_pyramid/checkpoint.pt --data-dir DATA --init-stride 3
 python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --data-dir DATA --stride 4
 python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
-    --pyramid P=runs/wb2_pyramid/pyramid_eval.json --out-dir docs/results/stage4_pyramid
+    "P-skip=runs/wb2_pyramid_noskip/compare_graphcast.json" --pyramid P=runs/wb2_pyramid/pyramid_eval.json \
+    "P-skip=runs/wb2_pyramid_noskip/pyramid_eval.json" --out-dir docs/results/stage4_pyramid
 # 5단계 (G1–G3 각각; G0 = 4단계 P 체크포인트)
 python scripts/train.py --config configs/wb2_g1.yaml --data-dir DATA
 python scripts/compare_graphcast.py --checkpoint runs/wb2_g1/checkpoint.pt --data-dir DATA --init-stride 3
