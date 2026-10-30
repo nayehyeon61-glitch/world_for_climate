@@ -109,27 +109,40 @@ def build_model(cfg: dict, layout: gm.ChannelLayout, dataset) -> ClimateWorldMod
 
 
 def train(cfg: dict, model: ClimateWorldModel, train_ds, device="cpu",
-          log=print) -> Dict[str, list]:
+          log=print, histories: Optional[Dict[str, list]] = None,
+          on_stage_end: Optional[Callable] = None) -> Dict[str, list]:
+    """Runs the configured stages in order. Stages already in `histories`
+    (from a resumed checkpoint) are skipped; `on_stage_end(histories)` runs
+    after each finished stage, e.g. to save a checkpoint."""
     loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"],
                         shuffle=True, num_workers=cfg["train"].get("num_workers", 0),
                         drop_last=True)
-    histories = {}
+    histories = dict(histories or {})
     for stage in cfg["train"]["stages"]:
         sc = StageConfig(**stage)
+        if sc.name in histories:
+            log(f"[{sc.name}] skipped: already trained (resumed checkpoint)")
+            continue
         if sc.name == "stochastic" and model.denoiser is None:
             log("[stochastic] skipped: transition has no diffusion residual")
             continue
         histories[sc.name] = train_stage(model, loader, sc, device,
                                          cfg["train"].get("log_every", 10), log)
+        if on_stage_end is not None:
+            on_stage_end(histories)
     return histories
 
 
 def save_checkpoint(path: str, cfg: dict, model: ClimateWorldModel,
-                    stats: NormalizationStats) -> None:
+                    stats: NormalizationStats,
+                    histories: Optional[Dict[str, list]] = None) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
     torch.save({"config": cfg, "model": model.state_dict(),
                 "stats": {"mean": stats.mean, "std": stats.std,
-                          "diff_std": stats.diff_std}}, path)
+                          "diff_std": stats.diff_std},
+                "histories": histories or {}}, tmp)
+    os.replace(tmp, path)  # never leave a half-written checkpoint behind
 
 
 def load_checkpoint(path: str, device="cpu"):
@@ -178,7 +191,10 @@ def evaluate(cfg: dict, model: ClimateWorldModel, val_ds, stats: NormalizationSt
     lead = cfg["eval"]["lead_steps"]
     members = cfg["eval"].get("members", 1)
     hours = [6 * (k + 1) for k in range(lead)]
-    names = ["model", *(extra_forecasts or {}), "persistence", "climatology"]
+    # "model" is the ensemble mean; "model_member" scores a single sample so a
+    # deterministic baseline is not compared only against a smoothed mean.
+    names = ["model", *(["model_member"] if members > 1 else []),
+             *(extra_forecasts or {}), "persistence", "climatology"]
     metrics = {name: GraphCastMetrics(layout.targets, val_ds.lat, hours) for name in names}
     ens = EnsembleMetrics(layout.targets, val_ds.lat, hours) if members > 1 else None
     data = val_ds if indices is None else Subset(val_ds, list(indices))
@@ -197,6 +213,7 @@ def evaluate(cfg: dict, model: ClimateWorldModel, val_ds, stats: NormalizationSt
         ens_phys = stats.unnormalize(ens_pred, layout.targets)
         metrics["model"].update(ens_phys.mean(0), target, clim)
         if ens is not None:
+            metrics["model_member"].update(ens_phys[0], target, clim)
             ens.update(ens_phys, target)
         for name, fn in (extra_forecasts or {}).items():
             metrics[name].update(fn(init, lead), target, clim)

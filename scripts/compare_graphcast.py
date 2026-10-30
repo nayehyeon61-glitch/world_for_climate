@@ -91,17 +91,19 @@ def main():
     print(format_scorecard(metrics, "model", "graphcast"))
     out = args.out or os.path.join(cfg["output_dir"], "compare_graphcast.json")
     pipeline.results_to_json(results, out)
-    ours, theirs = metrics["model"].compute(), metrics["graphcast"].compute()
+    theirs = metrics["graphcast"].compute()
     index = {c.key: i for i, c in enumerate(layout.targets)}
     summary = {}
-    for key in HEADLINE_KEYS:
-        if key in index:
-            j = index[key]
-            summary[key] = {
-                "lead_h": metrics["model"].lead_hours,
-                "rmse_skill_vs_graphcast": rmse_skill_score(ours["rmse"][:, j], theirs["rmse"][:, j]).tolist(),
-                "acc_skill_vs_graphcast": acc_skill_score(ours["acc"][:, j], theirs["acc"][:, j]).tolist(),
-            }
+    for name in [n for n in ("model", "model_member") if n in metrics]:
+        ours = metrics[name].compute()
+        for key in HEADLINE_KEYS:
+            if key in index:
+                j = index[key]
+                summary.setdefault(name, {})[key] = {
+                    "lead_h": metrics[name].lead_hours,
+                    "rmse_skill_vs_graphcast": rmse_skill_score(ours["rmse"][:, j], theirs["rmse"][:, j]).tolist(),
+                    "acc_skill_vs_graphcast": acc_skill_score(ours["acc"][:, j], theirs["acc"][:, j]).tolist(),
+                }
     with open(out.replace(".json", "_summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
     print(f"saved {out}")
