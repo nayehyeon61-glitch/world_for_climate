@@ -3,7 +3,7 @@
 Each input is compare_graphcast.json from the same initialisations; the first
 is the reference (the base model). Writes refinement.md (RMSE, ACC, CRPS and
 spread/skill at selected leads, change vs the reference, GraphCast and
-persistence for context) and rmse_change_vs_base.png.
+persistence for context), rmse_change_vs_base.png and calibration_vs_base.png.
 
     python scripts/report_refinement.py base=runs/test2020/base.json \
         supervised=runs/test2020/supervised.json rl=runs/test2020/rl.json \
@@ -75,21 +75,27 @@ def markdown(runs, leads, keys):
             lines.append("| " + " | ".join(row) + " |")
         lines.append("")
     # one line per run: mean change over every variable and lead
-    lines += ["### All variables", "", "| run | mean RMSE change | share of (variable, lead) improved |"
-              " mean CRPS change | median spread/skill |", "|---|---|---|---|---|"]
+    lines += ["### All variables", "",
+              "| run | mean RMSE change (ensemble mean) | share improved | mean RMSE change (single member) "
+              "| share improved | mean CRPS change | median spread/skill |", "|---|---|---|---|---|---|---|"]
     table_ref, ens_ref, leads_ref = runs[ref]
+
+    def changes(table, method):
+        return np.array([(table[k]["rmse"] - v["rmse"]) / v["rmse"] for k, v in table_ref.items()
+                         if k[0] == method and k in table])
+
     for n in names[1:]:
         table, ens, _ = runs[n]
-        d = [(table[k]["rmse"] - v["rmse"]) / v["rmse"] for k, v in table_ref.items()
-             if k[0] == "model" and k in table]
+        d, dm = changes(table, "model"), changes(table, "model_member")
         c = [(np.asarray(ens["crps"][v]) - np.asarray(ens_ref["crps"][v])) / np.asarray(ens_ref["crps"][v])
              for v in ens_ref.get("crps", {}) if v in ens.get("crps", {})]
         ss = [x for v in ens.get("spread_skill", {}).values() for x in v]
-        lines.append(f"| {n} | {100 * np.mean(d):+.2f}% | {np.mean(np.asarray(d) < 0):.0%} | "
+        member = f"{100 * dm.mean():+.2f}% | {np.mean(dm < 0):.0%}" if dm.size else "– | –"
+        lines.append(f"| {n} | {100 * d.mean():+.2f}% | {np.mean(d < 0):.0%} | {member} | "
                      f"{100 * np.mean(np.concatenate(c)) if c else np.nan:+.2f}% | "
                      f"{np.median(ss) if ss else np.nan:.2f} |")
     ss_ref = [x for v in ens_ref.get("spread_skill", {}).values() for x in v]
-    lines.append(f"| {ref} | 0 | – | 0 | {np.median(ss_ref) if ss_ref else np.nan:.2f} |")
+    lines.append(f"| {ref} | 0 | – | 0 | – | 0 | {np.median(ss_ref) if ss_ref else np.nan:.2f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -123,6 +129,39 @@ def plot(runs, keys, path):
     fig.savefig(path, dpi=130)
 
 
+def plot_calibration(runs, path):
+    """Median spread/skill over all variables and mean CRPS change vs the reference, by lead."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names = list(runs)
+    ref_ens, leads = runs[names[0]][1], runs[names[0]][2]
+    if not ref_ens:
+        return
+    fig, (a, b) = plt.subplots(1, 2, figsize=(9, 3.2))
+    for i, n in enumerate(names):
+        ens = runs[n][1]
+        ss = np.median(np.array(list(ens["spread_skill"].values())), 0)
+        a.plot(leads, ss, color=COLORS[i % len(COLORS)], lw=2, label=n)
+        if i:
+            crps = np.mean([np.array(ens["crps"][v]) / np.array(ref_ens["crps"][v]) - 1
+                            for v in ref_ens["crps"]], 0)
+            b.plot(leads, 100 * crps, color=COLORS[i % len(COLORS)], lw=2, label=n)
+    a.axhline(1, color=COLORS[0], lw=1, ls="--")
+    a.set_ylim(0, 1.1)
+    a.set_title("spread/skill (median over variables; 1 = calibrated)", fontsize=10)
+    b.axhline(0, color=COLORS[0], lw=1)
+    b.set_title(f"CRPS change vs {names[0]} (%, mean over variables)", fontsize=10)
+    for ax in (a, b):
+        ax.set_xlabel("lead (h)", fontsize=9)
+        ax.grid(alpha=0.3)
+        ax.tick_params(labelsize=8)
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("runs", nargs="+", metavar="NAME=compare_graphcast.json",
@@ -140,7 +179,8 @@ def main():
     with open(os.path.join(out_dir, "refinement.md"), "w") as f:
         f.write(markdown(runs, leads, HEADLINE_KEYS))
     plot(runs, HEADLINE_KEYS, os.path.join(out_dir, "rmse_change_vs_base.png"))
-    print(f"wrote {out_dir}/refinement.md and rmse_change_vs_base.png")
+    plot_calibration(runs, os.path.join(out_dir, "calibration_vs_base.png"))
+    print(f"wrote {out_dir}/refinement.md, rmse_change_vs_base.png and calibration_vs_base.png")
 
 
 if __name__ == "__main__":

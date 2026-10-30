@@ -10,6 +10,7 @@ latitude-weighted RMSE (eq. 20/21) and ACC (eq. 29).
 
 설계 설명 (한국어): [docs/ARCHITECTURE_KO.md](docs/ARCHITECTURE_KO.md) ·
 대용량 학습 (Lustre hourly 0.25°, GPU 96GB): [docs/LARGE_SCALE_KO.md](docs/LARGE_SCALE_KO.md)
+실험 결과 (2018 GraphCast 비교, 2020 RL 보강): [docs/results/README_KO.md](docs/results/README_KO.md)
 
 ![Training system](docs/figures/training_system.png)
 
