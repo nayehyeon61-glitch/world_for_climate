@@ -10,6 +10,8 @@ latitude-weighted RMSE (eq. 20/21) and ACC (eq. 29).
 
 설계 설명 (한국어): [docs/ARCHITECTURE_KO.md](docs/ARCHITECTURE_KO.md)
 
+![Training system](docs/figures/training_system.png)
+
 ## Layout
 
 ```
