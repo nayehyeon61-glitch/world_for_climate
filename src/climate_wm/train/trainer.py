@@ -22,8 +22,9 @@ DEFAULT_TRAINABLE = {
     "repr": ("encoder", "decoder"),
     "dynamics": ("encoder", "decoder", "lie", "residual"),
     "stochastic": ("denoiser",),
+    "theory": ("theory",),
 }
-MODULES = ("encoder", "decoder", "lie", "residual", "denoiser")
+MODULES = ("encoder", "decoder", "lie", "residual", "denoiser", "theory")
 
 
 @dataclasses.dataclass

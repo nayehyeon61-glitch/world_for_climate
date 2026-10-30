@@ -172,6 +172,9 @@ def train(cfg: dict, model: ClimateWorldModel, train_ds, device="cpu",
         if sc.name == "stochastic" and model.denoiser is None:
             log("[stochastic] skipped: transition has no diffusion residual")
             continue
+        if sc.name == "theory" and model.theory is None:
+            log("[theory] skipped: transition is not lie_program")
+            continue
         resume = progress if progress and progress.get("stage") == sc.name else None
         histories[sc.name] = train_stage(model, loader, sc, device,
                                          cfg["train"].get("log_every", 10), log,
@@ -220,9 +223,21 @@ def load_matching_state(model: ClimateWorldModel, path: str, log=print) -> None:
             copied += 1
         else:
             skipped.append(k)
+    # A lie_program model's programmer has the Lie transition's architecture
+    # (two latent frames in, one algebra element out): warm-start it from the
+    # trained transition when the checkpoint has none of its own.
+    warm = 0
+    if model.theory is not None and not any(k.startswith("theory.proposer.") for k in state):
+        for k, v in state.items():
+            if k.startswith("lie."):
+                tk = "theory.proposer." + k[len("lie."):]
+                if tk in own and own[tk].shape == v.shape:
+                    own[tk] = v
+                    warm += 1
     model.load_state_dict(own)
     log(f"[init] copied {copied} tensors from {path}; skipped {len(skipped)} "
-        f"(shape or name mismatch){': ' + ', '.join(skipped[:5]) if skipped else ''}")
+        f"(shape or name mismatch){': ' + ', '.join(skipped[:5]) if skipped else ''}"
+        + (f"; programmer warm-started from the Lie transition ({warm} tensors)" if warm else ""))
 
 
 def build_climatology(cfg: dict, train_ds) -> Climatology:

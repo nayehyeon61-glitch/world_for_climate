@@ -18,6 +18,8 @@ Transition modes (research design ablations, section 10):
   lie_diffusion        Lie + diffusion residual                (B6)
   euclidean_diffusion  Zbar = Z_t + diffusion residual         (Euclidean latent
                                                                diffusion baseline, H3)
+  lie_program          Learning-to-Theorize: Z_{t+1} explained by a short program
+                       of so(3) primitives from a shared codebook (models/theory.py)
 """
 
 from __future__ import annotations
@@ -39,9 +41,10 @@ from .shell_gnn_decoder import ShellGNNDecoder
 from .shell_gnn_encoder import ShellGNNConfig, ShellGNNEncoder
 from .stochastic_transition import (DiffusionConfig, LatentDenoiser,
                                     LatentDiffusionSampler)
+from .theory import TheoryConfig, TheoryProgram
 
 TRANSITIONS = ("euclidean", "lie", "lie_residual", "lie_diffusion",
-               "euclidean_diffusion")
+               "euclidean_diffusion", "lie_program")
 
 
 @dataclasses.dataclass
@@ -50,6 +53,7 @@ class WorldModelConfig:
     gnn: ShellGNNConfig = dataclasses.field(default_factory=ShellGNNConfig)
     lie: LieConfig = dataclasses.field(default_factory=LieConfig)
     diffusion: DiffusionConfig = dataclasses.field(default_factory=DiffusionConfig)
+    theory: TheoryConfig = dataclasses.field(default_factory=TheoryConfig)
     transition: str = "lie_diffusion"
     history: int = 2  # latent frames conditioning the transition (= GraphCast inputs)
     residual_layers: int = 2
@@ -58,7 +62,7 @@ class WorldModelConfig:
     def from_dict(cls, d: Optional[dict]) -> "WorldModelConfig":
         d = dict(d or {})
         sub = {"mesh": MeshConfig, "gnn": ShellGNNConfig, "lie": LieConfig,
-               "diffusion": DiffusionConfig}
+               "diffusion": DiffusionConfig, "theory": TheoryConfig}
         kwargs = {k: sub[k](**d.pop(k)) for k in list(d) if k in sub}
         return cls(**kwargs, **d)
 
@@ -96,6 +100,9 @@ class ClimateWorldModel(nn.Module):
                          if t in ("euclidean", "lie_residual") else None)
         self.denoiser = (LatentDenoiser(**common, cfg=cfg.diffusion)
                          if t.endswith("diffusion") else None)
+        theory_args = {k: v for k, v in common.items() if k != "history"}
+        self.theory = (TheoryProgram(**theory_args, lie_cfg=cfg.lie, cfg=cfg.theory)
+                       if t == "lie_program" else None)
         self.loss_fn = GraphCastLoss(layout, grid_lat)
         # RMS of the latent residual (scalar part, vector part); calibrated once
         # at the start of the stochastic stage so that sigma_data = 1 holds.
@@ -229,10 +236,47 @@ class ClimateWorldModel(nn.Module):
                     logs[name] = logs.get(name, 0.0) + value / steps
                     total = total + w(name) * value / steps
                 history = list(history[1:]) + [z_next]
+        elif stage == "theory":
+            total, logs = self.theory_losses(batch, w)
         else:
             raise ValueError(f"unknown stage {stage}")
         return total, {k: float(v.detach() if torch.is_tensor(v) else v)
                        for k, v in logs.items()}
+
+    def theory_losses(self, batch: Dict[str, Tensor], w) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """Learning-to-Theorize stage (transition lie_program).
+
+        The encoder and decoder are frozen; the programmer and codebook learn to
+        explain (Z_t, Z_{t+1}). As in NEO, every program prefix is trained to
+        reach the target (so a patch whose change is explained early learns to
+        emit the identity afterwards) and MDL only *selects* the length:
+          rec      GraphCast loss of the decoded full-length state
+          latent   mean squared latent error over the K prefixes
+          vq       commitment loss, entropy regulariser
+        Monitored: rec_mdl / latent_mdl of the MDL-selected state, the
+        reconstruction floor (decoded target latent), mean k*, code usage.
+        """
+        if self.theory is None:
+            raise ValueError("the theory stage needs transition lie_program")
+        with torch.no_grad():
+            s = self.encode(batch["inputs"][:, -1], batch["forcings_in"][:, -1], batch["static"])
+            s_y = self.encode_target(batch, 0)
+        nf = self.node_forcing(batch["forcings_tgt"][:, 0])
+        exp = self.theory.explain(self.graphs, s, s_y, nf)
+        target_x = batch["targets"][:, 0]
+        logs: Dict[str, Tensor] = {
+            "rec": self.loss_fn(self.decode(exp.states[-1]), target_x),
+            "latent": torch.stack([z.squared_error(s_y) for z in exp.states[1:]]).mean(),
+            "vq": exp.vq_loss,
+            "entropy": exp.entropy,
+        }
+        total = sum(w(k) * v for k, v in logs.items())
+        with torch.no_grad():
+            logs["rec_mdl"] = self.loss_fn(self.decode(exp.selected), target_x)
+            logs["latent_mdl"] = exp.selected.squared_error(s_y)
+            logs["floor"] = self.loss_fn(self.decode(s_y), target_x)  # reconstruction floor
+        logs.update({k: torch.tensor(v) for k, v in self.theory.summary(exp).items()})
+        return total, logs
 
     # ------------------------------------------------------------ inference
     @torch.no_grad()
