@@ -160,6 +160,22 @@ def test_physics_executor_is_column_local_and_conservative():
     assert torch.equal(family_weights(idx, 6)[0], torch.zeros(3))
 
 
+def test_physics_only_arm_has_no_transport_and_no_vq_gradient():
+    model, batch, _ = _setup(1, "chain", physics_codes=6)  # identity-only Lie vocabulary
+    th = model.theory
+    with torch.no_grad():
+        s = model.encode(batch["inputs"][:, -1], batch["forcings_in"][:, -1], batch["static"])
+        s_y = model.encode_target(batch, 0)
+        nf = model.node_forcing(batch["forcings_tgt"][:, 0])
+        exp = th.explain(model.graphs, s, s_y, nf)
+    assert torch.all(exp.program == 0) and torch.all(exp.indices == 0)
+    assert float(exp.vq_loss) >= 0 and abs(th.summary(exp)["phys_share"] - 1.0) < 1e-6
+    stage = StageConfig(name="theory", steps=3, lr=1e-2,
+                        weights={"rec": 1.0, "latent": 1.0, "vq": 1.0, "entropy": 0.1})
+    hist = train_stage(model, [batch], stage, log_every=0)
+    assert all(h["vq"] < 1.0 and torch.isfinite(torch.tensor(h["loss"])) for h in hist)
+
+
 def test_hybrid_program_explains_trains_and_transfers():
     from climate_wm.eval import transfer
 
@@ -174,10 +190,11 @@ def test_hybrid_program_explains_trains_and_transfers():
         exp = th.explain(model.graphs, s, s_y, nf, ns=ns)
     K, P = th.cfg.max_steps, model.graphs.patches.num_patches
     assert exp.phys_indices.shape == (K, 2, 3, P) and exp.sub_error.shape == (K, 2, 3, P)
+    assert exp.phys_gate.shape == (K, 2, 3, P) and float(exp.phys_gate.mean()) < 0.1  # starts closed
     assert "phys_frac" in th.summary(exp) and "phys_share" in th.summary(exp)
-    with torch.no_grad():  # replaying Lie + physics codes reproduces the final state
+    with torch.no_grad():  # replaying Lie + physics codes (with their gates) reproduces the final state
         replay = th.execute(model.graphs, s, exp.program, torch.full_like(exp.lengths, K),
-                            exp.phys_indices, nf, ns)
+                            exp.phys_indices, nf, ns, exp.phys_gate)
     assert torch.allclose(replay.h, exp.states[K].h, atol=1e-5)
     # the theory stage trains with physics codes and logs their statistics
     stage = StageConfig(name="theory", steps=2, lr=1e-3,

@@ -194,6 +194,7 @@ class Explanation:
     entropy: Tensor             # scalar
     phys_indices: Optional[Tensor] = None  # physics code per step [K, B, S, P] (phase 2)
     sub_error: Optional[Tensor] = None     # patch error after the Lie sub-step [K, B, S, P]
+    phys_gate: Optional[Tensor] = None     # physics gate per step [K, B, S, P] in (0, 1)
 
 
 class TheoryProgram(nn.Module):
@@ -220,6 +221,12 @@ class TheoryProgram(nn.Module):
         if cfg.physics_codes > 0:
             self.phys_head = nn.Linear(d, cfg.physics_dim)
             self.phys_codebook = VectorQuantiser(1 + cfg.physics_codes, cfg.physics_dim, cfg)
+            # learned "use physics here" gate per (shell, patch); starts almost
+            # closed, so the model begins as the Lie-only arm and opens the
+            # physics step only where it lowers the error
+            self.phys_gate = nn.Linear(d, 1)
+            nn.init.zeros_(self.phys_gate.weight)
+            nn.init.constant_(self.phys_gate.bias, -3.0)
             self.physics = PhysicsExecutor(forcing_dim, static_dim, cs, cv_latent, d,
                                            hidden_layers, cfg.physics_dim, cfg.physics_scale)
 
@@ -264,11 +271,12 @@ class TheoryProgram(nn.Module):
         return out
 
     def apply_physics(self, graphs: WorldGraphs, s: Latent, e_patch: Tensor, idx: Tensor,
-                      nf: Tensor, ns: Optional[Tensor]) -> Latent:
+                      gate: Tensor, nf: Tensor, ns: Optional[Tensor]) -> Latent:
+        """e_patch [B, S, P, dz] code embeddings, idx [B, S, P] codes, gate [B, S, P, 1]."""
         b, sh = e_patch.shape[:2]
         blend = lambda x: graphs.patches.blend(x.flatten(0, 1)).unflatten(0, (b, sh))
-        e_node = blend(e_patch)                                       # [B, S, N, dz]
-        w_node = blend(family_weights(idx, self.cfg.physics_codes))   # [B, S, N, 3]
+        e_node = blend(e_patch)                                              # [B, S, N, dz]
+        w_node = blend(family_weights(idx, self.cfg.physics_codes) * gate)   # [B, S, N, 3]
         return self.physics(s, e_node, w_node, nf, self._static(s, ns))
 
     def propose(self, graphs: WorldGraphs, s: Latent, s_y: Latent, nf: Tensor
@@ -281,16 +289,22 @@ class TheoryProgram(nn.Module):
         local = self.to_local(joints if self.chain else omega)
         zero = torch.zeros((), device=local.device)
         vq, ent, idx = zero, zero, None
-        if self.codebook is not None:
+        if self.codebook is not None and self.codebook.size == 1:
+            # identity-only vocabulary (physics-only arm): no transport, and no
+            # straight-through gradient into proposals that can never be used
+            local = torch.zeros_like(local).detach()
+            idx = torch.zeros(local.shape[:-1], dtype=torch.long, device=local.device)
+        elif self.codebook is not None:
             local, idx, commitment, ent = self.codebook(local)
             vq = commitment.mean()
         phys = None
         if self.physics is not None:
             b, sh = h.shape[:2]
-            e = graphs.patches.pool(self.phys_head(h.float()).flatten(0, 1)).unflatten(0, (b, sh))
-            e_q, p_idx, p_commit, p_ent = self.phys_codebook(e)
+            pooled = graphs.patches.pool(h.float().flatten(0, 1)).unflatten(0, (b, sh))  # [B, S, P, d]
+            e_q, p_idx, p_commit, p_ent = self.phys_codebook(self.phys_head(pooled))
+            gate = torch.sigmoid(self.phys_gate(pooled))                                  # [B, S, P, 1]
             vq, ent = vq + p_commit.mean(), ent + p_ent
-            phys = (e_q, p_idx)
+            phys = (e_q, p_idx, gate)
         return local, idx, phys, vq, ent
 
     # ---------------------------------------------------------- explanation
@@ -317,7 +331,7 @@ class TheoryProgram(nn.Module):
                 steps: Optional[int] = None, ns: Optional[Tensor] = None) -> Explanation:
         """Infers a program field for the pair (s, s_y) and selects k* by MDL."""
         K = steps or self.cfg.max_steps
-        states, program, indices, phys_indices, sub_errors = [s], [], [], [], []
+        states, program, indices, phys_indices, sub_errors, gates = [s], [], [], [], [], []
         vq_total = torch.zeros((), device=s.h.device)
         ent_total = torch.zeros((), device=s.h.device)
         errors = [self._patch_error(graphs, s, s_y)]
@@ -331,6 +345,7 @@ class TheoryProgram(nn.Module):
                 sub_errors.append(self._patch_error(graphs, cur, s_y))
                 cur = self.apply_physics(graphs, cur, *phys, nf, ns)
                 phys_indices.append(phys[1])
+                gates.append(phys[2][..., 0])
             states.append(cur)
             program.append(local)
             indices.append(idx)
@@ -346,24 +361,27 @@ class TheoryProgram(nn.Module):
                            torch.stack(indices, 0) if indices[0] is not None else None,
                            lengths, patch_error, selected, vq_total, ent_total,
                            torch.stack(phys_indices, 0) if phys_indices else None,
-                           torch.stack(sub_errors, 0) if sub_errors else None)
+                           torch.stack(sub_errors, 0) if sub_errors else None,
+                           torch.stack(gates, 0) if gates else None)
 
     @torch.no_grad()
     def execute(self, graphs: WorldGraphs, s: Latent, program: Tensor, lengths: Tensor,
                 phys_indices: Optional[Tensor] = None, nf: Optional[Tensor] = None,
-                ns: Optional[Tensor] = None) -> Latent:
+                ns: Optional[Tensor] = None, phys_gates: Optional[Tensor] = None) -> Latent:
         """Runs a stored program field on a (new) state: transfer.
 
         program [K, B, S, P, 3] local elements, lengths [B, S, P], optional
-        physics codes [K, B, S, P] (need the query state's forcing `nf`); a
-        patch whose length is exceeded receives the identity for the rest."""
+        physics codes [K, B, S, P] with their gates [K, B, S, P] (need the
+        query state's forcing `nf`); a patch whose length is exceeded receives
+        the identity for the rest."""
         cur = s
         for k in range(program.shape[0]):
             active = lengths > k
             phys = None
             if phys_indices is not None and self.physics is not None:
                 idx = torch.where(active, phys_indices[k], torch.zeros_like(phys_indices[k]))
-                phys = (self.phys_codebook.lookup(idx), idx)
+                gate = (phys_gates[k] if phys_gates is not None else torch.ones_like(idx, dtype=torch.float32))
+                phys = (self.phys_codebook.lookup(idx), idx, gate[..., None].float())
             cur = self.apply(graphs, cur, program[k] * active.float()[..., None], phys, nf, ns)
         return cur
 
@@ -376,8 +394,12 @@ class TheoryProgram(nn.Module):
             p = counts / counts.sum()
             out["perplexity"] = float(torch.exp(-(p * torch.log(p + 1e-9)).sum()))
         if exp.phys_indices is not None:
+            active = exp.phys_indices > 0
+            if exp.phys_gate is not None:
+                active = active & (exp.phys_gate > 0.5)
+                out["phys_gate"] = float(exp.phys_gate.mean())
             out["phys_codes_used"] = float(len(torch.unique(exp.phys_indices)))
-            out["phys_frac"] = float((exp.phys_indices > 0).float().mean())
+            out["phys_frac"] = float(active.float().mean())
             # share of the per-step error reduction done by the physics sub-step
             lie_gain = exp.patch_error[:-1] - exp.sub_error
             phys_gain = exp.sub_error - exp.patch_error[1:]

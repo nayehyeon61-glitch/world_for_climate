@@ -112,6 +112,14 @@ class Explained:
     latent_selected: Tensor  # [N]
     phys_indices: Optional[Tensor] = None  # physics code per step [K, N, S, P] (phase 2)
     sub_error: Optional[Tensor] = None     # patch error after the Lie sub-step [K, N, S, P]
+    phys_gate: Optional[Tensor] = None     # physics gate per step [K, N, S, P]
+
+    def active_physics(self) -> Optional[Tensor]:
+        """[K, N, S, P] mask of steps whose physics code is on (non-identity, gate open)."""
+        if self.phys_indices is None:
+            return None
+        active = self.phys_indices > 0
+        return active & (self.phys_gate > 0.5) if self.phys_gate is not None else active
 
 
 @torch.no_grad()
@@ -123,7 +131,7 @@ def explain_all(model: ClimateWorldModel, pairs: PairSet, steps: Optional[int] =
     out: Dict[str, List[Tensor]] = {k: [] for k in ("lengths", "program", "indices", "patch_error",
                                                     "loss_by_length", "loss_selected", "loss_floor",
                                                     "latent_by_length", "latent_selected",
-                                                    "phys_indices", "sub_error")}
+                                                    "phys_indices", "sub_error", "phys_gate")}
     n = len(pairs)
     for i in range(0, n, batch_size):
         sub = pairs.subset(range(i, min(i + batch_size, n)))
@@ -138,6 +146,7 @@ def explain_all(model: ClimateWorldModel, pairs: PairSet, steps: Optional[int] =
         if exp.phys_indices is not None:
             out["phys_indices"].append(exp.phys_indices.cpu())
             out["sub_error"].append(exp.sub_error.cpu())
+            out["phys_gate"].append(exp.phys_gate.cpu())
         out["patch_error"].append(exp.patch_error.cpu())
         out["loss_by_length"].append(torch.stack(
             [_per_sample_loss(model, z, target) for z in exp.states], 1).cpu())
@@ -154,7 +163,8 @@ def explain_all(model: ClimateWorldModel, pairs: PairSet, steps: Optional[int] =
                      cat("patch_error", 1), cat("loss_by_length"), cat("loss_selected"),
                      cat("loss_floor"), cat("latent_by_length"), cat("latent_selected"),
                      cat("phys_indices", 1) if out["phys_indices"] else None,
-                     cat("sub_error", 1) if out["sub_error"] else None)
+                     cat("sub_error", 1) if out["sub_error"] else None,
+                     cat("phys_gate", 1) if out["phys_gate"] else None)
 
 
 def _usage_by_region(active: Tensor, patch_lat: Optional[Tensor]) -> Dict[str, float]:
@@ -206,9 +216,12 @@ def self_explainability(exp: Explained, codebook_size: int,
         res["code_usage_per_shell"] = (s_count / s_count.sum(1, keepdim=True).clamp_min(1)).tolist()
         res["lie_usage"] = _usage_by_region(exp.indices > 0, patch_lat)
     if exp.phys_indices is not None:
-        res["phys_frac"] = float((exp.phys_indices > 0).float().mean())
+        active = exp.active_physics()
+        res["phys_frac"] = float(active.float().mean())
         res["phys_codes_used"] = int(len(torch.unique(exp.phys_indices)))
-        res["phys_usage"] = _usage_by_region(exp.phys_indices > 0, patch_lat)
+        res["phys_usage"] = _usage_by_region(active, patch_lat)
+        if exp.phys_gate is not None:
+            res["phys_gate_mean"] = float(exp.phys_gate.mean())
         lie_gain = (exp.patch_error[:-1] - exp.sub_error).sum()
         phys_gain = (exp.sub_error - exp.patch_error[1:]).sum()
         total = float(lie_gain + phys_gain)
@@ -255,8 +268,9 @@ def analog_transfer(model: ClimateWorldModel, pairs: PairSet, exp: Explained,
         nf_j = ana.nf.to(device)
         ns_j = None if ana.ns is None else ana.ns.to(device)
         phys = lambda kk: None if exp.phys_indices is None else exp.phys_indices[:, kk].to(device)
+        gate = lambda kk: None if exp.phys_gate is None else exp.phys_gate[:, kk].to(device)
         run = lambda kk: th.execute(graphs, s_j, exp.program[:, kk].to(device),
-                                    exp.lengths[kk].to(device), phys(kk), nf_j, ns_j)
+                                    exp.lengths[kk].to(device), phys(kk), nf_j, ns_j, gate(kk))
         # (1) transfer: program inferred on i, executed on the analog state j
         z_tr = run(ii)
         # (2) delta copy: Euclidean latent change of i added to j (re-projected)
@@ -310,7 +324,8 @@ def length_ood(model: ClimateWorldModel, pairs_long: PairSet, steps: Sequence[in
 def _family_used(exp: Explained, family: int, num_codes: int) -> Tensor:
     """[N, S, P] mask: the selected program of the patch uses a code of `family`."""
     k = torch.arange(exp.phys_indices.shape[0])[:, None, None, None]
-    active = (k < exp.lengths[None]) & (code_family(exp.phys_indices, num_codes) == family)
+    active = (k < exp.lengths[None]) & exp.active_physics() \
+        & (code_family(exp.phys_indices, num_codes) == family)
     return active.any(0)
 
 
@@ -358,7 +373,8 @@ def causal_tests(model: ClimateWorldModel, pairs: PairSet, exp: Explained,
         ns = None if sub.ns is None else sub.ns.to(device)
         prog, lens = exp.program[:, ii].to(device), exp.lengths[ii].to(device)
         phys = exp.phys_indices[:, ii].to(device)
-        z_fact = th.execute(graphs, s, prog, lens, phys, nf, ns)
+        gates = None if exp.phys_gate is None else exp.phys_gate[:, ii].to(device)
+        z_fact = th.execute(graphs, s, prog, lens, phys, nf, ns, gates)
         pred_fact = model.decode(z_fact)
         fact_loss.append(torch.stack([model.loss_fn(pred_fact[j:j + 1], target[j:j + 1])
                                       for j in range(len(ii))]).cpu())
@@ -366,7 +382,7 @@ def causal_tests(model: ClimateWorldModel, pairs: PairSet, exp: Explained,
         # counterfactual forcing
         nf_cf = nf.clone()
         nf_cf[..., forcing_channel] = forcing_value
-        z_cf = th.execute(graphs, s, prog, lens, phys, nf_cf, ns)
+        z_cf = th.execute(graphs, s, prog, lens, phys, nf_cf, ns, gates)
         cf_effect.append(th._patch_error(graphs, z_cf, z_fact).cpu())
         diff = (model.decode(z_cf) - pred_fact).mean((-2, -1)).cpu()  # [B, C]
         for name, c in report_channels.items():
@@ -375,7 +391,7 @@ def causal_tests(model: ClimateWorldModel, pairs: PairSet, exp: Explained,
         fam = code_family(phys, th.cfg.physics_codes)
         for f in range(len(FAMILIES)):
             z_ko = th.execute(graphs, s, prog, lens, torch.where(fam == f, torch.zeros_like(phys), phys),
-                              nf, ns)
+                              nf, ns, gates)
             pred_ko = model.decode(z_ko)
             ko_loss[f].append(torch.stack([model.loss_fn(pred_ko[j:j + 1], target[j:j + 1])
                                            for j in range(len(ii))]).cpu())
