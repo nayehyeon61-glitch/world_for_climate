@@ -95,14 +95,22 @@ class PyramidLieGenerator(nn.Module):
             om = patches.killing_projection(uf, prior)
             om = om + patches.pool(spin_levels[src]) * patches.centres[None]
             omegas.append(om)
-        parts = pyr.pyramid[-1].details(omegas)  # [omega^(0), delta^(1), ...]
-        nodes = [pyr.pyramid[i].node_algebra(parts[:len(pyr.pyramid[i].levels)])
-                 for i in range(pyr.num_levels)]
-        omega_node = torch.cat(nodes, 1).unflatten(0, (b, s))
-        parts = [p.unflatten(0, (b, s)) for p in parts]
+        parts = [p.unflatten(0, (b, s)) for p in pyr.pyramid[-1].details(omegas)]
+        omega_node = self.node_algebra(graphs, parts)
         omega = torch.cat(parts, 2)
         joints = torch.cat(parts[1:], 2) if len(parts) > 1 else None
         return omega, omega_node, joints
+
+    @staticmethod
+    def node_algebra(graphs: WorldGraphs, parts: Sequence[Tensor]) -> Tensor:
+        """Scale chain [omega^(0), delta^(1), ...] (each [B, S, P_k, 3]) blended
+        onto every state level's nodes: [B, S, N_stacked, 3]."""
+        pyr = graphs.pyramid
+        b, s = parts[0].shape[:2]
+        flat = [p.flatten(0, 1) for p in parts]
+        nodes = [pyr.pyramid[i].node_algebra(flat[:len(pyr.pyramid[i].levels)])
+                 for i in range(pyr.num_levels)]
+        return torch.cat(nodes, 1).unflatten(0, (b, s))
 
     # ---------------------------------------------------------------- action
     def act(self, graphs: WorldGraphs, z: Latent, omega_node: Tensor) -> Latent:

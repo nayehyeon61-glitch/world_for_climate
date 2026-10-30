@@ -208,3 +208,23 @@ def test_pyramid_skip_dropout_changes_training_decode(setup):
         torch.manual_seed(1)
         outs = [model.decode(z) for _ in range(4)]
     assert any(not torch.allclose(outs[0], o) for o in outs[1:])
+
+
+def test_pyramid_evaluation_energy_and_transfer(setup):
+    from climate_wm.eval import pyramid as pyr_eval
+    layout, data, batch = setup
+    model = _model(layout, data, "pyramid", (1, 2))
+    pairs = pyr_eval.collect_pairs(model, data, range(len(data)), batch_size=3)
+    assert len(pairs) == len(data) and len(pairs.hist) == 2
+    parts = pyr_eval.explain_all(model, pairs, batch_size=3)
+    assert [p.shape[-2] for p in parts] == [12, 42, 162]
+    energy = pyr_eval.level_energy(parts, pyr_eval.patch_latitudes(model), [s.name for s in layout.shells.shells])
+    assert len(energy["levels"]) == 3 and all(r["energy"] >= 0 for r in energy["levels"])
+    analogs = pyr_eval.find_analogs(pairs, min_gap_hours=6.0)
+    assert (analogs >= 0).any()
+    tr = pyr_eval.level_transfer(model, pairs, parts, analogs, batch_size=3)
+    assert tr["pairs"] > 0 and tr["coarse_levels"] == [0, 1] and tr["fine_level"] == 2
+    for name in ("persistence", "own", "all", "coarse", "fine", "random_all"):
+        assert np.isfinite(tr["latent_" + name]) and len(tr["levels_" + name]) == 2
+    assert "coarse_gap" in tr and "fine_gap" in tr
+    assert pyr_eval.markdown({"experiment": "t", "energy": energy, "transfer": tr}).startswith("#")
