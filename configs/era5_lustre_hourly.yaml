@@ -1,0 +1,23 @@
+# Hourly ERA5 0.25 deg archive on Lustre (1979-2018 now, 2019-2025 later), read
+# with climate_wm.data.sources.HourlyArchive: every file is scanned once into
+# `index_cache` (new files are added incrementally), then each 6-hourly frame is
+# read from the one file that holds it. Nothing is copied or converted.
+#
+# Variables in the archive: z q t u v on 13 levels; u10 v10 mslp tcwv sp skt t2m
+# d2m swrd lwrd tp tisr. No w -> task graphcast_13_no_w. Hourly tp is summed to
+# total_precipitation_6hr; tisr is used as is (GraphCast's 1 h accumulation).
+#
+# Check it first:  python scripts/inventory.py --archive configs/era5_lustre_hourly.yaml --task graphcast_13_no_w
+paths:
+  - /lustre/PATH/TO/era5_hourly/pressure_levels/**/*.nc   # z, q, t, u, v (13 levels)
+  - /lustre/PATH/TO/era5_hourly/single_levels/**/*.nc     # u10, v10, mslp, t2m, tp, tisr, ...
+  # GraphCast also needs surface geopotential and the land-sea mask (not in the
+  # list above): point this at the ERA5 invariants file.
+  - path: /lustre/PATH/TO/era5_invariants.nc
+    rename: {z: geopotential_at_surface}
+engine: netcdf4             # h5netcdf, cfgrib (GRIB) or zarr also work
+index_cache: /lustre/PATH/TO/cache/era5_hourly_index.pkl
+hours: [0, 6, 12, 18]
+coarsen: 1                  # experiment configs override: 4 -> 1 deg, 2 -> 0.5 deg
+scan_workers: 16
+open_files: 64

@@ -1,0 +1,60 @@
+# P2b: 0.25 deg fine-tuning (GraphCast resolution), one 96 GB GPU.
+# Start from the 1 deg run: the GNN weights do not depend on the grid, the
+# graphs are rebuilt. The latent lives on a coarser mesh (M5, 10,242 nodes)
+# than the grid encoder / decoder mesh (M6, 40,962 nodes) to keep the Lie
+# transition and the diffusion residual cheap.
+#   python scripts/benchmark_step.py --config configs/p2_025deg_96gb.yaml --device cuda
+#   python scripts/train.py --config configs/p2_025deg_96gb.yaml --device cuda \
+#       --init-from runs/p2_1deg/checkpoint.pt --resume
+experiment: p2_025deg_lie_diffusion_chain
+output_dir: runs/p2_025deg
+
+data:
+  source: era5_hourly
+  era5_config: configs/era5_lustre_hourly.yaml
+  archive: {coarsen: 1}
+  time_range: ["1979-01-01", "2019-01-15"]
+  train: {start: "1979-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 512
+  stats_workers: 24
+  stats_path: runs/p2_025deg/stats.json
+
+task:
+  name: graphcast_13_no_w
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null
+
+model:
+  transition: lie_diffusion
+  history: 2
+  mesh: {mesh_splits: 6, latent_splits: 5, patch_splits: 2, break_symmetry: true}
+  gnn: {hidden_dim: 256, vector_dim: 32, latent_scalars: 64, latent_vectors: 16,
+        hidden_layers: 1, encoder_layers: 2, latent_layers: 2, decoder_layers: 2}
+  lie: {layers: 4, shell_coupling: chain}
+  diffusion: {layers: 6, cond_dim: 256, num_steps_denoising: 3}
+  residual_layers: 2
+
+benchmark: {resolution: 0.25}
+
+train:
+  batch_size: 1
+  num_workers: 24
+  prefetch_factor: 2
+  log_every: 50
+  engine: {amp: bf16, accum_steps: 4, grad_checkpointing: true, save_every: 500}
+  stages:
+    - {name: repr, steps: 5000, lr: 3.0e-4, warmup_steps: 200, weights: {rec: 1.0}}
+    - {name: dynamics, steps: 20000, lr: 1.0e-4, warmup_steps: 200, rollout_steps: 2,
+       weights: {forecast: 1.0, latent: 0.1, rec: 0.5, geo: 1.0e-3, joint: 1.0e-3}}
+    - {name: stochastic, steps: 10000, lr: 1.0e-4, warmup_steps: 200, rollout_steps: 1,
+       weights: {gen: 1.0}}
+
+eval:
+  lead_steps: 40
+  members: 4
+  batch_size: 1
+  init_hours: [0, 12]
+  climatology_zarr: gs://weatherbench2/datasets/era5-hourly-climatology/1990-2017_6h_1440x721.zarr
+  climatology_load: false

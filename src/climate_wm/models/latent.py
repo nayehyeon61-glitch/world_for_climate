@@ -61,8 +61,8 @@ class Latent:
 
     def squared_error(self, other: "Latent") -> Tensor:
         """Mean squared difference over all latent coordinates (scalar)."""
-        return torch.cat([(self.h - other.h).flatten(1),
-                          (self.v - other.v).flatten(1)], 1).square().mean()
+        return torch.cat([(self.h.float() - other.h.float()).flatten(1),
+                          (self.v.float() - other.v.float()).flatten(1)], 1).square().mean()
 
 
 def _per_sample(x: Tensor, factor: Tensor) -> Tensor:

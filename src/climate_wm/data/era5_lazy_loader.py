@@ -19,7 +19,6 @@ samples with exactly the GraphCast split of `extract_inputs_targets_forcings`:
 from __future__ import annotations
 
 import glob
-from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -31,6 +30,7 @@ from . import forcings as forcing_lib
 from .graphcast_mapping import (ERA5_SHORT_TO_GRAPHCAST, STATIC_VARS, Channel,
                                 ChannelLayout)
 from .normalization import NormalizationStats
+from .sources import XarraySource
 
 COORD_RENAMES = {
     "latitude": "lat",
@@ -99,17 +99,15 @@ def open_era5(cfg: dict) -> xr.Dataset:
     return standardize(ds, cfg.get("rename"), cfg.get("hours", (0, 6, 12, 18)))
 
 
-def _group_by_variable(channels: Sequence[Channel]):
-    groups: "OrderedDict[str, List[Optional[int]]]" = OrderedDict()
-    for c in channels:
-        groups.setdefault(c.name, []).append(c.level)
-    return groups
-
-
 class GraphCastWindowDataset(torch.utils.data.Dataset):
-    """(inputs, forcings, targets) windows from a standardized dataset."""
+    """(inputs, forcings, targets) windows from a frame source.
 
-    def __init__(self, ds: xr.Dataset, layout: ChannelLayout,
+    `ds` is a standardized xarray dataset (wrapped in `XarraySource`) or any
+    source from `climate_wm.data.sources`, e.g. `HourlyArchive` for the hourly
+    0.25 degree archive. Windows with a missing frame are skipped.
+    """
+
+    def __init__(self, ds, layout: ChannelLayout,
                  stats: Optional[NormalizationStats] = None,
                  target_steps: int = 1, start: Optional[str] = None,
                  end: Optional[str] = None,
@@ -120,18 +118,20 @@ class GraphCastWindowDataset(torch.utils.data.Dataset):
         self.target_steps = target_steps
         self.input_steps = layout.task.input_steps
         levels = [int(l) for l in layout.task.pressure_levels]
-        if "level" in ds.dims and [int(l) for l in ds.level.values] != levels:
-            ds = ds.sel(level=levels)  # copies data: pre-select when loading into memory
-        self.ds = ds
-        self.times = ds.time.values.astype("datetime64[ns]")
+        self.source = XarraySource(ds, levels) if isinstance(ds, xr.Dataset) else ds
+        self.times = self.source.times
         step = np.timedelta64(pd.Timedelta(layout.task.timestep))
         if len(self.times) > 1 and not np.all(np.diff(self.times) == step):
             raise ValueError("Dataset times must be uniformly spaced by the "
                              f"task timestep {layout.task.timestep}.")
-        self.lat = ds.lat.values.astype(np.float32)
-        self.lon = ds.lon.values.astype(np.float32)
+        self.lat = np.asarray(self.source.lat, np.float32)
+        self.lon = np.asarray(self.source.lon, np.float32)
         tisr = "toa_incident_solar_radiation"
-        self.compute_tisr = (tisr not in ds) if compute_tisr is None else compute_tisr
+        self.compute_tisr = (not self.source.has(tisr)) if compute_tisr is None else compute_tisr
+        names = {c.name for c in layout.targets}
+        if not self.compute_tisr and tisr in {c.name for c in layout.forcings}:
+            names.add(tisr)
+        available = self.source.availability(names)
         lo = np.datetime64(start) if start else self.times[0]
         hi = np.datetime64(end) if end else self.times[-1]
         valid = []
@@ -141,9 +141,17 @@ class GraphCastWindowDataset(torch.utils.data.Dataset):
                 continue
             if init_hours is not None and pd.Timestamp(t).hour not in init_hours:
                 continue
+            if not available[i - self.input_steps + 1:i + target_steps + 1].all():
+                continue
             valid.append(i)
         self.indices = np.asarray(valid, np.int64)
-        self.static = self._load(layout.static, None)
+        self.static = self.source.read_static(layout.static)
+        if hasattr(self.source, "close"):
+            self.source.close()  # no open file handles when DataLoader workers fork
+
+    @property
+    def ds(self):
+        return getattr(self.source, "ds", None)
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -153,19 +161,9 @@ class GraphCastWindowDataset(torch.utils.data.Dataset):
         return len(self.lat), len(self.lon)
 
     def _load(self, channels: Sequence[Channel], time_idx) -> np.ndarray:
-        sub = self.ds if time_idx is None else self.ds.isel(time=time_idx)
-        arrays = []
-        for name, levels in _group_by_variable(channels).items():
-            da = sub[name]
-            if levels[0] is not None:
-                da = da.sel(level=levels).transpose(
-                    *(["time"] if time_idx is not None else []), "level", "lat", "lon")
-                arrays.append(np.asarray(da.values, np.float32))
-            else:
-                da = da.transpose(*(["time"] if time_idx is not None else []),
-                                  "lat", "lon")
-                arrays.append(np.asarray(da.values, np.float32)[..., None, :, :])
-        return np.concatenate(arrays, axis=-3)
+        if time_idx is None:
+            return self.source.read_static(channels)
+        return self.source.read(channels, time_idx)
 
     def forcing_frames(self, times) -> np.ndarray:
         """[T, C_f, H, W] in the layout's forcing order."""
@@ -177,9 +175,7 @@ class GraphCastWindowDataset(torch.utils.data.Dataset):
                     times, self.lat, self.lon)
             else:
                 idx = np.searchsorted(self.times, np.asarray(times, "datetime64[ns]"))
-                fields[tisr] = np.asarray(
-                    self.ds[tisr].isel(time=idx).transpose("time", "lat", "lon").values,
-                    np.float32)
+                fields[tisr] = self.source.read([Channel(tisr)], idx)[:, 0]
         return np.stack([fields[c.name] for c in self.layout.forcings], axis=1)
 
     def raw_window(self, k: int):

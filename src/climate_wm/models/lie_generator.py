@@ -87,6 +87,10 @@ class LieGenerator(nn.Module):
         joint rotations [B, S, P, 3] (= omega_patch for independent shells)."""
         h, v = self.embed(history, node_forcing, graphs.latent_struct)
         h, v = self.processor(graphs.latent_mesh, h, v)
+        with torch.autocast(h.device.type, enabled=False):  # so(3) algebra in fp32
+            return self._algebra(graphs, h.float(), v.float())
+
+    def _algebra(self, graphs: WorldGraphs, h: Tensor, v: Tensor):
         b, s, n = h.shape[:3]
         u = (self.velocity(h)[..., None] * v).sum(-2)  # tangent velocity
         patches = graphs.patches
@@ -114,8 +118,10 @@ class LieGenerator(nn.Module):
         |dt omega| is smoothly limited to `max_angle` (a CFL-like limiter that
         keeps departure points inside the triangles searched by the action).
         """
-        step = clamp_rotation(self.cfg.dt * omega_node, self.max_angle)
-        rot = so3_exp(step).flatten(0, 1)
-        h, v = graphs.rotation_action(z.h.flatten(0, 1), z.v.flatten(0, 1), rot)
+        with torch.autocast(omega_node.device.type, enabled=False):  # exp map + interpolation in fp32
+            step = clamp_rotation(self.cfg.dt * omega_node.float(), self.max_angle)
+            rot = so3_exp(step).flatten(0, 1)
+            h, v = graphs.rotation_action(z.h.float().flatten(0, 1),
+                                          z.v.float().flatten(0, 1), rot)
         b, s = z.h.shape[:2]
         return Latent(h.unflatten(0, (b, s)), v.unflatten(0, (b, s)))

@@ -24,6 +24,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 from torch_geometric.nn import MessagePassing
 
@@ -154,11 +155,19 @@ class GeometricInteraction(MessagePassing):
         self.vec_mix = VectorLinear(cv, cv)
         self.vec_gate = nn.Linear(d, cv)
         self.cond_norm = AdaLayerNorm(d, cond_dim) if cond_dim else None
+        self.checkpoint = False  # recompute activations in backward (large grids)
 
     def forward(self, graph: GeoGraph, h_src: Tensor, v_src: Tensor,
                 h_dst: Tensor, v_dst: Tensor, e: Tensor,
                 cond: Optional[Tensor] = None):
         """h_* [B, N, d], v_* [B, N, cv, 3], e [B or 1, E, d] edge latents."""
+        if self.checkpoint and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                self._forward, graph, h_src, v_src, h_dst, v_dst, e, cond,
+                use_reentrant=False)
+        return self._forward(graph, h_src, v_src, h_dst, v_dst, e, cond)
+
+    def _forward(self, graph, h_src, v_src, h_dst, v_dst, e, cond):
         msg = self.edge_updater(graph.edge_index, h=(h_src, h_dst),
                                 v=(v_src, v_dst), e=e, T=graph.transport,
                                 disp=graph.disp)

@@ -157,6 +157,13 @@ class ClimateWorldModel(nn.Module):
         return StepOutput(z=z, zbar=zbar, omega=omega, joints=joints)
 
     # ------------------------------------------------------------- training
+    def set_grad_checkpointing(self, enabled: bool = True) -> None:
+        """Recompute every message-passing layer in backward (large grids)."""
+        from .layers import GeometricInteraction
+        for m in self.modules():
+            if isinstance(m, GeometricInteraction):
+                m.checkpoint = enabled
+
     @torch.no_grad()
     def calibrate_residual_scale(self, batch: Dict[str, Tensor]) -> None:
         hist = self.encode_history(batch)

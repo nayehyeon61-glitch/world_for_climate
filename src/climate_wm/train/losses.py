@@ -76,7 +76,7 @@ class GraphCastLoss(nn.Module):
             graphcast_channel_weights(layout, per_variable_weights)))
 
     def per_channel(self, pred: Tensor, target: Tensor) -> Tensor:
-        err = (pred - target).square() * self.lat_w[:, None]
+        err = (pred.float() - target.float()).square() * self.lat_w[:, None]
         return err.mean((-2, -1))  # [..., C]
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:

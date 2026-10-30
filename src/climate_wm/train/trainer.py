@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import time
@@ -61,9 +62,39 @@ def _to(batch: Dict[str, torch.Tensor], device) -> Dict[str, torch.Tensor]:
     return {k: v.to(device) for k, v in batch.items()}
 
 
+@dataclasses.dataclass
+class EngineConfig:
+    """Large-grid options (train.engine in the config)."""
+    amp: Optional[str] = None          # "bf16": autocast matmuls (Lie algebra + losses stay fp32)
+    accum_steps: int = 1               # micro-batches per optimizer step
+    grad_checkpointing: bool = False   # recompute GNN activations in backward
+    save_every: int = 0                # optimizer steps between resumable checkpoints (0: stage end)
+
+
+def _autocast(device, amp: Optional[str]):
+    if amp is None:
+        return contextlib.nullcontext()
+    if amp != "bf16":
+        raise ValueError(f"amp must be null or 'bf16', got {amp!r}")
+    return torch.autocast(torch.device(device).type, dtype=torch.bfloat16)
+
+
+def _memory(device) -> str:
+    if torch.device(device).type == "cuda":
+        return f" mem={torch.cuda.max_memory_allocated(device) / 2 ** 30:.1f}GB"
+    return ""
+
+
 def train_stage(model: ClimateWorldModel, loader: DataLoader, cfg: StageConfig,
                 device="cpu", log_every: int = 10,
-                log: Callable[[str], None] = print) -> List[Dict[str, float]]:
+                log: Callable[[str], None] = print,
+                engine: Optional[EngineConfig] = None,
+                resume: Optional[dict] = None,
+                on_save: Optional[Callable[[dict], None]] = None) -> List[Dict[str, float]]:
+    """Trains one stage. `resume` ({step, optimizer, scheduler, history}) continues
+    an interrupted stage; `on_save(progress)` receives that dict every
+    `engine.save_every` optimizer steps."""
+    engine = engine or EngineConfig()
     if cfg.name == "stochastic" and model.denoiser is None:
         raise ValueError("The stochastic stage needs a *_diffusion transition.")
     params = set_trainable(model, cfg.trainable or DEFAULT_TRAINABLE[cfg.name])
@@ -76,25 +107,46 @@ def train_stage(model: ClimateWorldModel, loader: DataLoader, cfg: StageConfig,
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    history, first = [], 0
+    if resume is not None:
+        opt.load_state_dict(resume["optimizer"])
+        sched.load_state_dict(resume["scheduler"])
+        history, first = list(resume["history"]), int(resume["step"])
+        log(f"[{cfg.name}] resuming at step {first}")
     batches = _forever(loader)
     model.train()
     if cfg.name == "stochastic" and not bool(model.residual_calibrated):
-        model.calibrate_residual_scale(_to(next(batches), device))
+        with _autocast(device, engine.amp):
+            model.calibrate_residual_scale(_to(next(batches), device))
         log(f"[stochastic] residual scale = {model.residual_scale.tolist()}")
-    history, t0 = [], time.time()
-    for step in range(cfg.steps):
-        batch = _to(next(batches), device)
-        loss, logs = model.losses(batch, cfg.name, cfg.weights, cfg.rollout_steps)
+    t0, samples = time.time(), 0
+    for step in range(first, cfg.steps):
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        logs: Dict[str, float] = {}
+        loss_total = 0.0
+        for _ in range(engine.accum_steps):
+            batch = _to(next(batches), device)
+            with _autocast(device, engine.amp):
+                loss, micro = model.losses(batch, cfg.name, cfg.weights, cfg.rollout_steps)
+            (loss / engine.accum_steps).backward()
+            loss_total += float(loss.detach()) / engine.accum_steps
+            for k, v in micro.items():
+                logs[k] = logs.get(k, 0.0) + v / engine.accum_steps
+            samples += batch["targets"].shape[0]
         grad_norm = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         opt.step()
         sched.step()
-        logs.update(loss=float(loss), grad_norm=float(grad_norm), step=step)
+        logs.update(loss=loss_total, grad_norm=float(grad_norm), step=step)
         history.append(logs)
         if log_every and (step % log_every == 0 or step == cfg.steps - 1):
             terms = " ".join(f"{k}={v:.4g}" for k, v in logs.items()
                              if k not in ("step", "grad_norm"))
-            log(f"[{cfg.name}] step {step:>5} {terms} ({time.time() - t0:.1f}s)")
+            elapsed = time.time() - t0
+            log(f"[{cfg.name}] step {step:>5} {terms} ({elapsed:.1f}s, "
+                f"{samples / max(elapsed, 1e-9):.2f} samples/s{_memory(device)})")
+        if on_save is not None and engine.save_every and (step + 1) % engine.save_every == 0 \
+                and step + 1 < cfg.steps:
+            on_save({"stage": cfg.name, "step": step + 1, "optimizer": opt.state_dict(),
+                     "scheduler": sched.state_dict(), "history": list(history)})
     model.eval()
     return history

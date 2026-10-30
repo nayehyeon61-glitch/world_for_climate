@@ -72,19 +72,46 @@ class _Moments:
         return mean, np.sqrt(var), self.s2 / self.n
 
 
-def compute_stats(dataset, indices: Iterable[int]) -> NormalizationStats:
+class _RawWindows:
+    """Picklable view returning raw windows, for parallel reading."""
+
+    def __init__(self, dataset, indices):
+        self.dataset, self.indices = dataset, list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        frames, forc, _ = self.dataset.raw_window(self.indices[i])
+        return frames, forc
+
+
+def compute_stats(dataset, indices: Iterable[int], num_workers: int = 0,
+                  log=None) -> NormalizationStats:
     """Streaming statistics from a `GraphCastWindowDataset` (unnormalised).
 
     Uses target channels (a superset of the dynamic inputs), forcings and the
-    static fields. `diff_std` is the std of 6h differences.
+    static fields. `diff_std` is the std of 6h differences. With
+    `num_workers > 0` the windows are read by DataLoader workers (I/O bound on
+    the 0.25 degree archive); the moments are accumulated in this process.
     """
     layout = dataset.layout
     frames_m, diff_m, forc_m = _Moments(), _Moments(), _Moments()
-    for k in indices:
-        frames, forc, _ = dataset.raw_window(k)
+    windows = _RawWindows(dataset, indices)
+    if num_workers > 0:
+        import torch
+        iterator = torch.utils.data.DataLoader(
+            windows, batch_size=None, num_workers=num_workers,
+            collate_fn=lambda x: x, prefetch_factor=2)
+    else:
+        iterator = (windows[i] for i in range(len(windows)))
+    for n, (frames, forc) in enumerate(iterator):
+        frames, forc = np.asarray(frames), np.asarray(forc)
         frames_m.add(frames, (0, 2, 3))
         diff_m.add(np.diff(frames, axis=0), (0, 2, 3))
         forc_m.add(forc, (0, 2, 3))
+        if log is not None and (n + 1) % 50 == 0:
+            log(f"[stats] {n + 1}/{len(windows)} windows")
     static_m = _Moments()
     static_m.add(dataset.static[None], (0, 2, 3))
 

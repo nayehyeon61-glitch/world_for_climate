@@ -18,13 +18,14 @@ from torch.utils.data import DataLoader, Subset
 from .data import graphcast_mapping as gm
 from .data.era5_lazy_loader import GraphCastWindowDataset, open_era5, standardize
 from .data.normalization import NormalizationStats, compute_stats
+from .data.sources import HourlyArchive
 from .data.synthetic import make_synthetic_era5
 from .eval.climatology import Climatology
 from .eval.ensemble_metrics import EnsembleMetrics
 from .eval.graphcast_metrics import GraphCastMetrics
 from .geometry.shells import ShellSpec
 from .models.world_model import ClimateWorldModel, WorldModelConfig
-from .train.trainer import StageConfig, train_stage
+from .train.trainer import EngineConfig, StageConfig, train_stage
 
 
 def load_config(path: str, data_dir: Optional[str] = None) -> dict:
@@ -82,6 +83,15 @@ def open_dataset(cfg: dict):
         if "level" in ds.dims:
             ds = ds.sel(level=levels)
         return ds.load() if data.get("load_into_memory") else ds
+    if source == "era5_hourly":  # indexed reader for the hourly 0.25 deg archive
+        archive_cfg = {}
+        if data.get("era5_config"):
+            with open(data["era5_config"]) as f:
+                archive_cfg = yaml.safe_load(f)
+        archive_cfg.update(data.get("archive", {}))  # per-experiment overrides, e.g. coarsen
+        if data.get("time_range"):
+            archive_cfg["time_range"] = data["time_range"]
+        return HourlyArchive(archive_cfg)
     with open(data["era5_config"]) as f:
         return open_era5(yaml.safe_load(f))
 
@@ -91,11 +101,17 @@ def build_datasets(cfg: dict, layout: gm.ChannelLayout, ds,
     data = cfg["data"]
     train_steps = max(s.get("rollout_steps", 1) for s in cfg["train"]["stages"])
     split = lambda name: data[name]
+    stats_path = data.get("stats_path")
+    if stats is None and stats_path and os.path.exists(stats_path):
+        stats = NormalizationStats.load(stats_path)
     if stats is None:
         raw = GraphCastWindowDataset(ds, layout, None, train_steps, **split("train"))
         n = len(raw)
         idx = np.linspace(0, n - 1, min(n, data.get("stats_samples", 64))).astype(int)
-        stats = compute_stats(raw, idx)
+        stats = compute_stats(raw, idx, num_workers=data.get("stats_workers", 0), log=print)
+        if stats_path:
+            os.makedirs(os.path.dirname(stats_path) or ".", exist_ok=True)
+            stats.save(stats_path)
     train = GraphCastWindowDataset(ds, layout, stats, train_steps, **split("train"))
     lead = cfg["eval"]["lead_steps"]
     val = GraphCastWindowDataset(ds, layout, stats, lead, **split("val"),
@@ -108,15 +124,37 @@ def build_model(cfg: dict, layout: gm.ChannelLayout, dataset) -> ClimateWorldMod
                              dataset.lat, dataset.lon)
 
 
+def _worker_init(_):
+    torch.set_num_threads(1)
+    try:
+        import dask
+        dask.config.set(scheduler="synchronous")  # no thread pools inside workers
+    except ImportError:
+        pass
+
+
+def make_loader(cfg: dict, dataset, device="cpu") -> DataLoader:
+    tc = cfg["train"]
+    workers = tc.get("num_workers", 0)
+    extra = dict(persistent_workers=True, prefetch_factor=tc.get("prefetch_factor", 2),
+                 worker_init_fn=_worker_init) if workers > 0 else {}
+    return DataLoader(dataset, batch_size=tc["batch_size"], shuffle=True,
+                      num_workers=workers, drop_last=True,
+                      pin_memory=torch.device(device).type == "cuda", **extra)
+
+
 def train(cfg: dict, model: ClimateWorldModel, train_ds, device="cpu",
           log=print, histories: Optional[Dict[str, list]] = None,
-          on_stage_end: Optional[Callable] = None) -> Dict[str, list]:
+          on_stage_end: Optional[Callable] = None,
+          progress: Optional[dict] = None,
+          on_progress: Optional[Callable[[dict], None]] = None) -> Dict[str, list]:
     """Runs the configured stages in order. Stages already in `histories`
     (from a resumed checkpoint) are skipped; `on_stage_end(histories)` runs
-    after each finished stage, e.g. to save a checkpoint."""
-    loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"],
-                        shuffle=True, num_workers=cfg["train"].get("num_workers", 0),
-                        drop_last=True)
+    after each finished stage. `progress` resumes an interrupted stage and
+    `on_progress(progress)` is called every `train.engine.save_every` steps."""
+    engine = EngineConfig(**cfg["train"].get("engine", {}))
+    model.set_grad_checkpointing(engine.grad_checkpointing)
+    loader = make_loader(cfg, train_ds, device)
     histories = dict(histories or {})
     for stage in cfg["train"]["stages"]:
         sc = StageConfig(**stage)
@@ -126,8 +164,11 @@ def train(cfg: dict, model: ClimateWorldModel, train_ds, device="cpu",
         if sc.name == "stochastic" and model.denoiser is None:
             log("[stochastic] skipped: transition has no diffusion residual")
             continue
+        resume = progress if progress and progress.get("stage") == sc.name else None
         histories[sc.name] = train_stage(model, loader, sc, device,
-                                         cfg["train"].get("log_every", 10), log)
+                                         cfg["train"].get("log_every", 10), log,
+                                         engine=engine, resume=resume,
+                                         on_save=on_progress)
         if on_stage_end is not None:
             on_stage_end(histories)
     return histories
@@ -135,13 +176,16 @@ def train(cfg: dict, model: ClimateWorldModel, train_ds, device="cpu",
 
 def save_checkpoint(path: str, cfg: dict, model: ClimateWorldModel,
                     stats: NormalizationStats,
-                    histories: Optional[Dict[str, list]] = None) -> None:
+                    histories: Optional[Dict[str, list]] = None,
+                    progress: Optional[dict] = None) -> None:
+    """`progress` (optimizer / scheduler state of an unfinished stage) makes
+    the checkpoint resumable mid-stage."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     torch.save({"config": cfg, "model": model.state_dict(),
                 "stats": {"mean": stats.mean, "std": stats.std,
                           "diff_std": stats.diff_std},
-                "histories": histories or {}}, tmp)
+                "histories": histories or {}, "progress": progress}, tmp)
     os.replace(tmp, path)  # never leave a half-written checkpoint behind
 
 
@@ -150,11 +194,36 @@ def load_checkpoint(path: str, device="cpu"):
     return ckpt["config"], ckpt["model"], NormalizationStats(**ckpt["stats"])
 
 
+def load_matching_state(model: ClimateWorldModel, path: str, log=print) -> None:
+    """Initialises `model` from a checkpoint trained on another grid / mesh
+    (e.g. 1 deg -> 0.25 deg): copies parameters and non-geometry buffers whose
+    shapes match; graph buffers are rebuilt for the new grid and the residual
+    scale is recalibrated."""
+    state = torch.load(path, map_location="cpu", weights_only=False)["model"]
+    own = model.state_dict()
+    skip_prefix = ("graphs.",)
+    skip_names = ("residual_scale", "residual_calibrated")
+    copied, skipped = 0, []
+    for k, v in state.items():
+        if k.startswith(skip_prefix) or k in skip_names:
+            continue
+        if k in own and own[k].shape == v.shape:
+            own[k] = v
+            copied += 1
+        else:
+            skipped.append(k)
+    model.load_state_dict(own)
+    log(f"[init] copied {copied} tensors from {path}; skipped {len(skipped)} "
+        f"(shape or name mismatch){': ' + ', '.join(skipped[:5]) if skipped else ''}")
+
+
 def build_climatology(cfg: dict, train_ds) -> Climatology:
     """WeatherBench-2 climatology if configured, else from the training windows."""
     path = cfg["eval"].get("climatology_zarr")
-    if path:
-        return Climatology.from_weatherbench2(path, train_ds.layout.targets)
+    if path:  # climatology_load: false reads frames lazily (0.25 deg is ~400 GB in memory)
+        return Climatology.from_weatherbench2(path, train_ds.layout.targets,
+                                              load=cfg["eval"].get("climatology_load", True),
+                                              coarsen=cfg["eval"].get("climatology_coarsen", 1))
     n = len(train_ds)
     idx = range(0, n, max(1, cfg["eval"].get("climatology_stride", 1)))
     return Climatology.from_window_dataset(train_ds, idx,

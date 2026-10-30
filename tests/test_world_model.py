@@ -79,3 +79,24 @@ def test_chain_coupling_is_forward_kinematics(setup):
     for s in range(1, omega.shape[1]):
         torch.testing.assert_close(omega[:, s], compose(omega[:, s - 1], joints[:, s]),
                                    atol=1e-5, rtol=1e-4)
+
+
+def test_engine_bf16_checkpointing_and_resume(setup):
+    """Large-grid engine on CPU: bf16 autocast, recomputed layers, gradient
+    accumulation, mid-stage checkpoints and resuming from one."""
+    from climate_wm.train.trainer import EngineConfig, StageConfig, train_stage
+
+    layout, data, batch = setup
+    model = _model(layout, data, "lie_diffusion", "chain")
+    model.set_grad_checkpointing(True)
+    engine = EngineConfig(amp="bf16", accum_steps=2, grad_checkpointing=True, save_every=2)
+    stage = StageConfig(name="dynamics", steps=4, rollout_steps=2, weights=WEIGHTS)
+    saved = []
+    hist = train_stage(model, [batch], stage, log_every=0, engine=engine, on_save=saved.append)
+    assert len(hist) == 4 and all(torch.isfinite(torch.tensor(h["loss"])) for h in hist)
+    assert [p["step"] for p in saved] == [2]  # the stage end is saved by the caller
+    resumed = train_stage(model, [batch], stage, log_every=0, engine=engine, resume=saved[0])
+    assert len(resumed) == 4 and resumed[:2] == hist[:2]  # steps 2, 3 re-run from the checkpoint
+    omega, _, _ = model.lie(model.graphs, model.encode_history(batch),
+                            model.node_forcing(batch["forcings_tgt"][:, 0]))
+    assert omega.dtype == torch.float32

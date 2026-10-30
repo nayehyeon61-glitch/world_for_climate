@@ -13,6 +13,7 @@ day-of-year of the validity time. Two sources are supported:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Optional, Sequence
 
 import numpy as np
@@ -26,13 +27,18 @@ class Climatology:
 
     def __init__(self, values: Optional[np.ndarray] = None,
                  hours: Sequence[int] = (0, 6, 12, 18), lazy=None,
-                 channels: Optional[Sequence[Channel]] = None):
+                 channels: Optional[Sequence[Channel]] = None,
+                 coarsener=None, cache_size: int = 64):
         """values [366, len(hours), C, H, W] (NaN for missing days) or a lazy
-        xarray dataset in WeatherBench-2 format."""
+        xarray dataset in WeatherBench-2 format (frames are read on demand,
+        optionally coarsened, and kept in a small LRU cache)."""
         self.values = values
         self.hours = list(hours)
         self.lazy = lazy
         self.channels = list(channels) if channels is not None else None
+        self.coarsener = coarsener
+        self.cache_size = cache_size
+        self._cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 
     @classmethod
     def from_window_dataset(cls, dataset, indices: Sequence[int],
@@ -61,22 +67,33 @@ class Climatology:
 
     @classmethod
     def from_weatherbench2(cls, path: str, channels: Sequence[Channel],
-                           load: bool = True) -> "Climatology":
-        """WeatherBench-2 climatology zarr. load=True reads the selected
-        channels into memory ([366, hours, C, H, W]; ~1 GB at 64x32 x 83 ch)."""
+                           load: bool = True, coarsen: int = 1) -> "Climatology":
+        """WeatherBench-2 climatology zarr (local or gs://). load=True reads the
+        selected channels into memory ([366, hours, C, H, W]; ~1 GB at 64x32 x
+        83 ch); load=False reads frames lazily, e.g. the 0.25 deg climatology
+        coarsened on the fly (`coarsen=4` for a 1 deg model)."""
         import xarray as xr
-        ds = xr.open_zarr(path)
+        opts = {"storage_options": {"token": "anon"}} if path.startswith("gs://") else {}
+        ds = xr.open_zarr(path, **opts)
         ds = ds.rename({k: v for k, v in {"latitude": "lat", "longitude": "lon"}.items()
-                        if k in ds.dims}).sortby("lat")
+                        if k in ds.dims}).sortby("lat").sortby("lon")
+        coarsener = None
+        if coarsen > 1:
+            from ..data.sources import AreaCoarsener
+            coarsener = AreaCoarsener(ds.lat.values, ds.lon.values, coarsen)
         if not load:
-            return cls(None, lazy=ds, channels=channels)
+            return cls(None, hours=[int(h) for h in ds.hour.values], lazy=ds,
+                       channels=channels, coarsener=coarsener)
         hours = [int(h) for h in ds.hour.values]
         frames = []
         for c in channels:
             da = ds[c.name] if c.level is None else ds[c.name].sel(level=c.level)
             frames.append(np.asarray(da.transpose("dayofyear", "hour", "lat", "lon").values,
                                      np.float32))
-        return cls(np.stack(frames, axis=2), hours, channels=channels)
+        values = np.stack(frames, axis=2)
+        if coarsener is not None:
+            values = coarsener(values)
+        return cls(values, hours, channels=channels)
 
     def _day_hour(self, t):
         ts = pd.Timestamp(np.datetime64(int(t), "s"))
@@ -102,6 +119,11 @@ class Climatology:
         return torch.from_numpy(arr)
 
     def _lazy_frame(self, day: int, hour: int) -> np.ndarray:
+        hour = min(self.hours, key=lambda x: abs(x - hour))
+        key = (day, hour)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
         sel = self.lazy.sel(dayofyear=day + 1, hour=hour)
         frames = []
         for c in self.channels:
@@ -109,4 +131,10 @@ class Climatology:
             if c.level is not None:
                 da = da.sel(level=c.level)
             frames.append(np.asarray(da.transpose("lat", "lon").values, np.float32))
-        return np.stack(frames)
+        frame = np.stack(frames)
+        if self.coarsener is not None:
+            frame = self.coarsener(frame)
+        self._cache[key] = frame
+        if len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return frame

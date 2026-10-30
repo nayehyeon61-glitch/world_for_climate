@@ -20,6 +20,7 @@ import torch
 import xarray as xr
 
 from climate_wm import pipeline
+from climate_wm.data.sources import AreaCoarsener
 from climate_wm.eval.graphcast_metrics import (HEADLINE_KEYS, acc_skill_score,
                                                format_scorecard, rmse_skill_score)
 
@@ -27,11 +28,14 @@ from climate_wm.eval.graphcast_metrics import (HEADLINE_KEYS, acc_skill_score,
 class GraphCastForecasts:
     """fn(init_times [B] seconds, lead) -> physical forecasts [B, L, C, H, W]."""
 
-    def __init__(self, path, channels):
-        ds = xr.open_zarr(path)
+    def __init__(self, path, channels, coarsen=1):
+        opts = {"storage_options": {"token": "anon"}} if path.startswith("gs://") else {}
+        ds = xr.open_zarr(path, **opts)
         ds = ds.rename({k: v for k, v in {"latitude": "lat", "longitude": "lon"}.items()
                         if k in ds.dims}).sortby("lat").sortby("lon")
         self.ds, self.channels = ds, channels
+        self.coarsener = (AreaCoarsener(ds.lat.values, ds.lon.values, coarsen)
+                          if coarsen > 1 else None)
         lead = ds.prediction_timedelta.values
         if np.issubdtype(lead.dtype, np.timedelta64):
             lead = lead / np.timedelta64(1, "h")
@@ -51,22 +55,34 @@ class GraphCastForecasts:
             da = sub[c.name] if c.level is None else sub[c.name].sel(level=c.level)
             frames.append(np.asarray(
                 da.transpose("time", "prediction_timedelta", "lat", "lon").values, np.float32))
-        return torch.from_numpy(np.stack(frames, axis=2))
+        out = np.stack(frames, axis=2)
+        if self.coarsener is not None:
+            out = self.coarsener(out)
+        return torch.from_numpy(np.ascontiguousarray(out))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--data-dir", default=None,
+                        help='replaces "{data_dir}" in the config; holds graphcast.zarr by default')
     parser.add_argument("--lead-steps", type=int, default=None)
     parser.add_argument("--init-stride", type=int, default=1)
     parser.add_argument("--members", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--graphcast", default=None,
+                        help="GraphCast forecast zarr (default DATA/graphcast.zarr); e.g. the "
+                             "WB2 0.25 deg store on gs:// read lazily")
+    parser.add_argument("--coarsen", type=int, default=1,
+                        help="coarsen the GraphCast forecasts to the model grid (4: 0.25 -> 1 deg)")
     args = parser.parse_args()
 
     cfg, state, stats = pipeline.load_checkpoint(args.checkpoint, args.device)
-    cfg = pipeline.substitute_data_dir(cfg, args.data_dir)
+    if args.data_dir:
+        cfg = pipeline.substitute_data_dir(cfg, args.data_dir)
+    if not (args.graphcast or args.data_dir):
+        parser.error("give --graphcast or --data-dir")
     if args.lead_steps:
         cfg["eval"]["lead_steps"] = args.lead_steps
     if args.members:
@@ -77,7 +93,8 @@ def main():
     model = pipeline.build_model(cfg, layout, train_ds).to(args.device)
     model.load_state_dict(state)
     clim = pipeline.build_climatology(cfg, train_ds)
-    gc = GraphCastForecasts(os.path.join(args.data_dir, "graphcast.zarr"), layout.targets)
+    gc = GraphCastForecasts(args.graphcast or os.path.join(args.data_dir, "graphcast.zarr"),
+                            layout.targets, coarsen=args.coarsen)
 
     inits = np.array([val_ds.times[i].astype("datetime64[s]").astype(np.int64)
                       for i in val_ds.indices])
