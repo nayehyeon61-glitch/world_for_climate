@@ -72,7 +72,7 @@ class LatentDenoiser(nn.Module):
         self.cs = cs
         # Inputs: noisy residual, Zbar_{t+1}, Z_{t-k+1:t}.
         self.embed = LatentEmbedding(history + 2, cs, cv_latent, forcing_dim,
-                                     graphs.struct_dim, num_shells, d, cv,
+                                     graphs.latent_struct_dim, num_shells, d, cv,
                                      hidden_layers)
         self.noise_emb = FourierFeatures(cfg.cond_dim)
         self.cond_proj = nn.Sequential(

@@ -71,8 +71,8 @@ class ShellGNNEncoder(nn.Module):
         v = h.new_zeros(h.shape[:3] + (cv, 3))
         return h, v
 
-    def forward(self, graphs: WorldGraphs, x: Tensor) -> Latent:
-        """x [B, C_enc, H, W] normalised, channels = [dynamic | forcings | static]."""
+    def grid_features(self, graphs: WorldGraphs, x: Tensor):
+        """Per-shell grid node features: h [B, S, G, d], v [B, S, G, cv, 3]."""
         b = x.shape[0]
         flat = x.flatten(2).transpose(1, 2)  # [B, G, C]
         n_dyn = len(self.layout.dynamic)
@@ -88,7 +88,12 @@ class ShellGNNEncoder(nn.Module):
             else:
                 vec = flat.new_zeros(b, flat.shape[1], 1, 3)
             vs.append(self.in_vector[s](vec))
-        h_grid, v_grid = torch.stack(hs, 1), torch.stack(vs, 1)
+        return torch.stack(hs, 1), torch.stack(vs, 1)
+
+    def forward(self, graphs: WorldGraphs, x: Tensor) -> Latent:
+        """x [B, C_enc, H, W] normalised, channels = [dynamic | forcings | static]."""
+        b = x.shape[0]
+        h_grid, v_grid = self.grid_features(graphs, x)
         cv = v_grid.shape[-2]
 
         h, v = self._node_init(self.mesh_embed, graphs.mesh_struct, b, cv)

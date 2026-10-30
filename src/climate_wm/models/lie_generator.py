@@ -66,7 +66,7 @@ class LieGenerator(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = LatentEmbedding(history, cs, cv_latent, forcing_dim,
-                                     graphs.struct_dim, num_shells, d, cv,
+                                     graphs.latent_struct_dim, num_shells, d, cv,
                                      hidden_layers)
         self.processor = ShellProcessor(d, cv, graphs.latent_mesh.edge_dim,
                                         cfg.layers, num_shells, hidden_layers)

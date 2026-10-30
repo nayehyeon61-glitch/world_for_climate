@@ -13,6 +13,7 @@ of the latent state. If latent_splits == mesh_splits there is no pooling.
 from __future__ import annotations
 
 import dataclasses
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from ..geometry import tangent_frames
 from ..geometry.group_actions import SphereRotationAction
 from ..geometry.shells import SpherePatches
 from .layers import GeoGraph, structural_features
+from .pyramid_graphs import PyramidGraphs
 
 
 @dataclasses.dataclass
@@ -35,6 +37,10 @@ class MeshConfig:
     radius_fraction: float = 0.6  # GraphCast radius_query_fraction_edge_length
     break_symmetry: bool = True
     action_rings: int = 3
+    # Stage 4 pyramid: icosphere levels that carry latent state (coarse -> fine,
+    # consecutive, ending at mesh_splits), e.g. (1, 2, 3); () = single scale.
+    pyramid_levels: Tuple[int, ...] = ()
+    pyramid_detail_level: int = 2  # finest patch level with its own detail rotation
 
 
 class WorldGraphs(nn.Module):
@@ -83,28 +89,56 @@ class WorldGraphs(nn.Module):
         self.register_buffer("grid_north", f32(north))
         self.register_buffer("grid_pos", f32(grid_xyz))
         self.register_buffer("mesh_pos", f32(fine.vertices))
-        self.register_buffer("latent_pos", f32(latent.vertices))
         self.register_buffer("grid_struct", f32(structural_features(grid_xyz, bs)))
         self.register_buffer("mesh_struct", f32(structural_features(fine.vertices, bs)))
-        self.register_buffer("latent_struct", f32(structural_features(latent.vertices, bs)))
-        # Grid -> latent node area-weighted assignment (for forcings at nodes).
-        nearest = cKDTree(latent.vertices).query(grid_xyz)[1]
-        area = np.cos(np.deg2rad(lat_f)) + 1e-3
-        norm = np.bincount(nearest, weights=area, minlength=self.num_latent)
-        self.register_buffer("grid_to_latent", torch.tensor(nearest, dtype=torch.long))
-        self.register_buffer("grid_to_latent_w", f32(area / norm[nearest]))
+
+        # Stage 4: the latent lives on a stack of icosphere levels. The
+        # transition networks only see the stacked node set.
+        self.pyramid = None
+        if cfg.pyramid_levels:
+            if self.has_pooling:
+                raise ValueError("pyramid_levels needs latent_splits == mesh_splits")
+            self.pyramid = PyramidGraphs(meshes, grid_xyz, lat_f, cfg.pyramid_levels,
+                                         cfg.pyramid_detail_level, cfg.radius_fraction,
+                                         bs, cfg.action_rings, cfg.patch_neighbors)
+            self.num_latent = self.pyramid.num_nodes
+            self.latent_mesh = self.pyramid.stacked_mesh
+            self.register_buffer("latent_pos", self.pyramid.stacked_pos.clone())
+            self.register_buffer("latent_struct", self.pyramid.stacked_struct.clone())
+            self.register_buffer("grid_to_latent", self.pyramid.grid_to_nodes.clone())
+            self.register_buffer("grid_to_latent_w", self.pyramid.grid_to_nodes_w.clone())
+            self.register_buffer("grid_to_latent_cells", self.pyramid.grid_to_cells.clone())
+        else:
+            self.register_buffer("latent_pos", f32(latent.vertices))
+            self.register_buffer("latent_struct", f32(structural_features(latent.vertices, bs)))
+            # Grid -> latent node area-weighted assignment (for forcings at nodes).
+            nearest = cKDTree(latent.vertices).query(grid_xyz)[1]
+            area = np.cos(np.deg2rad(lat_f)) + 1e-3
+            norm = np.bincount(nearest, weights=area, minlength=self.num_latent)
+            self.register_buffer("grid_to_latent", torch.tensor(nearest, dtype=torch.long))
+            self.register_buffer("grid_to_latent_w", f32(area / norm[nearest]))
 
     @property
     def struct_dim(self) -> int:
+        """Structural feature width of grid and mesh nodes."""
         return self.grid_struct.shape[1]
+
+    @property
+    def latent_struct_dim(self) -> int:
+        """Structural feature width of latent nodes (+ level one-hot for a pyramid)."""
+        return self.latent_struct.shape[1]
 
     def grid_to_latent_mean(self, x: torch.Tensor) -> torch.Tensor:
         """Area-weighted average of grid fields onto latent nodes.
 
-        x [B, C, H, W] -> [B, N_latent, C].
+        x [B, C, H, W] -> [B, N_latent, C]. For a pyramid every level gets its
+        own average (the grid is assigned once per level).
         """
         b, c = x.shape[:2]
-        flat = x.reshape(b, c, -1).transpose(1, 2) * self.grid_to_latent_w[None, :, None]
+        flat = x.reshape(b, c, -1).transpose(1, 2)
+        if self.pyramid is not None:  # (cell, node) pairs, one set per level
+            flat = flat[:, self.grid_to_latent_cells]
+        flat = flat * self.grid_to_latent_w[None, :, None]
         out = flat.new_zeros(b, self.num_latent, c)
         return out.index_add_(1, self.grid_to_latent, flat)
 
@@ -115,4 +149,6 @@ class WorldGraphs(nn.Module):
                  f"patches {self.patches.num_patches}",
                  f"grid2mesh {self.grid2mesh.num_edges} edges",
                  f"mesh2grid {self.mesh2grid.num_edges} edges"]
+        if self.pyramid is not None:
+            parts.append(self.pyramid.summary())
         return ", ".join(parts)

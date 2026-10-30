@@ -26,7 +26,7 @@ class ResidualDynamics(nn.Module):
                  hidden_layers: int, layers: int):
         super().__init__()
         self.embed = LatentEmbedding(history + 1, cs, cv_latent, forcing_dim,
-                                     graphs.struct_dim, num_shells, d, cv,
+                                     graphs.latent_struct_dim, num_shells, d, cv,
                                      hidden_layers)
         self.processor = ShellProcessor(d, cv, graphs.latent_mesh.edge_dim,
                                         layers, num_shells, hidden_layers)

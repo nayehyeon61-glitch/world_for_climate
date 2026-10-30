@@ -20,6 +20,9 @@ Transition modes (research design ablations, section 10):
                                                                diffusion baseline, H3)
   lie_program          Learning-to-Theorize: Z_{t+1} explained by a short program
                        of so(3) primitives from a shared codebook (models/theory.py)
+  pyramid              stage 4: graph V-Net latent on a stack of icosphere levels,
+                       so(3) pyramid transition (models/vnet.py, pyramid_transition.py)
+  pyramid_diffusion    pyramid + DIAMOND residual on the stacked latent
 """
 
 from __future__ import annotations
@@ -36,15 +39,25 @@ from ..train.losses import GraphCastLoss
 from .graphs import MeshConfig, WorldGraphs
 from .latent import Latent
 from .lie_generator import LieConfig, LieGenerator
+from .pyramid_transition import PyramidLieGenerator
 from .residual_dynamics import ResidualDynamics
 from .shell_gnn_decoder import ShellGNNDecoder
 from .shell_gnn_encoder import ShellGNNConfig, ShellGNNEncoder
 from .stochastic_transition import (DiffusionConfig, LatentDenoiser,
                                     LatentDiffusionSampler)
 from .theory import TheoryConfig, TheoryProgram
+from .vnet import PyramidDecoder, PyramidEncoder
 
 TRANSITIONS = ("euclidean", "lie", "lie_residual", "lie_diffusion",
-               "euclidean_diffusion", "lie_program")
+               "euclidean_diffusion", "lie_program", "pyramid", "pyramid_diffusion")
+
+
+@dataclasses.dataclass
+class PyramidConfig:
+    """Stage 4 graph V-Net options (model.pyramid in the config)."""
+    level_weights: Tuple[float, ...] = (1.0, 0.5, 0.25)  # latent loss per state level, coarse -> fine
+    skip_dropout: float = 0.5  # probability of dropping a sample's skips in training
+    level_layers: int = 1  # message-passing steps per coarse V-Net block
 
 
 @dataclasses.dataclass
@@ -54,6 +67,7 @@ class WorldModelConfig:
     lie: LieConfig = dataclasses.field(default_factory=LieConfig)
     diffusion: DiffusionConfig = dataclasses.field(default_factory=DiffusionConfig)
     theory: TheoryConfig = dataclasses.field(default_factory=TheoryConfig)
+    pyramid: PyramidConfig = dataclasses.field(default_factory=PyramidConfig)
     transition: str = "lie_diffusion"
     history: int = 2  # latent frames conditioning the transition (= GraphCast inputs)
     residual_layers: int = 2
@@ -62,7 +76,7 @@ class WorldModelConfig:
     def from_dict(cls, d: Optional[dict]) -> "WorldModelConfig":
         d = dict(d or {})
         sub = {"mesh": MeshConfig, "gnn": ShellGNNConfig, "lie": LieConfig,
-               "diffusion": DiffusionConfig, "theory": TheoryConfig}
+               "diffusion": DiffusionConfig, "theory": TheoryConfig, "pyramid": PyramidConfig}
         kwargs = {k: sub[k](**d.pop(k)) for k in list(d) if k in sub}
         return cls(**kwargs, **d)
 
@@ -84,18 +98,30 @@ class ClimateWorldModel(nn.Module):
             raise ValueError(f"transition must be one of {TRANSITIONS}")
         if cfg.history > layout.task.input_steps:
             raise ValueError("history cannot exceed the task's input steps")
+        if bool(cfg.mesh.pyramid_levels) != cfg.transition.startswith("pyramid"):
+            raise ValueError("pyramid transitions need mesh.pyramid_levels (and vice versa)")
         self.cfg = cfg
         self.layout = layout
         self.graphs = WorldGraphs(grid_lat, grid_lon, cfg.mesh)
-        self.encoder = ShellGNNEncoder(layout, self.graphs, cfg.gnn)
-        self.decoder = ShellGNNDecoder(layout, self.graphs, cfg.gnn)
+        if self.graphs.pyramid is not None:
+            self.encoder = PyramidEncoder(layout, self.graphs, cfg.gnn, cfg.pyramid.level_layers)
+            self.decoder = PyramidDecoder(layout, self.graphs, cfg.gnn, cfg.pyramid.level_layers,
+                                          cfg.pyramid.skip_dropout)
+        else:
+            self.encoder = ShellGNNEncoder(layout, self.graphs, cfg.gnn)
+            self.decoder = ShellGNNDecoder(layout, self.graphs, cfg.gnn)
         g = cfg.gnn
         common = dict(graphs=self.graphs, num_shells=len(layout.shells),
                       history=cfg.history, forcing_dim=len(layout.forcings),
                       cs=g.latent_scalars, cv_latent=g.latent_vectors,
                       d=g.hidden_dim, cv=g.vector_dim, hidden_layers=g.hidden_layers)
         t = cfg.transition
-        self.lie = LieGenerator(**common, cfg=cfg.lie) if t.startswith("lie") else None
+        if t.startswith("lie"):
+            self.lie = LieGenerator(**common, cfg=cfg.lie)
+        elif t.startswith("pyramid"):
+            self.lie = PyramidLieGenerator(**common, cfg=cfg.lie)
+        else:
+            self.lie = None
         self.residual = (ResidualDynamics(**common, layers=cfg.residual_layers)
                          if t in ("euclidean", "lie_residual") else None)
         self.denoiser = (LatentDenoiser(**common, cfg=cfg.diffusion)
@@ -141,6 +167,17 @@ class ClimateWorldModel(nn.Module):
             return history[-1], None, None
         omega, omega_node, joints = self.lie(self.graphs, history, nf)
         return self.lie.act(self.graphs, history[-1], omega_node), omega, joints
+
+    def latent_error(self, z: Latent, target: Latent) -> Tensor:
+        """Mean squared latent error; level-weighted (coarse first) for a pyramid."""
+        pyr = self.graphs.pyramid
+        if pyr is None:
+            return z.squared_error(target)
+        w = pyr.level_weights(self.cfg.pyramid.level_weights)
+        pieces = zip(pyr.split(z.h), pyr.split(z.v), pyr.split(target.h), pyr.split(target.v))
+        total = sum(wi * Latent(h, v).squared_error(Latent(th, tv))
+                    for wi, (h, v, th, tv) in zip(w, pieces))
+        return total / sum(w)
 
     def _residual_scale(self, z: Latent, inverse: bool = False) -> Latent:
         s_h, s_v = self.residual_scale
@@ -212,13 +249,16 @@ class ClimateWorldModel(nn.Module):
                     z_next = out.z
                     z_tgt = self.encode_target(batch, k)
                     terms = {"forecast": self.loss_fn(self.decode(z_next), target_x),
-                             "latent": z_next.squared_error(z_tgt.detach())}
+                             "latent": self.latent_error(z_next, z_tgt.detach())}
                     if k == 0:
                         terms["rec"] = self.loss_fn(self.decode(z_tgt), target_x)
                     if out.omega is not None:
                         terms["geo"] = out.omega.square().sum(-1).mean()
-                    if out.joints is not None and self.cfg.lie.shell_coupling == "chain":
-                        terms["joint"] = out.joints[:, 1:].square().sum(-1).mean()
+                    if out.joints is not None:
+                        if self.graphs.pyramid is not None:  # scale-chain details
+                            terms["joint"] = out.joints.square().sum(-1).mean()
+                        elif self.cfg.lie.shell_coupling == "chain":
+                            terms["joint"] = out.joints[:, 1:].square().sum(-1).mean()
                 else:
                     nf = self.node_forcing(forcing)
                     with torch.no_grad():

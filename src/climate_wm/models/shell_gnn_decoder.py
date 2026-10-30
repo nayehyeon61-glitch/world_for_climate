@@ -66,6 +66,11 @@ class ShellGNNDecoder(nn.Module):
             h0, v0 = self._node_init(self.mesh_embed, graphs.mesh_struct, b)
             h, v = self.unpool(graphs.unpool, h, v, h0, v0)
         h, v = self.processor(graphs.mesh, h, v)
+        return self.readout(graphs, h, v)
+
+    def readout(self, graphs: WorldGraphs, h: Tensor, v: Tensor) -> Tensor:
+        """Mesh features [B, S, N_mesh, ...] -> normalised target fields [B, C, H, W]."""
+        b = h.shape[0]
         hg, vg = self._node_init(self.grid_embed, graphs.grid_struct, b)
         hg, vg = self.mesh2grid(graphs.mesh2grid, h, v, hg, vg)
 

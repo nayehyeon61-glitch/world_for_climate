@@ -34,6 +34,8 @@ def _model(layout, data, transition, coupling="independent"):
     torch.manual_seed(0)
     cfg = dict(TINY, transition=transition)
     cfg["lie"] = dict(TINY["lie"], shell_coupling=coupling)
+    if transition.startswith("pyramid"):  # stage 4 latent lives on levels 1 and 2
+        cfg["mesh"] = dict(TINY["mesh"], pyramid_levels=(1, 2), latent_splits=2)
     return ClimateWorldModel(WorldModelConfig.from_dict(cfg), layout, data.lat, data.lon)
 
 
