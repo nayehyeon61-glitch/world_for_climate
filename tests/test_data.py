@@ -81,5 +81,6 @@ def test_standardize_accumulates_hourly_precip():
     out = standardize(ds)
     assert list(out.lat.values) == [-10., 0., 10.]
     assert out.lon.values.min() >= 0
-    assert list(out.time.dt.hour.values) == [0, 6, 12, 18]
-    np.testing.assert_allclose(out.total_precipitation_6hr.isel(time=slice(1, None)).values, 6.0)
+    # 00 UTC has no complete 6h accumulation in this archive and is dropped.
+    assert list(out.time.dt.hour.values) == [6, 12, 18]
+    np.testing.assert_allclose(out.total_precipitation_6hr.values, 6.0)

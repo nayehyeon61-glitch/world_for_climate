@@ -56,9 +56,12 @@ def standardize(ds: xr.Dataset, rename: Optional[Dict[str, str]] = None,
     if "total_precipitation_6hr" not in ds and "total_precipitation" in ds:
         step = pd.Timedelta(ds.time.values[1] - ds.time.values[0])
         if step == pd.Timedelta("1h"):
-            # ERA5 hourly tp at T is the accumulation over (T-1h, T].
+            # ERA5 hourly tp at T is the accumulation over (T-1h, T]. The first
+            # 5 hours have no complete 6h window; drop them so no NaN frame
+            # reaches the windows or the normalisation statistics.
             ds["total_precipitation_6hr"] = ds.total_precipitation.rolling(
                 time=6, min_periods=6).sum()
+            ds = ds.isel(time=slice(5, None))
         elif step == pd.Timedelta("6h"):
             ds["total_precipitation_6hr"] = ds.total_precipitation
         else:

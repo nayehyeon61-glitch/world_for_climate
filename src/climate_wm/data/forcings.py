@@ -19,6 +19,7 @@ AVG_DAY_PER_YEAR = 365.24219
 _J2000_EPOCH = 2451545.0
 _JULIAN_YEAR_LENGTH_IN_DAYS = 365.25
 _REFERENCE_TSI = 1361.0
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz  # trapz before NumPy 2.0
 
 
 def seconds_since_epoch(times) -> np.ndarray:
@@ -85,7 +86,7 @@ def _integrate(times, sin_lat, cos_lat, lon, num_bins, tsi):
             hour_angle = 2.0 * np.pi * solar_time[k] + lon
             sin_alt = cos_lat * cos_d[k] * np.cos(hour_angle) + sin_lat * sin_d[k]
             flux.append(tsi / dist[k] ** 2 * np.maximum(sin_alt, 0.0))
-        out.append(np.trapezoid(np.stack(flux, -1), dx=dx, axis=-1))
+        out.append(_trapezoid(np.stack(flux, -1), dx=dx, axis=-1))
     return np.stack(out).astype(np.float32)
 
 
