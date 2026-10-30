@@ -131,8 +131,8 @@ def build_model(cfg: dict, layout: gm.ChannelLayout, dataset) -> ClimateWorldMod
     model = ClimateWorldModel(WorldModelConfig.from_dict(cfg["model"]), layout,
                               dataset.lat, dataset.lon)
     stats = getattr(dataset, "stats", None)
-    if model.diagnostics is not None and stats is not None:
-        model.diagnostics.set_stats(stats)  # a loaded checkpoint carries the same buffers
+    if stats is not None:
+        model.set_normalization(stats)  # a loaded checkpoint carries the same buffers
     return model
 
 

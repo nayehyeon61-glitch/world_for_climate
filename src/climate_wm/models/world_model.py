@@ -31,13 +31,16 @@ import dataclasses
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import Tensor, nn
 
 from ..data.graphcast_mapping import ChannelLayout
-from ..eval.physics_diag import DiagnosticsConfig, PhysicsDiagnostics, with_diagnostics
+from ..eval.physics_diag import (EARTH_RADIUS, DiagnosticsConfig, PhysicsDiagnostics,
+                                 with_diagnostics)
 from ..geometry.composite_group import CompositeConfig
 from ..train.losses import GraphCastLoss
+from .critic import CriticConfig, RealityCritic
 from .graphs import MeshConfig, WorldGraphs
 from .latent import Latent
 from .lie_generator import LieConfig, LieGenerator
@@ -72,6 +75,7 @@ class WorldModelConfig:
     pyramid: PyramidConfig = dataclasses.field(default_factory=PyramidConfig)
     diagnostics: DiagnosticsConfig = dataclasses.field(default_factory=DiagnosticsConfig)
     composite: CompositeConfig = dataclasses.field(default_factory=CompositeConfig)
+    critic: CriticConfig = dataclasses.field(default_factory=CriticConfig)
     transition: str = "lie_diffusion"
     history: int = 2  # latent frames conditioning the transition (= GraphCast inputs)
     residual_layers: int = 2
@@ -81,7 +85,8 @@ class WorldModelConfig:
         d = dict(d or {})
         sub = {"mesh": MeshConfig, "gnn": ShellGNNConfig, "lie": LieConfig,
                "diffusion": DiffusionConfig, "theory": TheoryConfig, "pyramid": PyramidConfig,
-               "diagnostics": DiagnosticsConfig, "composite": CompositeConfig}
+               "diagnostics": DiagnosticsConfig, "composite": CompositeConfig,
+               "critic": CriticConfig}
         kwargs = {k: sub[k](**d.pop(k)) for k in list(d) if k in sub}
         return cls(**kwargs, **d)
 
@@ -144,10 +149,24 @@ class ClimateWorldModel(nn.Module):
                                      static_dim=len(layout.static))
                        if t == "lie_program" else None)
         self.loss_fn = GraphCastLoss(layout, grid_lat)
+        # Stage 5 reality critic: its own diagnostics (all families) of decoded states.
+        self.critic = None
+        if cfg.critic.enabled:
+            pyr = self.graphs.pyramid
+            centres = ([pyr.pyramid[-1].patches[k].centres for k in pyr.rot_levels]
+                       if pyr is not None else None)
+            diag = PhysicsDiagnostics(layout, grid_lat, grid_lon, DiagnosticsConfig(enabled=True))
+            self.critic = RealityCritic(diag, len(grid_lat), len(layout.shells), centres, cfg.critic)
         # RMS of the latent residual (scalar part, vector part); calibrated once
         # at the start of the stochastic stage so that sigma_data = 1 holds.
         self.register_buffer("residual_scale", torch.ones(2))
         self.register_buffer("residual_calibrated", torch.tensor(False))
+
+    def set_normalization(self, stats) -> None:
+        """Gives the stage 5 diagnostics the physical units of the inputs."""
+        for diag in (self.diagnostics, self.critic.diagnostic.diag if self.critic is not None else None):
+            if diag is not None:
+                diag.set_stats(stats)
 
     # ------------------------------------------------------------------ I/O
     def encoder_input(self, dynamic: Tensor, forcing: Tensor, static: Tensor) -> Tensor:
@@ -189,6 +208,32 @@ class ClimateWorldModel(nn.Module):
             return self.lie.act(self.graphs, history[-1], omega_node, terms), omega, joints, terms
         omega, omega_node, joints = self.lie(self.graphs, history, nf)
         return self.lie.act(self.graphs, history[-1], omega_node), omega, joints, None
+
+    def observed_generators(self, dynamic: Tensor) -> Tensor:
+        """so(3) pyramid generators implied by the observed shell-mean wind of
+        normalised dynamic fields [B, C_dyn, H, W]: [B, S, sum_k P_k, 3] in rad per step."""
+        if self.critic is None or self.graphs.pyramid is None:
+            raise ValueError("observed generators need model.critic and a pyramid transition")
+        g = self.graphs
+        phys = self.critic.diagnostic.diag.physical(dynamic.float())
+        b, _, hh, ww = phys.shape
+        winds = []
+        for part in self.layout.dynamic_shells:
+            if part.vector_u:
+                u = phys[:, part.vector_u].mean(1).flatten(1)  # [B, G]
+                v = phys[:, part.vector_v].mean(1).flatten(1)
+                winds.append(u[..., None] * g.grid_east + v[..., None] * g.grid_north)
+            else:
+                winds.append(phys.new_zeros(b, hh * ww, 3))
+        xyz = torch.stack(winds, 1)  # [B, S, G, 3] m/s
+        s = xyz.shape[1]
+        node = g.grid_to_latent_mean(xyz.permute(0, 1, 3, 2).reshape(b, s * 3, hh, ww))
+        node = node.reshape(b, -1, s, 3).permute(0, 2, 1, 3)  # [B, S, N, 3]
+        pos = g.latent_pos
+        node = node - (node * pos).sum(-1, keepdim=True) * pos  # tangent at the latent nodes
+        seconds = pd.Timedelta(self.layout.task.timestep).total_seconds() * self.cfg.lie.dt
+        omega, _, _ = self.lie.project(g, node * (seconds / EARTH_RADIUS))
+        return omega
 
     def latent_error(self, z: Latent, target: Latent) -> Tensor:
         """Mean squared latent error; level-weighted (coarse first) for a pyramid."""
@@ -250,6 +295,7 @@ class ClimateWorldModel(nn.Module):
         dynamics:   L_forecast (multi-step, latent rollout) + L_latent + L_rec
                     + L_geo (|omega|^2) + L_joint (torsion springs)
                     + L_fib (stage 5 shift / fibre coefficients, squared)
+                    + L_phys, L_fisher (stage 5 critic, models/critic.py)
         stochastic: L_gen (EDM denoising of the latent residual, DIAMOND)
                     + optional L_forecast on the denoised estimate
         """
@@ -271,8 +317,11 @@ class ClimateWorldModel(nn.Module):
                     out = self.step(history, forcing, sample=False)
                     z_next = out.z
                     z_tgt = self.encode_target(batch, k)
-                    terms = {"forecast": self.loss_fn(self.decode(z_next), target_x),
+                    pred_x = self.decode(z_next)
+                    terms = {"forecast": self.loss_fn(pred_x, target_x),
                              "latent": self.latent_error(z_next, z_tgt.detach())}
+                    if self.critic is not None:  # stage 5: judged against observed statistics
+                        terms.update(self._critic_terms(batch, k, pred_x, out))
                     if k == 0:
                         terms["rec"] = self.loss_fn(self.decode(z_tgt), target_x)
                     if out.omega is not None:
@@ -302,12 +351,30 @@ class ClimateWorldModel(nn.Module):
                     logs[name] = logs.get(name, 0.0) + value / steps
                     total = total + w(name) * value / steps
                 history = list(history[1:]) + [z_next]
+            if self.critic is not None and stage == "dynamics" and self.training:
+                self.critic.tick()
         elif stage == "theory":
             total, logs = self.theory_losses(batch, w)
         else:
             raise ValueError(f"unknown stage {stage}")
         return total, {k: float(v.detach() if torch.is_tensor(v) else v)
                        for k, v in logs.items()}
+
+    def _critic_terms(self, batch: Dict[str, Tensor], k: int, pred_x: Tensor,
+                      out: StepOutput) -> Dict[str, Tensor]:
+        """L_phys (diagnostic moments) and L_fisher (generator discriminant), ramped in."""
+        t2d = self.layout.target_to_dynamic
+        critic, ramp = self.critic, self.critic.ramp()
+        if self.training:
+            critic.diagnostic.observe(batch["targets"][:, k][:, t2d])
+        terms = {"phys": ramp * critic.diagnostic.score(pred_x[:, t2d]).mean()}
+        if critic.fisher is not None and out.omega is not None:
+            obs = batch["inputs"][:, -1] if k == 0 else batch["targets"][:, k - 1][:, t2d]
+            if self.training:
+                with torch.no_grad():
+                    critic.fisher.observe(self.observed_generators(obs), out.omega.detach())
+            terms["fisher"] = ramp * critic.fisher.penalty(out.omega)
+        return terms
 
     def theory_losses(self, batch: Dict[str, Tensor], w) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Learning-to-Theorize stage (transition lie_program).

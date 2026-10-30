@@ -148,10 +148,17 @@ class PyramidLieGenerator(nn.Module):
             return self._algebra(graphs, h.float(), v.float())
 
     def _algebra(self, graphs: WorldGraphs, h: Tensor, v: Tensor):
-        pyr = graphs.pyramid
-        b, s = h.shape[:2]
         u = (self.velocity(h)[..., None] * v).sum(-2)  # tangent velocity [B, S, N, 3]
-        spin = self.spin(h)  # [B, S, N, 1]
+        return self.project(graphs, u, self.spin(h))
+
+    def project(self, graphs: WorldGraphs, u: Tensor, spin: Optional[Tensor] = None):
+        """Node velocities u [B, S, N, 3] (rad per step) and spins [B, S, N, 1]
+        -> the pyramid (omega, omega_node, joints) as in `forward`. Also used for
+        the generators implied by an observed wind field (stage 5 critic)."""
+        pyr = graphs.pyramid
+        b, s = u.shape[:2]
+        if spin is None:
+            spin = u.new_zeros(u.shape[:-1] + (1,))
         u_levels = [x.flatten(0, 1) for x in pyr.split(u)]
         spin_levels = [x.flatten(0, 1) for x in pyr.split(spin)]
         omegas = []
