@@ -36,6 +36,7 @@ from torch import Tensor, nn
 
 from ..data.graphcast_mapping import ChannelLayout
 from ..eval.physics_diag import DiagnosticsConfig, PhysicsDiagnostics, with_diagnostics
+from ..geometry.composite_group import CompositeConfig
 from ..train.losses import GraphCastLoss
 from .graphs import MeshConfig, WorldGraphs
 from .latent import Latent
@@ -70,6 +71,7 @@ class WorldModelConfig:
     theory: TheoryConfig = dataclasses.field(default_factory=TheoryConfig)
     pyramid: PyramidConfig = dataclasses.field(default_factory=PyramidConfig)
     diagnostics: DiagnosticsConfig = dataclasses.field(default_factory=DiagnosticsConfig)
+    composite: CompositeConfig = dataclasses.field(default_factory=CompositeConfig)
     transition: str = "lie_diffusion"
     history: int = 2  # latent frames conditioning the transition (= GraphCast inputs)
     residual_layers: int = 2
@@ -79,7 +81,7 @@ class WorldModelConfig:
         d = dict(d or {})
         sub = {"mesh": MeshConfig, "gnn": ShellGNNConfig, "lie": LieConfig,
                "diffusion": DiffusionConfig, "theory": TheoryConfig, "pyramid": PyramidConfig,
-               "diagnostics": DiagnosticsConfig}
+               "diagnostics": DiagnosticsConfig, "composite": CompositeConfig}
         kwargs = {k: sub[k](**d.pop(k)) for k in list(d) if k in sub}
         return cls(**kwargs, **d)
 
@@ -90,6 +92,7 @@ class StepOutput:
     zbar: Latent  # structural prediction Zbar_{t+1}
     omega: Optional[Tensor] = None  # [B, S, P, 3]
     joints: Optional[Tensor] = None  # [B, S, P, 3] joint rotations (chain)
+    composite: Optional[object] = None  # stage 5 shift / fibre coefficients (CompositeTerms)
 
 
 class ClimateWorldModel(nn.Module):
@@ -103,6 +106,8 @@ class ClimateWorldModel(nn.Module):
             raise ValueError("history cannot exceed the task's input steps")
         if bool(cfg.mesh.pyramid_levels) != cfg.transition.startswith("pyramid"):
             raise ValueError("pyramid transitions need mesh.pyramid_levels (and vice versa)")
+        if cfg.composite.enabled and not cfg.transition.startswith("pyramid"):
+            raise ValueError("model.composite needs a pyramid transition")
         self.cfg = cfg
         # Stage 5: physical diagnostics of the input state as extra encoder channels.
         self.diagnostics = (PhysicsDiagnostics(layout, grid_lat, grid_lon, cfg.diagnostics)
@@ -127,7 +132,7 @@ class ClimateWorldModel(nn.Module):
         if t.startswith("lie"):
             self.lie = LieGenerator(**common, cfg=cfg.lie)
         elif t.startswith("pyramid"):
-            self.lie = PyramidLieGenerator(**common, cfg=cfg.lie)
+            self.lie = PyramidLieGenerator(**common, cfg=cfg.lie, composite=cfg.composite)
         else:
             self.lie = None
         self.residual = (ResidualDynamics(**common, layers=cfg.residual_layers)
@@ -173,10 +178,17 @@ class ClimateWorldModel(nn.Module):
     # ----------------------------------------------------------- transition
     def structural(self, history: Sequence[Latent], nf: Tensor):
         """Zbar_{t+1} = Phi_{exp(dt xi)}(Z_t) (or Z_t without Lie generator)."""
+        return self.structural_terms(history, nf)[:3]
+
+    def structural_terms(self, history: Sequence[Latent], nf: Tensor):
+        """`structural` plus the stage 5 composite terms (None unless model.composite)."""
         if self.lie is None:
-            return history[-1], None, None
+            return history[-1], None, None, None
+        if getattr(self.lie, "composite", None) is not None:
+            omega, omega_node, joints, terms = self.lie.generate(self.graphs, history, nf)
+            return self.lie.act(self.graphs, history[-1], omega_node, terms), omega, joints, terms
         omega, omega_node, joints = self.lie(self.graphs, history, nf)
-        return self.lie.act(self.graphs, history[-1], omega_node), omega, joints
+        return self.lie.act(self.graphs, history[-1], omega_node), omega, joints, None
 
     def latent_error(self, z: Latent, target: Latent) -> Tensor:
         """Mean squared latent error; level-weighted (coarse first) for a pyramid."""
@@ -199,7 +211,7 @@ class ClimateWorldModel(nn.Module):
              sample: bool = True, num_denoising_steps: Optional[int] = None
              ) -> StepOutput:
         nf = self.node_forcing(forcing_next)
-        zbar, omega, joints = self.structural(history, nf)
+        zbar, omega, joints, terms = self.structural_terms(history, nf)
         pos = self.graphs.latent_pos
         if self.residual is not None:
             z = zbar.exp(self.residual(self.graphs, zbar, history, nf), pos)
@@ -209,7 +221,7 @@ class ClimateWorldModel(nn.Module):
             z = zbar.exp(self._residual_scale(r), pos)
         else:
             z = zbar
-        return StepOutput(z=z, zbar=zbar, omega=omega, joints=joints)
+        return StepOutput(z=z, zbar=zbar, omega=omega, joints=joints, composite=terms)
 
     # ------------------------------------------------------------- training
     def set_grad_checkpointing(self, enabled: bool = True) -> None:
@@ -237,6 +249,7 @@ class ClimateWorldModel(nn.Module):
         repr:       L_rec
         dynamics:   L_forecast (multi-step, latent rollout) + L_latent + L_rec
                     + L_geo (|omega|^2) + L_joint (torsion springs)
+                    + L_fib (stage 5 shift / fibre coefficients, squared)
         stochastic: L_gen (EDM denoising of the latent residual, DIAMOND)
                     + optional L_forecast on the denoised estimate
         """
@@ -269,6 +282,8 @@ class ClimateWorldModel(nn.Module):
                             terms["joint"] = out.joints.square().sum(-1).mean()
                         elif self.cfg.lie.shell_coupling == "chain":
                             terms["joint"] = out.joints[:, 1:].square().sum(-1).mean()
+                    if out.composite is not None:  # stage 5: shift and fibre part of the generator size
+                        terms["fib"] = out.composite.norm2()
                 else:
                     nf = self.node_forcing(forcing)
                     with torch.no_grad():

@@ -18,15 +18,27 @@ and every state level is moved by the scale chain blended onto its nodes,
 with the shell chain's `compose`. The projection is GraphCast's ball-query
 sum aggregation written in the Lie algebra: torques of the nodes inside a
 patch are summed and divided by the patch inertia.
+
+Stage 5 (`model.composite.enabled`) widens the step to the composite group
+(SO(3) x Vert) ⋉ Fib of `geometry.composite_group`: the same features also
+give a vertical shift w per column (shells per step) and the physics-family
+coefficients of the fibre generators, and the step is the Strang splitting
+exp(dt/2 F) exp(dt w d/d eta) exp(dt omega) exp(dt/2 F). The shift head is
+zero-initialised and every family has a gain that starts at zero (kept
+non-negative for mixing and condensation by a straight-through projection),
+so a composite model starts as the plain pyramid transition.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
 
+from ..geometry.composite_group import (FIB_FAMILIES, CompositeConfig, FibreCoefficients,
+                                        FibreGenerators, split_step, vert_shift)
 from ..geometry.group_actions import clamp_rotation, so3_exp
 from .graphs import WorldGraphs
 from .latent import Latent, LatentEmbedding
@@ -34,11 +46,32 @@ from .layers import ShellProcessor
 from .lie_generator import LieConfig
 
 
+@dataclasses.dataclass
+class CompositeTerms:
+    """Generators of one step besides the rotations (stage 5)."""
+    shift: Optional[Tensor]  # [B, N] vertical shift in shells per step (None = Vert off)
+    coef: FibreCoefficients  # physics-family coefficients
+
+    def norm2(self) -> Tensor:
+        """Mean squared generator size (the fibre and shift part of L_geo)."""
+        parts = list(self.coef.norm2().values())
+        if self.shift is not None:
+            parts.append(self.shift.square().mean())
+        return sum(parts) if parts else torch.zeros(())
+
+
+def _nonneg(g: Tensor) -> Tensor:
+    """max(g, 0) in the forward pass with the identity's gradient, so that a
+    gain projected to zero can still come back."""
+    return g + (g.clamp_min(0) - g).detach()
+
+
 class PyramidLieGenerator(nn.Module):
 
     def __init__(self, graphs: WorldGraphs, num_shells: int, history: int,
                  forcing_dim: int, cs: int, cv_latent: int, d: int, cv: int,
-                 hidden_layers: int, cfg: LieConfig):
+                 hidden_layers: int, cfg: LieConfig,
+                 composite: Optional[CompositeConfig] = None):
         super().__init__()
         if graphs.pyramid is None:
             raise ValueError("the pyramid transition needs mesh.pyramid_levels")
@@ -58,6 +91,17 @@ class PyramidLieGenerator(nn.Module):
         # CFL-like cap per state level: a fraction of that level's edge length.
         self.register_buffer("max_angle", torch.tensor(
             [cfg.max_rotation_edges * e for e in graphs.pyramid.max_edge]), persistent=False)
+        self.composite = composite if composite is not None and composite.enabled else None
+        if self.composite is not None:
+            c = self.composite
+            self.fibre = FibreGenerators(num_shells, cs, cv_latent, c)
+            self.coef_head = nn.Linear(d, self.fibre.num_raw)
+            self.gate_head = nn.Linear(d, 2) if c.diag_gates else None  # mixing, condensation
+            self.fibre_gain = nn.Parameter(torch.zeros(len(FIB_FAMILIES)))
+            self.shift = nn.Linear(d, 1) if c.vert else None
+            if self.shift is not None:
+                nn.init.zeros_(self.shift.weight)
+                nn.init.zeros_(self.shift.bias)
 
     # ------------------------------------------------------------- algebra
     def forward(self, graphs: WorldGraphs, history: Sequence[Latent],
@@ -71,6 +115,33 @@ class PyramidLieGenerator(nn.Module):
                  node_forcing: Tensor) -> Tuple[Tensor, Tensor]:
         h, v = self.embed(history, node_forcing, graphs.latent_struct)
         return self.processor(graphs.latent_mesh, h, v)
+
+    def generate(self, graphs: WorldGraphs, history: Sequence[Latent], node_forcing: Tensor
+                 ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[CompositeTerms]]:
+        """`forward` plus the stage 5 shift and fibre coefficients (None if off)."""
+        h, v = self.features(graphs, history, node_forcing)
+        omega, omega_node, joints = self.algebra(graphs, h, v)
+        terms = self.composite_terms(h) if self.composite is not None else None
+        return omega, omega_node, joints, terms
+
+    def composite_terms(self, h: Tensor) -> CompositeTerms:
+        """Processed features h [B, S, N, d] -> vertical shift and fibre coefficients."""
+        with torch.autocast(h.device.type, enabled=False):
+            h = h.float()
+            gate_mix = gate_cond = None
+            if self.gate_head is not None:  # learned gates on the features (which carry the
+                g = torch.sigmoid(self.gate_head(h))  # encoded diagnostics in arm G2)
+                gate_mix, gate_cond = g[..., 0].mean(1), g[..., 1]
+            coef = self.fibre.coefficients(self.coef_head(h), gate_mix, gate_cond)
+            gain = dict(zip(FIB_FAMILIES, self.fibre_gain))
+            scale = lambda x, k: None if x is None else x * k
+            coef = FibreCoefficients(
+                radiation=scale(coef.radiation, gain["radiation"]),
+                mixing=scale(coef.mixing, _nonneg(gain["mixing"])),
+                surface=scale(coef.surface, gain["surface"]),
+                condensation=scale(coef.condensation, _nonneg(gain["condensation"])))
+            shift = self.shift(h)[..., 0].mean(1) if self.shift is not None else None
+        return CompositeTerms(shift, coef)
 
     def algebra(self, graphs: WorldGraphs, h: Tensor, v: Tensor):
         with torch.autocast(h.device.type, enabled=False):  # so(3) algebra in fp32
@@ -113,8 +184,28 @@ class PyramidLieGenerator(nn.Module):
         return torch.cat(nodes, 1).unflatten(0, (b, s))
 
     # ---------------------------------------------------------------- action
-    def act(self, graphs: WorldGraphs, z: Latent, omega_node: Tensor) -> Latent:
-        """Phi_{exp(dt omega)}(z), level by level with that level's cap."""
+    def act(self, graphs: WorldGraphs, z: Latent, omega_node: Tensor,
+            terms: Optional[CompositeTerms] = None) -> Latent:
+        """Phi_{exp(dt omega)}(z), level by level with that level's cap; with
+        composite `terms`, the split step of the composite group around it."""
+        if terms is None:
+            return self.rotate(graphs, z, omega_node)
+        c = self.composite
+
+        def rotate(h, v):
+            out = self.rotate(graphs, Latent(h, v), omega_node)
+            return out.h, out.v
+
+        shift = None if terms.shift is None else (
+            lambda h, v, dt: vert_shift(h, v, terms.shift, dt, c.max_shift))
+        fibre = lambda h, v, dt: self.fibre.flow(h, v, terms.coef, dt)
+        with torch.autocast(omega_node.device.type, enabled=False):
+            h, v = split_step(z.h.float(), z.v.float(), rotate, shift, fibre,
+                              self.cfg.dt, c.splitting)
+        return Latent(h, v)
+
+    def rotate(self, graphs: WorldGraphs, z: Latent, omega_node: Tensor) -> Latent:
+        """The SO(3) part: every level moved by its blended scale chain."""
         pyr = graphs.pyramid
         b, s = z.h.shape[:2]
         hs, vs = [], []

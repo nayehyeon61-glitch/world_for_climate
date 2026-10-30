@@ -64,7 +64,8 @@ class CompositeConfig:
     mixing_rank: int = 4  # rank of the channel matrix M of the mixing generator
     max_shift: float = 0.5  # |dt w| cap in shells (CFL-like limiter)
     splitting: str = "strang"  # "strang" | "trotter"
-    diag_gates: bool = True  # gate mixing / condensation by the diagnostics (needs model.diagnostics)
+    diag_gates: bool = True  # learned sigmoid gates on mixing / condensation, read from the
+    # transition features (which carry the encoded diagnostics when model.diagnostics is on)
     coef_init: float = 0.1  # scale of the physics direction vectors at init
 
     def __post_init__(self):
@@ -122,16 +123,20 @@ class FibreCoefficients:
     surface: Optional[Tensor] = None  # [B, N]
     condensation: Optional[Tensor] = None  # [B, S, N]
 
+    def fields(self) -> Dict[str, Optional[Tensor]]:
+        # not dataclasses.asdict: it deep-copies, which non-leaf tensors refuse
+        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
     def knockout(self, families: Sequence[str]) -> "FibreCoefficients":
         """Zeroes the given families (the knock-out intervention)."""
-        kw = dataclasses.asdict(self)
+        kw = self.fields()
         for f in families:
             if kw.get(f) is not None:
                 kw[f] = torch.zeros_like(kw[f])
         return FibreCoefficients(**kw)
 
     def active(self) -> Dict[str, Tensor]:
-        return {k: v for k, v in dataclasses.asdict(self).items() if v is not None}
+        return {k: v for k, v in self.fields().items() if v is not None}
 
     def norm2(self) -> Dict[str, Tensor]:
         """Mean squared coefficient per family (for the generator penalty)."""
