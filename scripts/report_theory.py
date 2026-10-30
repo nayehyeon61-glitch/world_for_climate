@@ -14,7 +14,7 @@ import os
 import _path  # noqa: F401  (adds src/ to sys.path)
 import numpy as np
 
-COLORS = ["#2a78d6", "#8a8a8a", "#d6702a", "#3aa655"]
+COLORS = ["#2a78d6", "#8a8a8a", "#d6702a", "#3aa655", "#8e5cc4"]
 
 
 def load(items):

@@ -6,8 +6,9 @@
 |---|---|---|---|
 | 1 | Lie 군 Shell-GNN + DIAMOND 잠재 세계 모델. 쉘을 "액체 지네 로봇"처럼 사슬로 결합 | 완료: 2018 GraphCast 비교, 결합 절제 실험 | `stage1_world_model/` |
 | 2 | 학습된 세계 모델을 새 연도 데이터로 RL(검증 보상 정책 개선) 보강 | 완료: 2020 held-out 시험, 지도학습 대조군 | `stage2_rl_refinement/` |
-| 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 1차 완료(VQ-Lie vs 연속), 2차(잔차 physics 코드) 진행 중 | `stage3_theory/` |
-| 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 구현 완료, P·P−skip 학습 대기 | `stage4_pyramid/` |
+| 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 완료: 1차(VQ-Lie vs 연속), 2차(잔차 physics 코드 미지지, 2020 불변성 확인) | `stage3_theory/` |
+| 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 구현 완료, P 학습 중, P−skip 대기 | `stage4_pyramid/` |
+| 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | 설계 완료, 코드 1/6(복합 군 모듈) | `stage5_causal_lie/` |
 
 ---
 
@@ -104,9 +105,43 @@ GraphCast는 1979–2017년, TPU 32개, 0.25°로 학습했으므로 예산 차�
 - 두 모델 모두 **무작위 프로그램이 전이 프로그램과 거의 같습니다**. 어휘가 잡은 것은 전역 공통 운동(평균류 이송)이고, 상태 특이적 기제는 persistence→oracle 격차의 약 7%입니다. 2차의 질문은 물리 코드가 이 generic 격차를 메우는지입니다.
 - 6h로만 학습한 프로그램을 12h 쌍에 6스텝까지 합성하면 설명이 더 좋아져(길이 OOD) 합성 구조 자체는 유효합니다.
 
-### 3.2 2차 실험: Lie 위의 잔차 physics 코드 (진행 중)
+### 3.2 2차 실험: Lie 위의 잔차 physics 코드 (`stage3_theory/phase2_physics_codes.md`)
 
-V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 분할)를 따라, Lie 스텝 뒤에 칼럼 국소 physics 코드(복사·수직 혼합(플럭스 형태, 보존)·지표 교환)를 실행합니다(`models/physics_codes.py`). E = hybrid(Lie 16 + physics 15), D = physics-only(Lie 어휘는 항등만). 평가에는 개입 검사(TISR=0 반사실, 가족 제거)와 2020년 불변성 검사가 들어갑니다. 결과는 `stage3_theory/`에 추가합니다. 3차(예측용 사전 정책)는 아직입니다.
+V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 분할)를 따라, Lie 스텝 뒤에 칼럼 국소 physics 코드(복사·수직 혼합(플럭스 형태, 보존)·지표 교환)를 실행합니다(`models/physics_codes.py`). 같은 2018년 6h 쌍 183개, 같은 고정 인코더·디코더, 각 1500스텝.
+
+- E1 = hybrid(Lie 16 + physics 15), 게이트 없음: 양자화기가 항등 코드를 고르지 않아 모든 패치에 매 스텝 physics가 들어가 Lie 프로그램을 방해했습니다.
+- E2 = E1 + (쉘, 패치)별 학습 게이트(시그모이드, 닫힌 상태로 시작해 C와 같은 모델에서 출발).
+- D = physics-only(Lie 어휘는 항등만).
+
+| 지표 | C (VQ-Lie) | E1 | **E2** | D |
+|---|---|---|---|---|
+| 설명한 비율 (persistence 0.764 → 바닥 0.530) | **45.2%** | 34.0% | 44.7% | 14.1% |
+| 평균 프로그램 길이 k* | 2.16 | 0.85 | 1.51 | 0.87 |
+| physics 사용 스텝 / 오차 감소 기여 | – | 100% / 0% | 19% / −46% | 34% / 100% |
+| physics 사용 쉘 (지표 → 상층) | – | 전 쉘 | 경계층 95% | 지표 93%, 하부 대류권 62% |
+| 전이 손실 (무작위 / oracle) | **0.653** (0.661 / 0.638) | 0.690 (0.697 / 0.676) | 0.655 (0.659 / 0.642) | 0.717 (0.719 / 0.714) |
+| 상태 특이적 몫 = (무작위 − 전이) / (persistence − oracle) | **7.4%** | 12% | 4.7% | 11% |
+| 12h 쌍 K=6 설명 비율 | **49.6%** | 41.6% | 48.7% | 11.6% |
+
+개입 검사(설계 문서의 인과 검사):
+
+| 검사 | E2 | D |
+|---|---|---|
+| TISR := 밤 반사실, 잠재 효과: 복사 코드가 쓰인 패치 / 코드 없는 패치 | 3.7e-3 / 9.0e-5 (**41배**) | 3.3e-5 / 1.0e-5 |
+| 위 반사실의 복원 2 m 기온 변화 | −0.002 (정규화 단위) | −0.0001 |
+| 가족 제거 시 손실 증가: 복사 / 혼합 / 지표 | +0.16% / +0.47% / +0.09% | +0.29% / **+2.84%** / +0.01% |
+
+2020년 불변성(2015–17로 배운 어휘를 2020년 쌍 183개에 적용):
+
+| 팔 | Lie 코드 사용 분포 TV 거리 (2018 vs 2020) | physics 쉘 분포 TV | k* | 설명 비율 | 전이 이득 |
+|---|---|---|---|---|---|
+| C | 0.012 | – | 2.16 → 2.13 | 45.2% → 45.7% | 0.840 → 0.845 |
+| E2 | 0.011 | 0.000 | 1.51 → 1.46 | 44.7% → 45.2% | 0.862 → 0.861 |
+
+- **판정:** 잔차 physics 코드는 설명력도 전이도 개선하지 않습니다(가설 2 미지지). 게이트를 단 E2도 C와 같은 수준이고, physics가 켜진 스텝에서는 오히려 오차를 늘립니다(기여 −46%). physics만으로는 설명 가능한 변화의 14%만 설명하므로, 6시간 변화의 대부분은 Lie 이송이 담당합니다.
+- **인과 구조는 맞지만 크기가 작습니다.** E2에서 일사를 밤으로 바꾸면 복사 코드가 쓰인 곳에서만 41배 큰 반응이 나와 "복사 코드 = 일사 반응"이라는 대응은 학습되었습니다. 그러나 복원된 기온 변화는 무시할 수준입니다. D에서는 이런 국소화가 없고, 측정 가능한 인과 역할을 가진 가족은 수직 혼합뿐입니다(제거 시 +2.84%).
+- **어휘는 해를 넘어 안정적입니다.** 2020년에도 코드 사용 분포가 거의 같고(TV 0.01) 설명 비율·전이 이득이 그대로입니다. 다만 1차에서 본 것처럼 전이 프로그램과 무작위 프로그램의 차이가 작아(상태 특이적 몫 5–7%), 안정적인 것은 주로 전역 공통 운동입니다.
+- **5단계로 넘기는 이유:** physics를 Lie 군 밖의 잔차로 붙이면 Lie가 이미 설명한 것과 경쟁할 뿐입니다. 5단계는 physics를 군 안에 넣어(복합 군 (SO(3) × Vert) ⋉ Fib, 이송된 좌표계에서 물리 적용), 진단량을 GNN 입력으로 주고, critic으로 현실 정합성을 판정합니다.
 
 ---
 
@@ -121,6 +156,18 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 - 평가 `scripts/eval_pyramid.py` + `report_pyramid.py`: 레벨별 회전 에너지(위도대·쉘별), 레벨별 유사 상태 전이(거친/미세 레벨을 섞어 실행, 무작위 쌍 대조), 1단계 GraphCast 프로토콜과 결합한 S·P·P−skip 스코어카드.
 
 **검증할 예측:** (1) 거친 레벨 회전의 전이 이득은 무작위 대비 크고(격차 ≥ 0.2) 미세 레벨은 작다(< 0.1); (2) 레벨별 에너지는 L0 > L1 > L2, L2는 중위도 > 열대; (3) P는 S(1단계 independent)보다 72–120h z500 RMSE가 낮고 ACC가 높다. 결과는 `stage4_pyramid/`에 추가합니다.
+
+---
+
+## 5단계 — 현실 정합 인과 Lie 세계 모델 (`stage5_causal_lie/`)
+
+**가설:** 대기 방정식 dX/dt = F(X)의 각 항은 벡터장, 곧 Lie 대수의 생성자이고, exp(Δt F)는 군 원소, 순차적 과정은 군의 곱입니다(수치예보의 과정 분할 = Lie–Trotter/Strang). 3단계 2차에서 physics를 Lie 군 밖의 잔차로 붙였을 때 Lie와 경쟁만 했으므로, physics를 **군 안에** 넣습니다: 칼럼 잠재 상태 위의 복합 군 G = (SO(3) × Vert) ⋉ Fib, 즉 수평 이송(SO(3), Killing 사영) × 수직 이동(Vert = 쉘 축 평행이동, 상승·하강) ⋉ 물리 가족(Fib = 아핀 생성자: 복사 편향, 쉘 라플라시안 모드 위의 교환 가능한 수직 혼합, 보존형 지표 교환, 게이트 응결). 반직접곱은 "이송된(라그랑주) 좌표계에서 물리를 적용한다"는 뜻입니다. 진단량(정역학·지균 잔차, N², 포화 결손, 발산·와도, 지표 수지, TISR 위상)을 GNN 입력으로 주고, critic(해석적 진단 + 𝔤 위의 Lie–Fisher 판별)이 현실 정합성을 판정합니다. 이론 참조: Li et al., *Lie Group Machine Learning* (De Gruyter 2019). 설계 문서(한국어): https://claude.ai/artifact/7R6BJ2z27FC5LWu5m3SG18
+
+**구현 진행:**
+- 1/6 `geometry/composite_group.py`: Vert 이동(경계 고정, tanh 상한), Fib 생성자와 정확한 아핀 흐름 Z(dt) = e^{dt A} Z + φ₁(dt A) dt b(혼합 가족은 교환 가능 → 닫힌 아핀 부분대수, 칼럼 합 보존), Strang/Trotter 분할, Cartan 분해 ω = ω_𝔨 + ω_𝔭, Karcher 평균·군 가우시안 불변성 통계. 테스트 10개(항등·보존·ODE 일치·1-매개변수 부분군·교환성·분할 차수 2·Karcher 복원).
+- 남은 것: 진단 채널, 전이 heads(이동·혼합 계수, 0 초기화로 G0와 동일하게 시작), critic, 평가·보고 스크립트, 설정 G1–G3.
+
+**팔:** G0 = 4단계 P(플래그 끔, 비트 동일), G1 = +Vert·Fib, G2 = +진단 입력, G3 = +critic. 예측 P1–P5는 설계 문서 §7.
 
 ---
 
@@ -144,6 +191,12 @@ python scripts/report_refinement.py base=runs/test2020/base.json \
 # 3단계
 python scripts/train.py --config configs/wb2_theory_lie.yaml --data-dir DATA --init-from runs/wb2_64x32/checkpoint.pt
 python scripts/eval_transfer.py --checkpoint runs/wb2_theory_lie/checkpoint.pt --data-dir DATA --stride 4
+# 3단계 2차: E2 = wb2_theory_hybrid.yaml, D = wb2_theory_phys.yaml (같은 --init-from), 2020 불변성은 DATA2020에 같은 평가
+python scripts/eval_transfer.py --checkpoint runs/wb2_theory_hybrid/checkpoint.pt --data-dir DATA2020 --stride 4 \
+    --min-gap-days 7 --out runs/wb2_theory_hybrid/transfer_2020.json
+python scripts/report_theory.py C=runs/wb2_theory_lie/transfer.json E2=runs/wb2_theory_hybrid/transfer.json \
+    D=runs/wb2_theory_phys/transfer.json --invariance C=runs/wb2_theory_lie/transfer_2020.json \
+    E2=runs/wb2_theory_hybrid/transfer_2020.json --out-dir docs/results/stage3_theory
 # 4단계
 python scripts/train.py --config configs/wb2_pyramid.yaml --data-dir DATA              # P (P−skip: wb2_pyramid_noskip.yaml)
 python scripts/compare_graphcast.py --checkpoint runs/wb2_pyramid/checkpoint.pt --data-dir DATA --init-stride 3
