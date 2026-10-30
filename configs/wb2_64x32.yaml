@@ -1,0 +1,50 @@
+# CPU-scale real-data experiment on WeatherBench-2 ERA5 (64 x 32, 5.625 deg,
+# 13 levels incl. vertical velocity => exact GraphCast 13-level task).
+# Data: python scripts/download_weatherbench2.py --out {data_dir} --start 2012-01-01 --end 2019-01-15
+# Train: python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA
+# Compare: python scripts/compare_graphcast.py --checkpoint runs/wb2_64x32/checkpoint.pt --data-dir DATA
+experiment: wb2_64x32_lie_diffusion_chain
+output_dir: runs/wb2_64x32
+
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2015-01-01", "2019-01-15"]
+  load_into_memory: true          # ~4 GB float32
+  train: {start: "2015-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 256
+
+task:
+  name: graphcast_13
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null   # surface | 1000-850 | 700-500 | 400-200 | 150-50 hPa
+
+model:
+  transition: lie_diffusion
+  history: 2
+  mesh: {mesh_splits: 3, latent_splits: 3, patch_splits: 1, break_symmetry: true}
+  gnn: {hidden_dim: 64, vector_dim: 16, latent_scalars: 32, latent_vectors: 8,
+        hidden_layers: 1, encoder_layers: 2, latent_layers: 1, decoder_layers: 2}
+  lie: {layers: 2, shell_coupling: chain}
+  diffusion: {layers: 3, cond_dim: 64, num_steps_denoising: 3}
+  residual_layers: 2
+
+train:
+  batch_size: 2
+  num_workers: 0
+  log_every: 25
+  stages:
+    - {name: repr, steps: 600, lr: 1.0e-3, warmup_steps: 50, weights: {rec: 1.0}}
+    - {name: dynamics, steps: 1000, lr: 5.0e-4, warmup_steps: 50, rollout_steps: 2,
+       weights: {forecast: 1.0, latent: 0.1, rec: 0.5, geo: 1.0e-3, joint: 1.0e-3}}
+    - {name: stochastic, steps: 500, lr: 3.0e-4, warmup_steps: 50, rollout_steps: 1,
+       weights: {gen: 1.0}}
+
+eval:
+  lead_steps: 20                  # 6h .. 120h
+  members: 4
+  batch_size: 1
+  init_hours: [0, 12]             # WeatherBench-2 GraphCast inits
+  climatology_zarr: "{data_dir}/climatology.zarr"

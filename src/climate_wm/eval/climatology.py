@@ -60,12 +60,23 @@ class Climatology:
         return cls(values.astype(np.float32), hours, channels=dataset.layout.targets)
 
     @classmethod
-    def from_weatherbench2(cls, path: str, channels: Sequence[Channel]) -> "Climatology":
+    def from_weatherbench2(cls, path: str, channels: Sequence[Channel],
+                           load: bool = True) -> "Climatology":
+        """WeatherBench-2 climatology zarr. load=True reads the selected
+        channels into memory ([366, hours, C, H, W]; ~1 GB at 64x32 x 83 ch)."""
         import xarray as xr
         ds = xr.open_zarr(path)
         ds = ds.rename({k: v for k, v in {"latitude": "lat", "longitude": "lon"}.items()
                         if k in ds.dims}).sortby("lat")
-        return cls(None, lazy=ds, channels=channels)
+        if not load:
+            return cls(None, lazy=ds, channels=channels)
+        hours = [int(h) for h in ds.hour.values]
+        frames = []
+        for c in channels:
+            da = ds[c.name] if c.level is None else ds[c.name].sel(level=c.level)
+            frames.append(np.asarray(da.transpose("dayofyear", "hour", "lat", "lon").values,
+                                     np.float32))
+        return cls(np.stack(frames, axis=2), hours, channels=channels)
 
     def _day_hour(self, t):
         ts = pd.Timestamp(np.datetime64(int(t), "s"))

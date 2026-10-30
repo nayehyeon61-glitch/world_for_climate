@@ -116,8 +116,9 @@ class GraphCastWindowDataset(torch.utils.data.Dataset):
         self.stats = stats
         self.target_steps = target_steps
         self.input_steps = layout.task.input_steps
-        if "level" in ds.dims:
-            ds = ds.sel(level=list(layout.task.pressure_levels))
+        levels = [int(l) for l in layout.task.pressure_levels]
+        if "level" in ds.dims and [int(l) for l in ds.level.values] != levels:
+            ds = ds.sel(level=levels)  # copies data: pre-select when loading into memory
         self.ds = ds
         self.times = ds.time.values.astype("datetime64[ns]")
         step = np.timedelta64(pd.Timedelta(layout.task.timestep))
