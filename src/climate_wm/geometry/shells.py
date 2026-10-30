@@ -131,6 +131,8 @@ class SpherePatches(nn.Module):
         self.register_buffer("weight", torch.tensor(weights, dtype=torch.float32))
         self.register_buffer("mass", torch.tensor(mass, dtype=torch.float32))
         self.register_buffer("a_inv", torch.tensor(np.linalg.inv(a), dtype=torch.float32))
+        self.register_buffer("reg", torch.tensor(eps * np.maximum(mass, 1e-6), dtype=torch.float32),
+                             persistent=False)  # derived; keeps old checkpoints loadable
         self.register_buffer("hard", torch.tensor(idx[:, 0], dtype=torch.long))
 
     def pool(self, x: Tensor) -> Tensor:
@@ -141,19 +143,122 @@ class SpherePatches(nn.Module):
             out.index_add_(1, self.index[:, j], x * self.weight[:, j, None])
         return out / self.mass.clamp_min(1e-6)[None, :, None]
 
-    def killing_projection(self, u: Tensor) -> Tensor:
+    def killing_projection(self, u: Tensor, prior: Optional[Tensor] = None) -> Tensor:
         """Least-squares so(3) element per patch from tangent velocities.
 
         u [B, N, 3] -> omega [B, P, 3]; equivariant under global rotations.
+        The Tikhonov term `eps * mass |omega - prior|^2` pulls the component a
+        small patch cannot observe (rotation about its own axis) towards
+        `prior` [B, P, 3] (zero when omitted); a pyramid passes the parent's
+        element so that a rigid field projects exactly at every level.
         """
         torque = torch.cross(self.node_pos.expand_as(u), u, dim=-1)
         b = u.shape[0]
         rhs = u.new_zeros(b, self.num_patches, 3)
         for j in range(self.index.shape[1]):
             rhs.index_add_(1, self.index[:, j], torque * self.weight[:, j, None])
+        if prior is not None:
+            rhs = rhs + self.reg[None, :, None] * prior
         return torch.einsum("pij,bpj->bpi", self.a_inv, rhs)
 
     def blend(self, omega_patch: Tensor) -> Tensor:
         """Patch algebra elements [B, P, 3] -> node elements [B, N, 3]."""
         gathered = omega_patch[:, self.index]  # [B, N, k, 3]
         return (gathered * self.weight[None, :, :, None]).sum(2)
+
+
+def _compose(a: Tensor, b: Tensor) -> Tensor:
+    """log(exp(a) exp(b)) on so(3) elements [..., 3]."""
+    from .group_actions import so3_exp, so3_log
+    return so3_log(so3_exp(a) @ so3_exp(b))
+
+
+class PatchPyramid(nn.Module):
+    """Patch levels over one node set and the so(3) pyramid on them (stage 4).
+
+    Level l uses the icosphere-level-`levels[l]` centres (12, 42, 162, ...).
+    The Killing projection at a coarse level is the least-squares so(3) fit
+    over the coarse patch, i.e. the inertia-weighted pooling of the finer
+    elements, so `project` gives the whole pyramid omega^(0..L) from one node
+    velocity field. Details are relative rotations to the parent patch,
+
+        delta_P = log(exp(-omega_parent(P)) exp(omega_P)),
+
+    and the scale chain g = exp(omega^(0)) exp(delta^(1)) ... exp(delta^(L))
+    is blended onto the nodes level by level (`node_algebra`). This is the
+    shell chain's forward kinematics applied along the scale axis.
+    """
+
+    def __init__(self, node_xyz: np.ndarray, levels: Sequence[int] = (0, 1, 2),
+                 k: int = 3, softness: float = 0.5):
+        super().__init__()
+        if list(levels) != sorted(set(levels)):
+            raise ValueError("pyramid levels must be strictly increasing")
+        self.levels = tuple(int(l) for l in levels)
+        self.patches = nn.ModuleList([SpherePatches(node_xyz, l, k, softness) for l in self.levels])
+        for i in range(1, len(self.levels)):
+            coarse = self.patches[i - 1].centres.numpy()
+            fine = self.patches[i].centres.numpy()
+            parent = cKDTree(coarse).query(fine)[1]
+            self.register_buffer(f"parent_{i}", torch.tensor(parent, dtype=torch.long))
+
+    @property
+    def num_levels(self) -> int:
+        return len(self.levels)
+
+    def parent(self, level: int) -> Tensor:
+        """Index of the parent patch (level - 1) of every patch at `level` >= 1."""
+        return getattr(self, f"parent_{level}")
+
+    def root(self, u: Tensor) -> Tensor:
+        """Whole-sphere least-squares rotation [B, 3]: the pyramid's level -1.
+
+        For a near-uniform node set sum_i (I - p_i p_i^T) ~ (2N/3) I, but the
+        exact normal matrix is used.
+        """
+        p = self.patches[0].node_pos
+        a = torch.eye(3, device=p.device, dtype=p.dtype) * len(p) - p.T @ p
+        rhs = torch.cross(p.expand_as(u), u, dim=-1).sum(1)
+        return torch.linalg.solve(a, rhs.T).T
+
+    def project(self, u: Tensor) -> list:
+        """Node velocities [B, N, 3] -> [omega^(l) [B, P_l, 3] for every level].
+
+        Hierarchical: level l is regularised towards its parent's element, so
+        the axial component a small patch cannot see is inherited from the
+        coarser scale instead of being shrunk to zero.
+        """
+        root = self.root(u)
+        omegas = [self.patches[0].killing_projection(
+            u, root[:, None, :].expand(-1, self.patches[0].num_patches, -1))]
+        for i in range(1, self.num_levels):
+            prior = omegas[i - 1][:, self.parent(i)]
+            omegas.append(self.patches[i].killing_projection(u, prior))
+        return omegas
+
+    def details(self, omegas: Sequence[Tensor]) -> list:
+        """Absolute elements per level -> [omega^(0), delta^(1), ..., delta^(L)]."""
+        parts = [omegas[0]]
+        for i in range(1, self.num_levels):
+            parent = omegas[i - 1][:, self.parent(i)]
+            parts.append(_compose(-parent, omegas[i]))
+        return parts
+
+    def reconstruct(self, parts: Sequence[Tensor]) -> list:
+        """[omega^(0), delta^(1), ...] -> absolute elements per level."""
+        omegas = [parts[0]]
+        for i in range(1, self.num_levels):
+            omegas.append(_compose(omegas[i - 1][:, self.parent(i)], parts[i]))
+        return omegas
+
+    def node_algebra(self, parts: Sequence[Tensor]) -> Tensor:
+        """Scale chain blended onto the nodes: [B, N, 3] algebra element per node."""
+        out = self.patches[0].blend(parts[0])
+        for i in range(1, self.num_levels):
+            out = _compose(out, self.patches[i].blend(parts[i]))
+        return out
+
+    @staticmethod
+    def energy(parts: Sequence[Tensor]) -> Tensor:
+        """Mean squared rotation per level [L] (a rotational energy spectrum)."""
+        return torch.stack([p.square().sum(-1).mean() for p in parts])
