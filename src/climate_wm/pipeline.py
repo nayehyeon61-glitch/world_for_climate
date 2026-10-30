@@ -63,6 +63,14 @@ def apply_overrides(cfg: dict, overrides) -> dict:
     return cfg
 
 
+def merge_config(base: dict, update: dict) -> dict:
+    """Recursive dict update (returns a new dict)."""
+    out = dict(base)
+    for k, v in update.items():
+        out[k] = merge_config(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
 def save_json(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:

@@ -74,6 +74,8 @@ def main():
     parser.add_argument("--graphcast", default=None,
                         help="GraphCast forecast zarr (default DATA/graphcast.zarr); e.g. the "
                              "WB2 0.25 deg store on gs:// read lazily")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                        help="override the checkpoint config, e.g. data.val.start=2020-01-01")
     parser.add_argument("--coarsen", type=int, default=1,
                         help="coarsen the GraphCast forecasts to the model grid (4: 0.25 -> 1 deg)")
     args = parser.parse_args()
@@ -83,6 +85,7 @@ def main():
         cfg = pipeline.substitute_data_dir(cfg, args.data_dir)
     if not (args.graphcast or args.data_dir):
         parser.error("give --graphcast or --data-dir")
+    pipeline.apply_overrides(cfg, args.set)
     if args.lead_steps:
         cfg["eval"]["lead_steps"] = args.lead_steps
     if args.members:

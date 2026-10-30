@@ -6,7 +6,8 @@
 Writes three local zarr stores (anonymous public GCS access, needs gcsfs):
   era5.zarr         ERA5 6-hourly, GraphCast task variables + static fields
   climatology.zarr  ERA5 1990-2017 hourly climatology (for ACC, eq. 29)
-  graphcast.zarr    GraphCast 2018 forecasts (00/12 UTC inits, 6h..240h)
+  graphcast.zarr    GraphCast forecasts for one year (WB2 has 2018 and 2020;
+                    00/12 UTC inits, 6h..240h)
 all on the same grid (default 64x32 equiangular, conservative regridding).
 """
 
@@ -23,11 +24,11 @@ GRIDS = {
     "64x32": dict(
         era5="era5/1959-2022-6h-64x32_equiangular_conservative.zarr",
         clim="era5-hourly-climatology/1990-2017_6h_64x32_equiangular_conservative.zarr",
-        graphcast="graphcast/2018/date_range_2017-11-16_2019-02-01_12_hours-64x32_equiangular_conservative.zarr"),
+        graphcast="graphcast/{y}/date_range_{y0}-11-16_{y1}-02-01_12_hours-64x32_equiangular_conservative.zarr"),
     "240x121": dict(
         era5="era5/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr",
         clim="era5-hourly-climatology/1990-2017_6h_240x121_equiangular_with_poles_conservative.zarr",
-        graphcast="graphcast/2018/date_range_2017-11-16_2019-02-01_12_hours-240x121_equiangular_with_poles_conservative.zarr"),
+        graphcast="graphcast/{y}/date_range_{y0}-11-16_{y1}-02-01_12_hours-240x121_equiangular_with_poles_conservative.zarr"),
 }
 
 
@@ -52,8 +53,9 @@ def main():
     parser.add_argument("--task", default="graphcast_13")
     parser.add_argument("--start", default="2016-01-01")
     parser.add_argument("--end", default="2019-01-15")
-    parser.add_argument("--forecast-start", default="2018-01-01")
-    parser.add_argument("--forecast-end", default="2018-12-31T12:00")
+    parser.add_argument("--forecast-year", type=int, default=2018, choices=[2018, 2020])
+    parser.add_argument("--forecast-start", default=None, help="default: Jan 1 of the year")
+    parser.add_argument("--forecast-end", default=None, help="default: Dec 31 12 UTC")
     parser.add_argument("--forecast-lead-steps", type=int, default=40, help="6h steps to keep")
     parser.add_argument("--forecast-init-stride", type=int, default=1, help="keep every n-th init")
     parser.add_argument("--skip", nargs="*", default=[], choices=["era5", "clim", "graphcast"])
@@ -74,9 +76,12 @@ def main():
         clim = _open(paths["clim"])[targets].sel(level=levels)
         _write(clim, os.path.join(args.out, "climatology.zarr"))
     if "graphcast" not in args.skip:
-        gc = _open(paths["graphcast"])
+        y = args.forecast_year
+        gc = _open(paths["graphcast"].format(y=y, y0=y - 1, y1=y + 1))
         keep = [v for v in targets if v in gc]
-        gc = gc[keep].sel(time=slice(args.forecast_start, args.forecast_end), level=levels)
+        start = args.forecast_start or f"{y}-01-01"
+        end = args.forecast_end or f"{y}-12-31T12:00"
+        gc = gc[keep].sel(time=slice(start, end), level=levels)
         gc = gc.isel(time=slice(None, None, args.forecast_init_stride),
                      prediction_timedelta=slice(0, args.forecast_lead_steps))
         _write(gc, os.path.join(args.out, "graphcast.zarr"), time_chunk=1)  # one init per chunk

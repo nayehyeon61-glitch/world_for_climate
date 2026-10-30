@@ -132,10 +132,10 @@ class LatentDenoiser(nn.Module):
                                         node_forcing)
         return self.wrap_model_output(noisy, out, cs)
 
-    def loss(self, graphs: WorldGraphs, target: Latent, zbar: Latent,
-             history: Sequence[Latent], node_forcing: Tensor
-             ) -> Tuple[Tensor, Latent]:
-        """EDM denoising loss (as DIAMOND) and the denoised estimate."""
+    def loss_per_sample(self, graphs: WorldGraphs, target: Latent, zbar: Latent,
+                        history: Sequence[Latent], node_forcing: Tensor
+                        ) -> Tuple[Tensor, Latent]:
+        """EDM denoising loss [B] (as DIAMOND) and the denoised estimate."""
         b = target.batch_size
         sigma = self.sample_sigma_training(b, target.h.device)
         noisy = self.apply_noise(target, sigma, graphs.latent_pos)
@@ -144,9 +144,17 @@ class LatentDenoiser(nn.Module):
                                         node_forcing)
         inv_c_out = 1 / cs.c_out
         tgt = scale_per_sample(target - scale_per_sample(noisy, cs.c_skip), inv_c_out)
-        loss = out.squared_error(tgt)
+        err = torch.cat([(out.h.float() - tgt.h.float()).flatten(1),
+                         (out.v.float() - tgt.v.float()).flatten(1)], 1).square().mean(1)
         denoised = self.wrap_model_output(noisy, out, cs)
-        return loss, denoised
+        return err, denoised
+
+    def loss(self, graphs: WorldGraphs, target: Latent, zbar: Latent,
+             history: Sequence[Latent], node_forcing: Tensor
+             ) -> Tuple[Tensor, Latent]:
+        """EDM denoising loss (as DIAMOND) and the denoised estimate."""
+        err, denoised = self.loss_per_sample(graphs, target, zbar, history, node_forcing)
+        return err.mean(), denoised
 
 
 def build_sigmas(num_steps: int, sigma_min: float, sigma_max: float,

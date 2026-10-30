@@ -100,3 +100,42 @@ def test_engine_bf16_checkpointing_and_resume(setup):
     omega, _, _ = model.lie(model.graphs, model.encode_history(batch),
                             model.node_forcing(batch["forcings_tgt"][:, 0]))
     assert omega.dtype == torch.float32
+
+
+def test_rl_refinement_groups_and_modes(setup):
+    """Verification-reward policy improvement of the denoiser and its control."""
+    from climate_wm.train.rl_refine import (RefineConfig, awr_backward, awr_loss, collect_rollouts,
+                                            group_advantages, refine)
+
+    layout, data, batch = setup
+    model = _model(layout, data, "lie_diffusion", "chain")
+    model.calibrate_residual_scale(batch)
+    steps, returns, rewards = collect_rollouts(model, batch, members=3, horizon=2)
+    assert returns.shape == (2, 3) and rewards.shape == (2, 3, 2) and len(steps) == 2
+    assert (rewards <= 0).all() and steps[0]["action"].h.shape[0] == 6
+    adv, w = group_advantages(returns, beta=1.0)
+    assert torch.allclose(w.mean(1), torch.ones(2)) and torch.allclose(adv.mean(1), torch.zeros(2), atol=1e-5)
+
+    # the step-by-step backward accumulates the gradient of the full AWR loss
+    params = [p for p in model.denoiser.parameters() if p.requires_grad]
+    grads = []
+    for backward in (True, False):
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(1)
+        if backward:
+            value = awr_backward(model, steps, w, scale=2.0)
+        else:
+            loss = awr_loss(model, steps, w)
+            (2.0 * loss).backward()
+            assert abs(value - float(loss.detach())) < 1e-5
+        grads.append(torch.cat([p.grad.flatten() for p in params]))
+    assert torch.allclose(grads[0], grads[1], atol=1e-6)
+
+    frozen = {k: v.clone() for k, v in model.encoder.state_dict().items()}
+    for mode in ("supervised", "rl"):
+        cfg = RefineConfig(mode=mode, steps=2, members=3, horizon=2, log_every=0, warmup_steps=0,
+                           awr_chunk=2)
+        hist = refine(model, [batch], cfg)
+        assert len(hist) == 2 and all(torch.isfinite(torch.tensor(h["loss"])) for h in hist)
+        assert ("awr" in hist[0]) == (mode == "rl")
+    assert all(torch.equal(v, model.encoder.state_dict()[k]) for k, v in frozen.items())  # only the policy moves
