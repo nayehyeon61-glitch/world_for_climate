@@ -1,0 +1,13 @@
+# ERA5 archive on Lustre (fill in after the Stage-0 inventory:
+#   python scripts/inventory.py --era5 configs/era5_source.yaml).
+# Files are opened lazily (xarray + dask); ERA5 short names are renamed with
+# climate_wm.data.graphcast_mapping.ERA5_SHORT_TO_GRAPHCAST plus `rename`.
+paths:
+  - /lustre/PATH/TO/era5/pressure_levels/*.nc      # z, q, t, u, v on 13 levels, hourly
+  - /lustre/PATH/TO/era5/single_levels/*.nc        # u10, v10, msl, t2m, tp, tisr, ...
+  - path: /lustre/PATH/TO/era5/invariants.nc       # surface geopotential + land-sea mask
+    rename: {z: geopotential_at_surface}
+engine: netcdf4
+chunks: {time: 1}
+hours: [0, 6, 12, 18]        # 6-hourly subset; hourly tp is accumulated to 6h first
+rename: {}
