@@ -6,7 +6,8 @@
 |---|---|---|---|
 | 1 | Lie 군 Shell-GNN + DIAMOND 잠재 세계 모델. 쉘을 "액체 지네 로봇"처럼 사슬로 결합 | 완료: 2018 GraphCast 비교, 결합 절제 실험 | `stage1_world_model/` |
 | 2 | 학습된 세계 모델을 새 연도 데이터로 RL(검증 보상 정책 개선) 보강 | 완료: 2020 held-out 시험, 지도학습 대조군 | `stage2_rl_refinement/` |
-| 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 진행 중: 1차(VQ-Lie vs 연속 대조) 학습 | `stage3_theory/` |
+| 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 1차 완료(VQ-Lie vs 연속), 2차(잔차 physics 코드) 진행 중 | `stage3_theory/` |
+| 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 구현 완료, P·P−skip 학습 대기 | `stage4_pyramid/` |
 
 ---
 
@@ -109,6 +110,20 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 ---
 
+## 4단계 — 그래프 V-Net so(3) 피라미드 (`stage4_pyramid/`)
+
+**가설:** 정이십면체 계층(레벨 1/2/3 = 42/162/642 노드)을 그래프 V-Net처럼 수축·확장하면서 Lie 대수를 레벨별로 다운스케일한 so(3) 피라미드(ω⁽⁰⁾ 12패치, δ⁽¹⁾ 42, δ⁽²⁾ 162) 위에서 세계 모델을 학습하면, 전역 공통 운동(거친 레벨)과 상태 특이 기제(미세 레벨)가 구조적으로 분리되어 전이가 나아지고 72–120h 롤아웃이 안정된다. 3단계 1차의 "무작위 프로그램 ≈ 전이 프로그램"이 동기입니다. 설계 문서(한국어): https://claude.ai/artifact/HyDfQMgse2dCX9CHhku21j
+
+**구현 (`models/pyramid_graphs.py`, `vnet.py`, `pyramid_transition.py`, `eval/pyramid.py`):**
+- 잠재 상태는 레벨 1·2·3 노드를 쌓은 846개 노드에 있습니다(P−skip은 레벨 1의 42개만). 전이·잔차·DIAMOND denoiser는 쌓인 노드 집합(레벨별 다중메시 + 부모–자식 엣지) 위에서 그대로 돌아갑니다.
+- 인코더(수축)는 GraphCast 규칙을 레벨마다 적용합니다: 레벨 ℓ 노드는 풀링된 ℓ+1 상태에 더해 반경 0.6 × (레벨 ℓ 변 길이)의 격자점을 직접 합칩니다. 디코더(확장)는 가장 거친 상태에서 포함 삼각형으로 올라오며 레벨 상태를 skip으로 받고, 학습 중 확률 0.5로 skip을 끊습니다.
+- so(3) 피라미드 전이: 쌓인 그래프 위의 Shell-GNN 하나가 속도장을 내고, 계층적 Killing 사영(부모 원소를 사전값으로, 작은 패치가 못 보는 축 방향 성분 보완)으로 ω⁽⁰⁾, δ⁽¹⁾, δ⁽²⁾를 얻어 스케일 사슬 g = exp(ω⁽⁰⁾)exp(δ⁽¹⁾)exp(δ⁽²⁾)로 모든 레벨을 이송합니다. 세부 회전은 joint 벌칙, latent 손실은 레벨 가중(1.0/0.5/0.25).
+- 평가 `scripts/eval_pyramid.py` + `report_pyramid.py`: 레벨별 회전 에너지(위도대·쉘별), 레벨별 유사 상태 전이(거친/미세 레벨을 섞어 실행, 무작위 쌍 대조), 1단계 GraphCast 프로토콜과 결합한 S·P·P−skip 스코어카드.
+
+**검증할 예측:** (1) 거친 레벨 회전의 전이 이득은 무작위 대비 크고(격차 ≥ 0.2) 미세 레벨은 작다(< 0.1); (2) 레벨별 에너지는 L0 > L1 > L2, L2는 중위도 > 열대; (3) P는 S(1단계 independent)보다 72–120h z500 RMSE가 낮고 ACC가 높다. 결과는 `stage4_pyramid/`에 추가합니다.
+
+---
+
 ## 재현
 
 ```bash
@@ -129,4 +144,10 @@ python scripts/report_refinement.py base=runs/test2020/base.json \
 # 3단계
 python scripts/train.py --config configs/wb2_theory_lie.yaml --data-dir DATA --init-from runs/wb2_64x32/checkpoint.pt
 python scripts/eval_transfer.py --checkpoint runs/wb2_theory_lie/checkpoint.pt --data-dir DATA --stride 4
+# 4단계
+python scripts/train.py --config configs/wb2_pyramid.yaml --data-dir DATA              # P (P−skip: wb2_pyramid_noskip.yaml)
+python scripts/compare_graphcast.py --checkpoint runs/wb2_pyramid/checkpoint.pt --data-dir DATA --init-stride 3
+python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --data-dir DATA --stride 4
+python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
+    --pyramid P=runs/wb2_pyramid/pyramid_eval.json --out-dir docs/results/stage4_pyramid
 ```
