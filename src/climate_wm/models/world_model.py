@@ -101,7 +101,8 @@ class ClimateWorldModel(nn.Module):
         self.denoiser = (LatentDenoiser(**common, cfg=cfg.diffusion)
                          if t.endswith("diffusion") else None)
         theory_args = {k: v for k, v in common.items() if k != "history"}
-        self.theory = (TheoryProgram(**theory_args, lie_cfg=cfg.lie, cfg=cfg.theory)
+        self.theory = (TheoryProgram(**theory_args, lie_cfg=cfg.lie, cfg=cfg.theory,
+                                     static_dim=len(layout.static))
                        if t == "lie_program" else None)
         self.loss_fn = GraphCastLoss(layout, grid_lat)
         # RMS of the latent residual (scalar part, vector part); calibrated once
@@ -262,7 +263,8 @@ class ClimateWorldModel(nn.Module):
             s = self.encode(batch["inputs"][:, -1], batch["forcings_in"][:, -1], batch["static"])
             s_y = self.encode_target(batch, 0)
         nf = self.node_forcing(batch["forcings_tgt"][:, 0])
-        exp = self.theory.explain(self.graphs, s, s_y, nf)
+        ns = self.graphs.grid_to_latent_mean(batch["static"])  # static fields at latent nodes
+        exp = self.theory.explain(self.graphs, s, s_y, nf, ns=ns)
         target_x = batch["targets"][:, 0]
         logs: Dict[str, Tensor] = {
             "rec": self.loss_fn(self.decode(exp.states[-1]), target_x),

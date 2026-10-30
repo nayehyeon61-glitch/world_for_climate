@@ -55,13 +55,16 @@ def main():
 
     pairs = transfer.collect_pairs(model, val_ds, indices, 0, args.device, args.batch_size, print)
     exp = transfer.explain_all(model, pairs, None, args.device, args.batch_size, print)
+    centres = model.graphs.patches.centres.cpu()
+    patch_lat = torch.rad2deg(torch.asin(centres[:, 2].clamp(-1, 1)))
     results = {
         "experiment": cfg.get("experiment", ""),
         "checkpoint": args.checkpoint,
         "lead_hours": pairs.lead_hours,
         "codebook_size": th.cfg.codebook_size,
+        "physics_codes": th.cfg.physics_codes,
         "max_steps": th.cfg.max_steps,
-        "self_explainability": transfer.self_explainability(exp, th.cfg.codebook_size),
+        "self_explainability": transfer.self_explainability(exp, th.cfg.codebook_size, patch_lat),
     }
     analogs = transfer.find_analogs(pairs, 24.0 * args.min_gap_days)
     results["analog_transfer"] = transfer.analog_transfer(model, pairs, exp, analogs,

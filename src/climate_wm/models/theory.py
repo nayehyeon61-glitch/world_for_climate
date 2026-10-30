@@ -40,6 +40,7 @@ from torch import Tensor, nn
 from .graphs import WorldGraphs
 from .latent import Latent
 from .lie_generator import LieConfig, LieGenerator, compose
+from .physics_codes import PhysicsExecutor, family_weights
 
 
 @dataclasses.dataclass
@@ -53,56 +54,38 @@ class TheoryConfig:
     ema_decay: float = 0.99
     dead_code_steps: int = 200     # re-seed a code unused for this many updates (0: off)
     code_scale: float = 0.5        # initial code magnitude in units of the rotation cap
+    # Phase 2: column-local residual physics codes executed after the Lie step
+    physics_codes: int = 0         # non-identity physics codes (0: Lie only); split in
+                                   # three equal families: radiation, mixing, surface
+    physics_dim: int = 8           # code embedding width (FiLM input of the executor)
+    physics_scale: float = 0.1     # tendency scale in latent units per step
 
 
-class LieCodebook(nn.Module):
-    """EMA vector quantiser over so(3) elements in patch-local frames."""
+class VectorQuantiser(nn.Module):
+    """EMA vector quantiser (NEO's VQ): code 0 is a fixed identity, the other
+    codes are seeded from the first training batch and re-seeded when dead."""
 
-    def __init__(self, patch_centres: Tensor, size: int, max_angle: float, cfg: TheoryConfig):
+    def __init__(self, size: int, dim: int, cfg: TheoryConfig, codes: Optional[Tensor] = None):
         super().__init__()
         self.cfg = cfg
-        self.size = size
-        up = F.normalize(patch_centres, dim=-1)                      # [P, 3]
-        z = torch.tensor([0.0, 0.0, 1.0]).expand_as(up)
-        east = torch.cross(z, up, dim=-1)
-        polar = east.norm(dim=-1, keepdim=True) < 1e-6
-        east = torch.where(polar, torch.tensor([1.0, 0.0, 0.0]).expand_as(up), east)
-        east = F.normalize(east - (east * up).sum(-1, keepdim=True) * up, dim=-1)
-        north = torch.cross(up, east, dim=-1)
-        self.register_buffer("frames", torch.stack([east, north, up], -2))  # [P, 3, 3] rows
-        codes = self._initial_codes(size, cfg.code_scale * max_angle)
+        self.size, self.dim = size, dim
+        if codes is None:
+            codes = torch.zeros(size, dim)
+            if size > 1:
+                codes[1:] = 0.1 * torch.randn(size - 1, dim, generator=torch.Generator().manual_seed(0))
         self.register_buffer("embedding", codes)
         self.register_buffer("ema_weight", codes.clone())
         self.register_buffer("ema_size", torch.ones(size))
         self.register_buffer("seeded", torch.zeros(()))  # codes re-seeded from the first batch
         self.register_buffer("unused_steps", torch.zeros(size))
 
-    @staticmethod
-    def _initial_codes(size: int, scale: float) -> Tensor:
-        """Code 0 is the identity; then +-east, +-north, +-spin at two sizes."""
-        axes = torch.eye(3)
-        basis = torch.cat([axes, -axes], 0)  # [6, 3]
-        codes = [torch.zeros(1, 3), scale * basis, 2 * scale * basis]
-        codes = torch.cat(codes, 0)[:size]
-        if len(codes) < size:
-            extra = scale * torch.randn(size - len(codes), 3, generator=torch.Generator().manual_seed(0))
-            codes = torch.cat([codes, extra], 0)
-        return codes
-
-    def to_local(self, omega: Tensor) -> Tensor:
-        """World-frame algebra elements [..., P, 3] -> local (east, north, up)."""
-        return torch.einsum("pij,...pj->...pi", self.frames, omega)
-
-    def to_world(self, local: Tensor) -> Tensor:
-        return torch.einsum("pji,...pj->...pi", self.frames, local)
-
     def forward(self, local: Tensor, update: bool = True
                 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Quantises local proposals [..., 3].
+        """Quantises proposals [..., dim].
 
         Returns the straight-through quantised values, code indices, the
         per-element commitment loss and the entropy regulariser (scalar)."""
-        flat = local.reshape(-1, 3).float()
+        flat = local.reshape(-1, self.dim).float()
         if self.training and update and not bool(self.seeded):
             self._seed(flat)
         emb = self.embedding.clone()  # snapshot: the EMA update below edits the buffer in place
@@ -165,6 +148,40 @@ class LieCodebook(nn.Module):
         return self.embedding[idx]
 
 
+class LieCodebook(VectorQuantiser):
+    """Vector quantiser over so(3) elements written in patch-local frames."""
+
+    def __init__(self, patch_centres: Tensor, size: int, max_angle: float, cfg: TheoryConfig):
+        super().__init__(size, 3, cfg, self._initial_codes(size, cfg.code_scale * max_angle))
+        up = F.normalize(patch_centres, dim=-1)                      # [P, 3]
+        z = torch.tensor([0.0, 0.0, 1.0]).expand_as(up)
+        east = torch.cross(z, up, dim=-1)
+        polar = east.norm(dim=-1, keepdim=True) < 1e-6
+        east = torch.where(polar, torch.tensor([1.0, 0.0, 0.0]).expand_as(up), east)
+        east = F.normalize(east - (east * up).sum(-1, keepdim=True) * up, dim=-1)
+        north = torch.cross(up, east, dim=-1)
+        self.register_buffer("frames", torch.stack([east, north, up], -2))  # [P, 3, 3] rows
+
+    @staticmethod
+    def _initial_codes(size: int, scale: float) -> Tensor:
+        """Code 0 is the identity; then +-east, +-north, +-spin at two sizes."""
+        axes = torch.eye(3)
+        basis = torch.cat([axes, -axes], 0)  # [6, 3]
+        codes = [torch.zeros(1, 3), scale * basis, 2 * scale * basis]
+        codes = torch.cat(codes, 0)[:size]
+        if len(codes) < size:
+            extra = scale * torch.randn(size - len(codes), 3, generator=torch.Generator().manual_seed(0))
+            codes = torch.cat([codes, extra], 0)
+        return codes
+
+    def to_local(self, omega: Tensor) -> Tensor:
+        """World-frame algebra elements [..., P, 3] -> local (east, north, up)."""
+        return torch.einsum("pij,...pj->...pi", self.frames, omega)
+
+    def to_world(self, local: Tensor) -> Tensor:
+        return torch.einsum("pji,...pj->...pi", self.frames, local)
+
+
 @dataclasses.dataclass
 class Explanation:
     states: List[Latent]        # s_1 .. s_{K+1}
@@ -175,6 +192,8 @@ class Explanation:
     selected: Latent            # the assembled state (each node at its patch's k*)
     vq_loss: Tensor             # scalar
     entropy: Tensor             # scalar
+    phys_indices: Optional[Tensor] = None  # physics code per step [K, B, S, P] (phase 2)
+    sub_error: Optional[Tensor] = None     # patch error after the Lie sub-step [K, B, S, P]
 
 
 class TheoryProgram(nn.Module):
@@ -182,9 +201,10 @@ class TheoryProgram(nn.Module):
 
     def __init__(self, graphs: WorldGraphs, num_shells: int, forcing_dim: int,
                  cs: int, cv_latent: int, d: int, cv: int, hidden_layers: int,
-                 lie_cfg: LieConfig, cfg: TheoryConfig):
+                 lie_cfg: LieConfig, cfg: TheoryConfig, static_dim: int = 0):
         super().__init__()
         self.cfg = cfg
+        self.static_dim = static_dim
         self.chain = lie_cfg.shell_coupling == "chain"
         # the programmer sees (s_k, s_y): two latent frames, like a 2-frame history
         self.proposer = LieGenerator(graphs, num_shells, 2, forcing_dim, cs, cv_latent,
@@ -195,6 +215,19 @@ class TheoryProgram(nn.Module):
         if self.codebook is None:  # frames are still needed to store continuous programs
             self.register_buffer("frames", LieCodebook(graphs.patches.centres, 1,
                                                        self.proposer.max_angle, cfg).frames)
+        # phase 2: physics codes (identity + physics_codes) executed after the Lie step
+        self.physics = self.phys_head = self.phys_codebook = None
+        if cfg.physics_codes > 0:
+            self.phys_head = nn.Linear(d, cfg.physics_dim)
+            self.phys_codebook = VectorQuantiser(1 + cfg.physics_codes, cfg.physics_dim, cfg)
+            self.physics = PhysicsExecutor(forcing_dim, static_dim, cs, cv_latent, d,
+                                           hidden_layers, cfg.physics_dim, cfg.physics_scale)
+
+    def _static(self, s: Latent, ns: Optional[Tensor]) -> Tensor:
+        if ns is None:
+            b, n = s.h.shape[0], s.h.shape[2]
+            ns = s.h.new_zeros(b, n, self.static_dim)
+        return ns
 
     # ----------------------------------------------------------- primitives
     def _frames(self) -> Tensor:
@@ -216,23 +249,49 @@ class TheoryProgram(nn.Module):
             chain.append(compose(chain[-1], world[:, k]))
         return torch.stack(chain, 1)
 
-    def apply(self, graphs: WorldGraphs, s: Latent, local: Tensor) -> Latent:
-        """Executes one program step on every patch: s -> Phi_{exp(omega)}(s)."""
+    def apply(self, graphs: WorldGraphs, s: Latent, local: Tensor,
+              phys: Optional[Tuple[Tensor, Tensor]] = None,
+              nf: Optional[Tensor] = None, ns: Optional[Tensor] = None) -> Latent:
+        """Executes one program step on every patch: s -> Phi_{exp(omega)}(s),
+        then the physics code (`phys` = (code embeddings [B, S, P, dz], code
+        indices [B, S, P])) as a column-local tendency."""
         omega = self._omega_from_program(local)
         b, sh = omega.shape[:2]
         omega_node = graphs.patches.blend(omega.flatten(0, 1)).unflatten(0, (b, sh))
-        return self.proposer.act(graphs, s, omega_node)
+        out = self.proposer.act(graphs, s, omega_node)
+        if phys is not None and self.physics is not None:
+            out = self.apply_physics(graphs, out, *phys, nf, ns)
+        return out
+
+    def apply_physics(self, graphs: WorldGraphs, s: Latent, e_patch: Tensor, idx: Tensor,
+                      nf: Tensor, ns: Optional[Tensor]) -> Latent:
+        b, sh = e_patch.shape[:2]
+        blend = lambda x: graphs.patches.blend(x.flatten(0, 1)).unflatten(0, (b, sh))
+        e_node = blend(e_patch)                                       # [B, S, N, dz]
+        w_node = blend(family_weights(idx, self.cfg.physics_codes))   # [B, S, N, 3]
+        return self.physics(s, e_node, w_node, nf, self._static(s, ns))
 
     def propose(self, graphs: WorldGraphs, s: Latent, s_y: Latent, nf: Tensor
-                ) -> Tuple[Tensor, Optional[Tensor], Tensor, Tensor]:
-        """One primitive per (shell, patch) in local frame, quantised if a codebook exists."""
-        omega, _, joints = self.proposer(graphs, [s, s_y], nf)
+                ) -> Tuple[Tensor, Optional[Tensor], Optional[Tuple[Tensor, Tensor]], Tensor, Tensor]:
+        """One Lie primitive per (shell, patch) in local frame (quantised if a
+        codebook exists) and, in phase 2, one physics code per (shell, patch).
+        Returns (lie_local, lie_idx, (phys_embed, phys_idx) | None, vq, entropy)."""
+        h, v = self.proposer.features(graphs, [s, s_y], nf)
+        omega, _, joints = self.proposer.algebra(graphs, h, v)
         local = self.to_local(joints if self.chain else omega)
-        if self.codebook is None:
-            zero = torch.zeros((), device=local.device)
-            return local, None, zero, zero
-        quant, idx, commitment, entropy = self.codebook(local)
-        return quant, idx, commitment.mean(), entropy
+        zero = torch.zeros((), device=local.device)
+        vq, ent, idx = zero, zero, None
+        if self.codebook is not None:
+            local, idx, commitment, ent = self.codebook(local)
+            vq = commitment.mean()
+        phys = None
+        if self.physics is not None:
+            b, sh = h.shape[:2]
+            e = graphs.patches.pool(self.phys_head(h.float()).flatten(0, 1)).unflatten(0, (b, sh))
+            e_q, p_idx, p_commit, p_ent = self.phys_codebook(e)
+            vq, ent = vq + p_commit.mean(), ent + p_ent
+            phys = (e_q, p_idx)
+        return local, idx, phys, vq, ent
 
     # ---------------------------------------------------------- explanation
     @staticmethod
@@ -255,17 +314,23 @@ class TheoryProgram(nn.Module):
         return Latent(h.gather(0, ih)[0], v.gather(0, iv)[0])
 
     def explain(self, graphs: WorldGraphs, s: Latent, s_y: Latent, nf: Tensor,
-                steps: Optional[int] = None) -> Explanation:
+                steps: Optional[int] = None, ns: Optional[Tensor] = None) -> Explanation:
         """Infers a program field for the pair (s, s_y) and selects k* by MDL."""
         K = steps or self.cfg.max_steps
-        states, program, indices = [s], [], []
+        states, program, indices, phys_indices, sub_errors = [s], [], [], [], []
         vq_total = torch.zeros((), device=s.h.device)
         ent_total = torch.zeros((), device=s.h.device)
         errors = [self._patch_error(graphs, s, s_y)]
         cur = s
         for _ in range(K):
-            local, idx, vq, ent = self.propose(graphs, cur, s_y, nf)
-            cur = self.apply(graphs, cur, local)
+            local, idx, phys, vq, ent = self.propose(graphs, cur, s_y, nf)
+            if phys is None:
+                cur = self.apply(graphs, cur, local)
+            else:  # Lie sub-step, then the physics code; keep the intermediate error
+                cur = self.apply(graphs, cur, local)
+                sub_errors.append(self._patch_error(graphs, cur, s_y))
+                cur = self.apply_physics(graphs, cur, *phys, nf, ns)
+                phys_indices.append(phys[1])
             states.append(cur)
             program.append(local)
             indices.append(idx)
@@ -279,19 +344,27 @@ class TheoryProgram(nn.Module):
         selected = self._assemble(graphs, states, lengths)
         return Explanation(states, torch.stack(program, 0),
                            torch.stack(indices, 0) if indices[0] is not None else None,
-                           lengths, patch_error, selected, vq_total, ent_total)
+                           lengths, patch_error, selected, vq_total, ent_total,
+                           torch.stack(phys_indices, 0) if phys_indices else None,
+                           torch.stack(sub_errors, 0) if sub_errors else None)
 
     @torch.no_grad()
-    def execute(self, graphs: WorldGraphs, s: Latent, program: Tensor, lengths: Tensor
-                ) -> Latent:
+    def execute(self, graphs: WorldGraphs, s: Latent, program: Tensor, lengths: Tensor,
+                phys_indices: Optional[Tensor] = None, nf: Optional[Tensor] = None,
+                ns: Optional[Tensor] = None) -> Latent:
         """Runs a stored program field on a (new) state: transfer.
 
-        program [K, B, S, P, 3] local elements, lengths [B, S, P]; a patch whose
-        length is exceeded receives the identity for the remaining steps."""
+        program [K, B, S, P, 3] local elements, lengths [B, S, P], optional
+        physics codes [K, B, S, P] (need the query state's forcing `nf`); a
+        patch whose length is exceeded receives the identity for the rest."""
         cur = s
         for k in range(program.shape[0]):
-            active = (lengths > k).float()[..., None]
-            cur = self.apply(graphs, cur, program[k] * active)
+            active = lengths > k
+            phys = None
+            if phys_indices is not None and self.physics is not None:
+                idx = torch.where(active, phys_indices[k], torch.zeros_like(phys_indices[k]))
+                phys = (self.phys_codebook.lookup(idx), idx)
+            cur = self.apply(graphs, cur, program[k] * active.float()[..., None], phys, nf, ns)
         return cur
 
     def summary(self, exp: Explanation) -> Dict[str, float]:
@@ -302,4 +375,12 @@ class TheoryProgram(nn.Module):
             counts = torch.bincount(exp.indices.flatten(), minlength=self.cfg.codebook_size).float()
             p = counts / counts.sum()
             out["perplexity"] = float(torch.exp(-(p * torch.log(p + 1e-9)).sum()))
+        if exp.phys_indices is not None:
+            out["phys_codes_used"] = float(len(torch.unique(exp.phys_indices)))
+            out["phys_frac"] = float((exp.phys_indices > 0).float().mean())
+            # share of the per-step error reduction done by the physics sub-step
+            lie_gain = exp.patch_error[:-1] - exp.sub_error
+            phys_gain = exp.sub_error - exp.patch_error[1:]
+            total = lie_gain.sum() + phys_gain.sum()
+            out["phys_share"] = float(phys_gain.sum() / total) if abs(float(total)) > 1e-12 else 0.0
         return out

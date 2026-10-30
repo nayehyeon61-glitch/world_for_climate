@@ -40,6 +40,7 @@ class PairSet:
     target: Tensor            # normalised target fields [N, C, H, W]
     times: np.ndarray         # init time in seconds [N]
     lead_hours: float
+    ns: Optional[Tensor] = None  # static fields at latent nodes [N, Nodes, St]
 
     def __len__(self) -> int:
         return self.s.h.shape[0]
@@ -47,7 +48,8 @@ class PairSet:
     def subset(self, idx) -> "PairSet":
         idx = torch.as_tensor(idx)
         return PairSet(Latent(self.s.h[idx], self.s.v[idx]), Latent(self.s_y.h[idx], self.s_y.v[idx]),
-                       self.nf[idx], self.target[idx], self.times[idx.numpy()], self.lead_hours)
+                       self.nf[idx], self.target[idx], self.times[idx.numpy()], self.lead_hours,
+                       None if self.ns is None else self.ns[idx])
 
 
 def _cat(latents: Sequence[Latent]) -> Latent:
@@ -64,7 +66,7 @@ def collect_pairs(model: ClimateWorldModel, dataset, indices: Sequence[int],
                   log: Optional[Callable[[str], None]] = None) -> PairSet:
     """Encodes (x_t, x_{t + 6h (target_step + 1)}) for the given dataset indices."""
     model.eval()
-    s, s_y, nf, tgt, times = [], [], [], [], []
+    s, s_y, nf, ns, tgt, times = [], [], [], [], [], []
     indices = list(indices)
     for i in range(0, len(indices), batch_size):
         chunk = [dataset[int(j)] for j in indices[i:i + batch_size]]
@@ -74,13 +76,14 @@ def collect_pairs(model: ClimateWorldModel, dataset, indices: Sequence[int],
         s.append(Latent(z.h.cpu(), z.v.cpu()))
         s_y.append(Latent(zy.h.cpu(), zy.v.cpu()))
         nf.append(model.node_forcing(batch["forcings_tgt"][:, target_step]).cpu())
+        ns.append(model.graphs.grid_to_latent_mean(batch["static"]).cpu())
         tgt.append(batch["targets"][:, target_step].cpu())
         times.append(batch["init_time"].cpu().numpy())
         if log and (i // batch_size) % 10 == 0:
             log(f"[pairs] {min(i + batch_size, len(indices))}/{len(indices)}")
     step_hours = 6.0 * (target_step + 1)
     return PairSet(_cat(s), _cat(s_y), torch.cat(nf), torch.cat(tgt),
-                   np.concatenate(times), step_hours)
+                   np.concatenate(times), step_hours, torch.cat(ns))
 
 
 def _per_sample_loss(model: ClimateWorldModel, z: Latent, target: Tensor) -> Tensor:
@@ -106,6 +109,8 @@ class Explained:
     loss_floor: Tensor       # decoded loss of the target latent [N]
     latent_by_length: Tensor  # latent MSE of state k [N, K + 1]
     latent_selected: Tensor  # [N]
+    phys_indices: Optional[Tensor] = None  # physics code per step [K, N, S, P] (phase 2)
+    sub_error: Optional[Tensor] = None     # patch error after the Lie sub-step [K, N, S, P]
 
 
 @torch.no_grad()
@@ -116,17 +121,22 @@ def explain_all(model: ClimateWorldModel, pairs: PairSet, steps: Optional[int] =
     th = model.theory
     out: Dict[str, List[Tensor]] = {k: [] for k in ("lengths", "program", "indices", "patch_error",
                                                     "loss_by_length", "loss_selected", "loss_floor",
-                                                    "latent_by_length", "latent_selected")}
+                                                    "latent_by_length", "latent_selected",
+                                                    "phys_indices", "sub_error")}
     n = len(pairs)
     for i in range(0, n, batch_size):
         sub = pairs.subset(range(i, min(i + batch_size, n)))
         s, s_y = _to(sub.s, device), _to(sub.s_y, device)
         nf, target = sub.nf.to(device), sub.target.to(device)
-        exp = th.explain(model.graphs, s, s_y, nf, steps=steps)
+        ns = None if sub.ns is None else sub.ns.to(device)
+        exp = th.explain(model.graphs, s, s_y, nf, steps=steps, ns=ns)
         out["lengths"].append(exp.lengths.cpu())
         out["program"].append(exp.program.cpu())
         if exp.indices is not None:
             out["indices"].append(exp.indices.cpu())
+        if exp.phys_indices is not None:
+            out["phys_indices"].append(exp.phys_indices.cpu())
+            out["sub_error"].append(exp.sub_error.cpu())
         out["patch_error"].append(exp.patch_error.cpu())
         out["loss_by_length"].append(torch.stack(
             [_per_sample_loss(model, z, target) for z in exp.states], 1).cpu())
@@ -141,10 +151,25 @@ def explain_all(model: ClimateWorldModel, pairs: PairSet, steps: Optional[int] =
     return Explained(cat("lengths"), cat("program", 1),
                      cat("indices", 1) if out["indices"] else None,
                      cat("patch_error", 1), cat("loss_by_length"), cat("loss_selected"),
-                     cat("loss_floor"), cat("latent_by_length"), cat("latent_selected"))
+                     cat("loss_floor"), cat("latent_by_length"), cat("latent_selected"),
+                     cat("phys_indices", 1) if out["phys_indices"] else None,
+                     cat("sub_error", 1) if out["sub_error"] else None)
 
 
-def self_explainability(exp: Explained, codebook_size: int) -> Dict[str, object]:
+def _usage_by_region(active: Tensor, patch_lat: Optional[Tensor]) -> Dict[str, float]:
+    """Fraction of active (non-identity) codes per shell and, with patch
+    latitudes (degrees, [P]), in the tropics (|lat| < 23.5) vs outside."""
+    out = {"per_shell": [float(v) for v in active.float().mean((0, 1, 3))]}
+    if patch_lat is not None:
+        tropics = patch_lat.abs() < 23.5
+        if tropics.any() and (~tropics).any():
+            out["tropics"] = float(active[..., tropics].float().mean())
+            out["extratropics"] = float(active[..., ~tropics].float().mean())
+    return out
+
+
+def self_explainability(exp: Explained, codebook_size: int,
+                        patch_lat: Optional[Tensor] = None) -> Dict[str, object]:
     """Means over pairs; `explained_fraction` = (persistence - selected) / (persistence - floor)."""
     k = exp.loss_by_length.shape[1] - 1
     pers, sel, floor = exp.loss_by_length[:, 0], exp.loss_selected, exp.loss_floor
@@ -178,6 +203,15 @@ def self_explainability(exp: Explained, codebook_size: int) -> Dict[str, object]
         s_count = torch.stack([torch.bincount(exp.indices[:, :, sh].flatten(), minlength=codebook_size)
                                for sh in range(exp.indices.shape[2])]).float()
         res["code_usage_per_shell"] = (s_count / s_count.sum(1, keepdim=True).clamp_min(1)).tolist()
+        res["lie_usage"] = _usage_by_region(exp.indices > 0, patch_lat)
+    if exp.phys_indices is not None:
+        res["phys_frac"] = float((exp.phys_indices > 0).float().mean())
+        res["phys_codes_used"] = int(len(torch.unique(exp.phys_indices)))
+        res["phys_usage"] = _usage_by_region(exp.phys_indices > 0, patch_lat)
+        lie_gain = (exp.patch_error[:-1] - exp.sub_error).sum()
+        phys_gain = (exp.sub_error - exp.patch_error[1:]).sum()
+        total = float(lie_gain + phys_gain)
+        res["phys_share"] = float(phys_gain / total) if abs(total) > 1e-12 else 0.0
     return res
 
 
@@ -217,15 +251,20 @@ def analog_transfer(model: ClimateWorldModel, pairs: PairSet, exp: Explained,
         src, ana = pairs.subset(ii), pairs.subset(jj)
         s_j, sy_j = _to(ana.s, device), _to(ana.s_y, device)
         target_j = ana.target.to(device)
+        nf_j = ana.nf.to(device)
+        ns_j = None if ana.ns is None else ana.ns.to(device)
+        phys = lambda kk: None if exp.phys_indices is None else exp.phys_indices[:, kk].to(device)
+        run = lambda kk: th.execute(graphs, s_j, exp.program[:, kk].to(device),
+                                    exp.lengths[kk].to(device), phys(kk), nf_j, ns_j)
         # (1) transfer: program inferred on i, executed on the analog state j
-        z_tr = th.execute(graphs, s_j, exp.program[:, ii].to(device), exp.lengths[ii].to(device))
+        z_tr = run(ii)
         # (2) delta copy: Euclidean latent change of i added to j (re-projected)
         delta = Latent(src.s_y.h - src.s.h, src.s_y.v - src.s.v)
         z_delta = s_j.exp(_to(delta, device), pos)
         # (3) a program from a random pair
-        z_rand = th.execute(graphs, s_j, exp.program[:, rr].to(device), exp.lengths[rr].to(device))
+        z_rand = run(rr)
         # (4) oracle: j explained with its own target
-        z_or = th.execute(graphs, s_j, exp.program[:, jj].to(device), exp.lengths[jj].to(device))
+        z_or = run(jj)
         for name, z in (("transfer", z_tr), ("persistence", s_j), ("delta", z_delta),
                         ("random", z_rand), ("oracle", z_or)):
             rows[name].append(_per_sample_loss(model, z, target_j).cpu())
@@ -281,6 +320,18 @@ def markdown(results: Dict[str, object]) -> str:
         lines.append(f"| codes used / perplexity | {se['codes_used']} / {se['perplexity']:.2f} |")
     if "corr_length_activity" in se:
         lines.append(f"| corr(k*, activity) | {se['corr_length_activity']:.3f} |")
+    if "phys_frac" in se:
+        pu, lu = se["phys_usage"], se.get("lie_usage", {})
+        lines.append(f"| physics codes: share of steps / of error reduction | "
+                     f"{100 * se['phys_frac']:.0f}% / {100 * se['phys_share']:.0f}% |")
+        lines.append("| physics usage per shell (surface → top) | "
+                     + ", ".join(f"{100 * v:.0f}%" for v in pu["per_shell"]) + " |")
+        if "tropics" in pu:
+            lines.append(f"| physics usage tropics / extratropics | "
+                         f"{100 * pu['tropics']:.0f}% / {100 * pu['extratropics']:.0f}% |")
+        if "tropics" in lu:
+            lines.append(f"| Lie (non-identity) usage tropics / extratropics | "
+                         f"{100 * lu['tropics']:.0f}% / {100 * lu['extratropics']:.0f}% |")
     if tr.get("pairs"):
         lines += ["", f"Analog transfer ({tr['pairs']} pairs):", "",
                   "| state on the analog | decoded loss | latent MSE |", "|---|---|---|",

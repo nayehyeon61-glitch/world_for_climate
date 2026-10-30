@@ -18,7 +18,7 @@ TINY = {
 }
 
 
-def _setup(codebook_size, coupling="independent", target_steps=1):
+def _setup(codebook_size, coupling="independent", target_steps=1, physics_codes=0):
     layout = gm.ChannelLayout(gm.get_task("graphcast_13_no_w", (500, 850)))
     ds = make_synthetic_era5(num_days=3, num_lat=9, num_lon=16, levels=(500, 850))
     raw = GraphCastWindowDataset(ds, layout, target_steps=target_steps)
@@ -26,7 +26,8 @@ def _setup(codebook_size, coupling="independent", target_steps=1):
     data = GraphCastWindowDataset(ds, layout, stats, target_steps=target_steps)
     batch = torch.utils.data.default_collate([data[0], data[1]])
     torch.manual_seed(0)
-    cfg = dict(TINY, theory={"codebook_size": codebook_size, "max_steps": 2},
+    cfg = dict(TINY, theory={"codebook_size": codebook_size, "max_steps": 2,
+                             "physics_codes": physics_codes, "physics_dim": 4},
                lie=dict(TINY["lie"], shell_coupling=coupling))
     model = ClimateWorldModel(WorldModelConfig.from_dict(cfg), layout, data.lat, data.lon)
     return model, batch, data
@@ -117,3 +118,80 @@ def test_transfer_evaluation_runs_end_to_end():
     md = transfer.markdown({"experiment": "tiny", "lead_hours": 6.0, "self_explainability": se,
                             "analog_transfer": tr, "length_ood": ood})
     assert "Analog transfer" in md and "Length OOD" in md
+
+
+def test_physics_executor_is_column_local_and_conservative():
+    from climate_wm.models.latent import Latent
+    from climate_wm.models.physics_codes import PhysicsExecutor, code_family, family_weights
+
+    torch.manual_seed(0)
+    B, S, N, Cs, Cv, F, St, dz = 2, 4, 7, 6, 3, 5, 2, 4
+    ex = PhysicsExecutor(F, St, Cs, Cv, hidden=16, hidden_layers=1, code_dim=dz, scale=1.0)
+    for m in ex.modules():  # the executor starts at zero; give it something to do
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.normal_(m.weight, std=0.3)
+    z = Latent(torch.randn(B, S, N, Cs), torch.randn(B, S, N, Cv, 3))
+    e, nf, ns = torch.randn(B, S, N, dz), torch.randn(B, N, F), torch.randn(B, N, St)
+    fam = lambda f: torch.nn.functional.one_hot(torch.full((B, S, N), f), 3).float()
+    # identity weights leave the state unchanged
+    out = ex(z, e, torch.zeros(B, S, N, 3), nf, ns)
+    assert torch.equal(out.h, z.h) and torch.equal(out.v, z.v)
+    # radiation changes scalars only
+    out = ex(z, e, fam(0), nf, ns)
+    assert not torch.allclose(out.h, z.h) and torch.equal(out.v, z.v)
+    # mixing conserves the column sum of scalars and vectors
+    out = ex(z, e, fam(1), nf, ns)
+    assert not torch.allclose(out.h, z.h)
+    assert torch.allclose((out.h - z.h).sum(1), torch.zeros(B, N, Cs), atol=1e-5)
+    assert torch.allclose((out.v - z.v).sum(1), torch.zeros(B, N, Cv, 3), atol=1e-5)
+    # the surface code only exchanges between shells 0 and 1
+    out = ex(z, e, fam(2), nf, ns)
+    d = out.h - z.h
+    assert torch.allclose(d[:, 2:], torch.zeros_like(d[:, 2:])) and not torch.allclose(d[:, 0], torch.zeros_like(d[:, 0]))
+    assert torch.allclose(d[:, 0] + d[:, 1], torch.zeros_like(d[:, 0]), atol=1e-6)
+    # column locality: changing another node leaves this node's tendency unchanged
+    z2 = Latent(z.h.clone(), z.v.clone())
+    z2.h[:, :, 3] += 1.0
+    out1, out2 = ex(z, e, fam(1), nf, ns), ex(z2, e, fam(1), nf, ns)
+    assert torch.allclose((out1.h - z.h)[:, :, :3], (out2.h - z2.h)[:, :, :3], atol=1e-6)
+    # families split the codebook in three equal blocks, identity has none
+    idx = torch.arange(7)
+    assert code_family(idx, 6).tolist() == [-1, 0, 0, 1, 1, 2, 2]
+    assert torch.equal(family_weights(idx, 6)[0], torch.zeros(3))
+
+
+def test_hybrid_program_explains_trains_and_transfers():
+    from climate_wm.eval import transfer
+
+    model, batch, data = _setup(8, "chain", target_steps=2, physics_codes=6)
+    th = model.theory
+    assert th.physics is not None and th.phys_codebook.size == 7
+    with torch.no_grad():
+        s = model.encode(batch["inputs"][:, -1], batch["forcings_in"][:, -1], batch["static"])
+        s_y = model.encode_target(batch, 0)
+        nf = model.node_forcing(batch["forcings_tgt"][:, 0])
+        ns = model.graphs.grid_to_latent_mean(batch["static"])
+        exp = th.explain(model.graphs, s, s_y, nf, ns=ns)
+    K, P = th.cfg.max_steps, model.graphs.patches.num_patches
+    assert exp.phys_indices.shape == (K, 2, 3, P) and exp.sub_error.shape == (K, 2, 3, P)
+    assert "phys_frac" in th.summary(exp) and "phys_share" in th.summary(exp)
+    with torch.no_grad():  # replaying Lie + physics codes reproduces the final state
+        replay = th.execute(model.graphs, s, exp.program, torch.full_like(exp.lengths, K),
+                            exp.phys_indices, nf, ns)
+    assert torch.allclose(replay.h, exp.states[K].h, atol=1e-5)
+    # the theory stage trains with physics codes and logs their statistics
+    stage = StageConfig(name="theory", steps=2, lr=1e-3,
+                        weights={"rec": 1.0, "latent": 1.0, "vq": 1.0, "entropy": 0.1})
+    hist = train_stage(model, [batch], stage, log_every=0)
+    assert all(torch.isfinite(torch.tensor(h["loss"])) for h in hist) and "phys_frac" in hist[0]
+    # the evaluation carries physics codes through explanation and transfer
+    pairs = transfer.collect_pairs(model, data, range(len(data)), 0, batch_size=3)
+    assert pairs.ns is not None
+    ex = transfer.explain_all(model, pairs, batch_size=3)
+    lat = torch.rad2deg(torch.asin(model.graphs.patches.centres[:, 2].clamp(-1, 1)))
+    se = transfer.self_explainability(ex, 8, lat)
+    assert "phys_share" in se and len(se["phys_usage"]["per_shell"]) == 3
+    tr = transfer.analog_transfer(model, pairs, ex, transfer.find_analogs(pairs, 12.0), batch_size=3)
+    assert all(math.isfinite(v) for v in tr.values() if isinstance(v, float))
+    assert "physics codes" in transfer.markdown({"experiment": "t", "lead_hours": 6.0,
+                                                  "self_explainability": se, "analog_transfer": tr})

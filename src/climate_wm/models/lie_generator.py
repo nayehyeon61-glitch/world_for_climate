@@ -85,8 +85,16 @@ class LieGenerator(nn.Module):
                 node_forcing: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Returns omega_patch [B, S, P, 3], omega_node [B, S, N, 3] and the
         joint rotations [B, S, P, 3] (= omega_patch for independent shells)."""
+        return self.algebra(graphs, *self.features(graphs, history, node_forcing))
+
+    def features(self, graphs: WorldGraphs, history: Sequence[Latent],
+                 node_forcing: Tensor) -> Tuple[Tensor, Tensor]:
+        """Processed node features (h [B, S, N, d], v [B, S, N, cv, 3]) that the
+        algebra head reads; the theory programmer adds its physics head here."""
         h, v = self.embed(history, node_forcing, graphs.latent_struct)
-        h, v = self.processor(graphs.latent_mesh, h, v)
+        return self.processor(graphs.latent_mesh, h, v)
+
+    def algebra(self, graphs: WorldGraphs, h: Tensor, v: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         with torch.autocast(h.device.type, enabled=False):  # so(3) algebra in fp32
             return self._algebra(graphs, h.float(), v.float())
 
