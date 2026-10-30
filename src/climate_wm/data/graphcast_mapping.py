@@ -222,10 +222,14 @@ class ChannelLayout:
         self.target_to_dynamic = [target_index[c] for c in self.dynamic]
         self.dynamic_shells = self.partition(self.dynamic)
         self.target_shells = self.partition(self.targets)
+        # Derived encoder inputs between the dynamic and forcing channels (stage 5
+        # physical diagnostics, `eval.physics_diag.with_diagnostics`); none by default.
+        self.diagnostics: List[Channel] = []
+        self.diagnostic_shells = self.partition(self.diagnostics)
 
     @property
     def num_encoder_channels(self) -> int:
-        return len(self.dynamic) + len(self.forcings) + len(self.static)
+        return len(self.dynamic) + len(self.diagnostics) + len(self.forcings) + len(self.static)
 
     def shell_of(self, channel: Channel) -> int:
         if channel.level is None:

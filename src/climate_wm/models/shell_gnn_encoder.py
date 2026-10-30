@@ -47,8 +47,8 @@ class ShellGNNEncoder(nn.Module):
         s = len(layout.shells)
         common = len(layout.forcings) + len(layout.static)
         self.in_scalar = nn.ModuleList([
-            MLP(len(p.scalar) + common + graphs.struct_dim, d, d, hl)
-            for p in layout.dynamic_shells])
+            MLP(len(p.scalar) + len(q.scalar) + common + graphs.struct_dim, d, d, hl)
+            for p, q in zip(layout.dynamic_shells, layout.diagnostic_shells)])
         self.in_vector = nn.ModuleList([
             VectorLinear(max(len(p.vector_u), 1), cv) for p in layout.dynamic_shells])
         self.shell_embed = nn.Parameter(0.02 * torch.randn(s, d))
@@ -75,12 +75,14 @@ class ShellGNNEncoder(nn.Module):
         """Per-shell grid node features: h [B, S, G, d], v [B, S, G, cv, 3]."""
         b = x.shape[0]
         flat = x.flatten(2).transpose(1, 2)  # [B, G, C]
-        n_dyn = len(self.layout.dynamic)
-        common = flat[..., n_dyn:]
+        n_dyn, n_diag = len(self.layout.dynamic), len(self.layout.diagnostics)
+        diag = flat[..., n_dyn:n_dyn + n_diag]
+        common = flat[..., n_dyn + n_diag:]
         struct = graphs.grid_struct.expand(b, -1, -1)
         hs, vs = [], []
-        for s, part in enumerate(self.layout.dynamic_shells):
-            scal = torch.cat([flat[..., part.scalar], common, struct], -1)
+        for s, (part, dpart) in enumerate(zip(self.layout.dynamic_shells,
+                                              self.layout.diagnostic_shells)):
+            scal = torch.cat([flat[..., part.scalar], diag[..., dpart.scalar], common, struct], -1)
             hs.append(self.in_scalar[s](scal) + self.shell_embed[s])
             if part.vector_u:
                 vec = uv_to_xyz(flat[..., part.vector_u], flat[..., part.vector_v],
@@ -91,7 +93,7 @@ class ShellGNNEncoder(nn.Module):
         return torch.stack(hs, 1), torch.stack(vs, 1)
 
     def forward(self, graphs: WorldGraphs, x: Tensor) -> Latent:
-        """x [B, C_enc, H, W] normalised, channels = [dynamic | forcings | static]."""
+        """x [B, C_enc, H, W] normalised, channels = [dynamic | diagnostics | forcings | static]."""
         b = x.shape[0]
         h_grid, v_grid = self.grid_features(graphs, x)
         cv = v_grid.shape[-2]

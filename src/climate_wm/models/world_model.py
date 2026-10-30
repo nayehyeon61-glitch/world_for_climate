@@ -35,6 +35,7 @@ import torch
 from torch import Tensor, nn
 
 from ..data.graphcast_mapping import ChannelLayout
+from ..eval.physics_diag import DiagnosticsConfig, PhysicsDiagnostics, with_diagnostics
 from ..train.losses import GraphCastLoss
 from .graphs import MeshConfig, WorldGraphs
 from .latent import Latent
@@ -68,6 +69,7 @@ class WorldModelConfig:
     diffusion: DiffusionConfig = dataclasses.field(default_factory=DiffusionConfig)
     theory: TheoryConfig = dataclasses.field(default_factory=TheoryConfig)
     pyramid: PyramidConfig = dataclasses.field(default_factory=PyramidConfig)
+    diagnostics: DiagnosticsConfig = dataclasses.field(default_factory=DiagnosticsConfig)
     transition: str = "lie_diffusion"
     history: int = 2  # latent frames conditioning the transition (= GraphCast inputs)
     residual_layers: int = 2
@@ -76,7 +78,8 @@ class WorldModelConfig:
     def from_dict(cls, d: Optional[dict]) -> "WorldModelConfig":
         d = dict(d or {})
         sub = {"mesh": MeshConfig, "gnn": ShellGNNConfig, "lie": LieConfig,
-               "diffusion": DiffusionConfig, "theory": TheoryConfig, "pyramid": PyramidConfig}
+               "diffusion": DiffusionConfig, "theory": TheoryConfig, "pyramid": PyramidConfig,
+               "diagnostics": DiagnosticsConfig}
         kwargs = {k: sub[k](**d.pop(k)) for k in list(d) if k in sub}
         return cls(**kwargs, **d)
 
@@ -101,6 +104,11 @@ class ClimateWorldModel(nn.Module):
         if bool(cfg.mesh.pyramid_levels) != cfg.transition.startswith("pyramid"):
             raise ValueError("pyramid transitions need mesh.pyramid_levels (and vice versa)")
         self.cfg = cfg
+        # Stage 5: physical diagnostics of the input state as extra encoder channels.
+        self.diagnostics = (PhysicsDiagnostics(layout, grid_lat, grid_lon, cfg.diagnostics)
+                            if cfg.diagnostics.enabled else None)
+        if self.diagnostics is not None:
+            layout = with_diagnostics(layout, self.diagnostics.channels)
         self.layout = layout
         self.graphs = WorldGraphs(grid_lat, grid_lon, cfg.mesh)
         if self.graphs.pyramid is not None:
@@ -139,6 +147,8 @@ class ClimateWorldModel(nn.Module):
     # ------------------------------------------------------------------ I/O
     def encoder_input(self, dynamic: Tensor, forcing: Tensor, static: Tensor) -> Tensor:
         """[B, C_dyn, H, W], [B, C_f, H, W], [B, C_s, H, W] -> [B, C_enc, H, W]."""
+        if self.diagnostics is not None:
+            return torch.cat([dynamic, self.diagnostics(dynamic), forcing, static], 1)
         return torch.cat([dynamic, forcing, static], 1)
 
     def encode(self, dynamic: Tensor, forcing: Tensor, static: Tensor) -> Latent:
