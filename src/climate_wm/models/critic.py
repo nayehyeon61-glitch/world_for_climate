@@ -5,12 +5,14 @@ statistics are tracked (EMA, no gradient) on observed frames during training:
 
   DiagnosticCritic  moment matching in the space of the squashed physical
                     diagnostics (`eval.physics_diag`). Per channel and latitude
-                    row a state has a zonal mean and a zonal variance; the
-                    score compares them with the observed distribution,
-                        (m - mu)^2 / s2  +  (log v - log v_obs)^2,
-                    averaged over channels and rows. The variance term makes a
-                    blurred prediction score badly, which a plain likelihood
-                    would reward.
+                    row a state has a zonal mean m and a zonal variance v; the
+                    score compares them with the observed means,
+                        (m - mu)^2 / v_obs  +  (log v - log v_obs)^2,
+                    averaged over channels and rows (the mean is measured in
+                    observed zonal standard deviations, which keeps channels
+                    with an almost constant zonal mean from dominating). The
+                    variance term makes a blurred prediction score badly, which
+                    a plain likelihood would reward.
   LieFisherCritic   Fisher's linear discriminant on so(3) (Li et al., Lie Group
                     Machine Learning, ch. 9) between the generators implied by
                     the observed wind (Killing projection of the shell-mean
@@ -23,8 +25,8 @@ statistics are tracked (EMA, no gradient) on observed frames during training:
                     model generators to the observed mean.
 
 Uses: an auxiliary loss ramped in over the dynamics stage (arm G3), member
-weights softmax(-score / tau) for the DIAMOND ensemble, and a reward term for
-the stage 2 refinement.
+weights softmax(-score / tau) (scores standardised over the members) for the
+DIAMOND ensemble, and a reward term for the stage 2 refinement.
 """
 
 from __future__ import annotations
@@ -61,7 +63,6 @@ class DiagnosticCritic(nn.Module):
         self.cfg = cfg
         k = len(diag)
         self.register_buffer("mean", torch.zeros(k, num_lat))  # E[zonal mean]
-        self.register_buffer("mean_sq", torch.ones(k, num_lat))  # E[zonal mean^2]
         self.register_buffer("log_var", torch.zeros(k, num_lat))  # E[log zonal variance]
         self.register_buffer("count", torch.zeros((), dtype=torch.long))
 
@@ -78,15 +79,13 @@ class DiagnosticCritic(nn.Module):
         first = bool(self.count == 0)
         mom = self.cfg.momentum
         _ema(self.mean, m.mean(0), mom, first)
-        _ema(self.mean_sq, m.square().mean(0), mom, first)
         _ema(self.log_var, lv.mean(0), mom, first)
         self.count += 1
 
     def score(self, x: Tensor, per_channel: bool = False) -> Tensor:
         """[B] (or [B, K]) distance of each state's diagnostics to the observed ones."""
         m, lv = self.moments(x)
-        var = (self.mean_sq - self.mean.square()).clamp_min(self.cfg.eps)
-        d = (m - self.mean).square() / var + (lv - self.log_var).square()
+        d = (m - self.mean).square() / self.log_var.exp() + (lv - self.log_var).square()
         d = d.mean(-1)  # over latitude rows
         return d if per_channel else d.mean(-1)
 
@@ -188,6 +187,13 @@ class RealityCritic(nn.Module):
         return out
 
 
-def member_weights(scores: Tensor, tau: float = 1.0) -> Tensor:
-    """Ensemble member weights softmax(-score / tau) over members (dim 0)."""
+def member_weights(scores: Tensor, tau: float = 1.0, standardize: bool = True) -> Tensor:
+    """Ensemble member weights softmax(-score / tau) over members (dim 0).
+
+    With `standardize` the scores are first centred and scaled by their spread
+    over the members, so that tau is a dimensionless sharpness (the raw score
+    differences between members of one forecast are small and vary by lead).
+    """
+    if standardize and scores.shape[0] > 1:
+        scores = (scores - scores.mean(0)) / (scores.std(0) + 1e-8)
     return torch.softmax(-scores / tau, 0)

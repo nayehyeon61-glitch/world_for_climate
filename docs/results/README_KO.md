@@ -8,7 +8,7 @@
 | 2 | 학습된 세계 모델을 새 연도 데이터로 RL(검증 보상 정책 개선) 보강 | 완료: 2020 held-out 시험, 지도학습 대조군 | `stage2_rl_refinement/` |
 | 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 완료: 1차(VQ-Lie vs 연속), 2차(잔차 physics 코드 미지지, 2020 불변성 확인) | `stage3_theory/` |
 | 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 구현 완료, P 학습 중, P−skip 대기 | `stage4_pyramid/` |
-| 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | 설계 완료, 코드 1/6(복합 군 모듈) | `stage5_causal_lie/` |
+| 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | 구현 완료(복합 군·진단·critic·평가), G1–G3 학습 대기 | `stage5_causal_lie/` |
 
 ---
 
@@ -163,11 +163,15 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **가설:** 대기 방정식 dX/dt = F(X)의 각 항은 벡터장, 곧 Lie 대수의 생성자이고, exp(Δt F)는 군 원소, 순차적 과정은 군의 곱입니다(수치예보의 과정 분할 = Lie–Trotter/Strang). 3단계 2차에서 physics를 Lie 군 밖의 잔차로 붙였을 때 Lie와 경쟁만 했으므로, physics를 **군 안에** 넣습니다: 칼럼 잠재 상태 위의 복합 군 G = (SO(3) × Vert) ⋉ Fib, 즉 수평 이송(SO(3), Killing 사영) × 수직 이동(Vert = 쉘 축 평행이동, 상승·하강) ⋉ 물리 가족(Fib = 아핀 생성자: 복사 편향, 쉘 라플라시안 모드 위의 교환 가능한 수직 혼합, 보존형 지표 교환, 게이트 응결). 반직접곱은 "이송된(라그랑주) 좌표계에서 물리를 적용한다"는 뜻입니다. 진단량(정역학·지균 잔차, N², 포화 결손, 발산·와도, 지표 수지, TISR 위상)을 GNN 입력으로 주고, critic(해석적 진단 + 𝔤 위의 Lie–Fisher 판별)이 현실 정합성을 판정합니다. 이론 참조: Li et al., *Lie Group Machine Learning* (De Gruyter 2019). 설계 문서(한국어): https://claude.ai/artifact/7R6BJ2z27FC5LWu5m3SG18
 
-**구현 진행:**
-- 1/6 `geometry/composite_group.py`: Vert 이동(경계 고정, tanh 상한), Fib 생성자와 정확한 아핀 흐름 Z(dt) = e^{dt A} Z + φ₁(dt A) dt b(혼합 가족은 교환 가능 → 닫힌 아핀 부분대수, 칼럼 합 보존), Strang/Trotter 분할, Cartan 분해 ω = ω_𝔨 + ω_𝔭, Karcher 평균·군 가우시안 불변성 통계. 테스트 10개(항등·보존·ODE 일치·1-매개변수 부분군·교환성·분할 차수 2·Karcher 복원).
-- 남은 것: 진단 채널, 전이 heads(이동·혼합 계수, 0 초기화로 G0와 동일하게 시작), critic, 평가·보고 스크립트, 설정 G1–G3.
+**구현 (`geometry/composite_group.py`, `eval/physics_diag.py`, `models/pyramid_transition.py`, `models/critic.py`, `eval/stage5.py`):**
+- 복합 군: Vert 이동(경계 고정, tanh 상한), Fib 생성자와 정확한 아핀 흐름 Z(dt) = e^{dt A} Z + φ₁(dt A) dt b(혼합 가족은 교환 가능 → 닫힌 아핀 부분대수, 칼럼 합 보존), Strang/Trotter 분할, Cartan 분해 ω = ω_𝔨 + ω_𝔭, Karcher 평균·군 가우시안 불변성 통계.
+- 전이: 피라미드 전이의 같은 특징에서 칼럼별 수직 이동 w와 가족별 계수(복사·혼합·지표·응결, 학습 게이트)를 내고, 한 스텝을 exp(½F)·exp(w∂_η)·exp(ω)·exp(½F)로 합성합니다. 이동 헤드는 0 초기화, 가족마다 이득이 0에서 시작(혼합·응결은 straight-through 사영으로 비음수)하므로 G1은 P와 같은 모델에서 출발합니다. 생성원 크기는 L_fib로 벌점.
+- 진단 입력 80채널: 층 쌍별 정역학 두께 오차와 N², 층별 지균 불균형 비(적도 ±10° 제외)·1 − q/q_s·발산·와도, 지표 지균 비·10 m 발산·와도, t2m − T₁₀₀₀. 실제 WB2 2018에서 정역학 오차 중앙값 ~1e-3, N² ~1e-4 (성층권 4e-4), 지균 비 0.1(상층)–0.25(1000 hPa)로 물리적으로 맞는 값입니다. 0.25° 격자의 극 행도 처리합니다.
+- critic: 진단 critic은 관측 프레임의 EMA 통계 대비 위도 행별 동서 평균·로그 분산을 비교합니다(흐린 예측이 나쁜 점수를 받도록 분산 항 포함; 실제 2018 상태 1.29, 동서 평활 1.66, 잡음 10.6). Lie–Fisher critic은 관측 바람의 Killing 투영(같은 피라미드 사영, 스텝당 rad)과 모델 생성원 사이의 Fisher 판별(쉘·패치 레벨별, Cartan 좌표, 합동 공분산)입니다. G3는 L_phys·L_fisher를 첫 200 스텝에 걸쳐 켭니다. 앙상블 멤버 가중은 멤버 간 표준화한 점수의 softmax.
+- 평가 `scripts/eval_stage5.py` + `report_stage5.py`: 쉘별 가족 활동과 불안정(N² < 0) 칼럼 조건부 혼합, 가족·이동 knock-out, TISR = 밤 반사실, Cartan 스핀/이송 에너지, critic 가중 앙상블 CRPS·spread/skill·critic–오차 순위 상관, 2018 대 2020 군 통계. P1(72h RMSE)은 `compare_graphcast.py`.
+- 테스트 25개 추가(전체 83개).
 
-**팔:** G0 = 4단계 P(플래그 끔, 비트 동일), G1 = +Vert·Fib, G2 = +진단 입력, G3 = +critic. 예측 P1–P5는 설계 문서 §7.
+**팔 (`configs/wb2_g1.yaml`·`wb2_g2.yaml`·`wb2_g3.yaml`):** G0 = 4단계 P(플래그 끔, 기존 체크포인트 그대로 로드), G1 = +Vert·Fib, G2 = +진단 입력, G3 = +critic. 같은 데이터·단계·스텝 예산. 예측 P1–P5와 판정 기준은 설계 문서 §7과 `report_stage5.py` 머리말.
 
 ---
 
@@ -203,4 +207,12 @@ python scripts/compare_graphcast.py --checkpoint runs/wb2_pyramid/checkpoint.pt 
 python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --data-dir DATA --stride 4
 python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
     --pyramid P=runs/wb2_pyramid/pyramid_eval.json --out-dir docs/results/stage4_pyramid
+# 5단계 (G1–G3 각각; G0 = 4단계 P 체크포인트)
+python scripts/train.py --config configs/wb2_g1.yaml --data-dir DATA
+python scripts/compare_graphcast.py --checkpoint runs/wb2_g1/checkpoint.pt --data-dir DATA --init-stride 3
+python scripts/eval_stage5.py --checkpoint runs/wb2_g1/checkpoint.pt --data-dir DATA
+python scripts/report_stage5.py G0=runs/wb2_pyramid/compare_graphcast.json G1=runs/wb2_g1/compare_graphcast.json \
+    G2=runs/wb2_g2/compare_graphcast.json G3=runs/wb2_g3/compare_graphcast.json \
+    --eval G0=runs/wb2_pyramid/stage5_eval.json G1=runs/wb2_g1/stage5_eval.json G2=... G3=... \
+    --out-dir docs/results/stage5_causal_lie
 ```

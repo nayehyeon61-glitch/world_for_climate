@@ -111,6 +111,21 @@ def test_critic_losses_ramp_and_member_weights(setup):
     assert grads and all(torch.isfinite(g).all() for g in grads)
     assert "fisher_J" in model.critic.summary()
     w = member_weights(torch.tensor([[1.0, 0.2], [3.0, 0.1]]), tau=1.0)
-    assert torch.allclose(w.sum(0), torch.ones(2)) and w[0, 0] > w[1, 0]
+    assert torch.allclose(w.sum(0), torch.ones(2)) and w[0, 0] > w[1, 0] and w[0, 1] < w[1, 1]
+    # standardised: only the ranking within a forecast matters, not the score scale
+    assert torch.allclose(member_weights(torch.tensor([[1.0], [3.0]])),
+                          member_weights(torch.tensor([[10.0], [30.0]])))
     # checkpoints carry the observed statistics
     assert any(k.startswith("critic.diagnostic.mean") for k in model.state_dict())
+
+
+def test_weighted_crps():
+    from climate_wm.eval.stage5 import weighted_crps
+    g = torch.Generator().manual_seed(0)
+    ens, y = torch.randn(5, 7, generator=g), torch.randn(7, generator=g)
+    eq = torch.full((5, 1), 0.2)
+    biased = (ens - y).abs().mean(0) - 0.5 * (ens[:, None] - ens[None]).abs().mean((0, 1))
+    assert torch.allclose(weighted_crps(ens, y, eq), biased, atol=1e-6)
+    one = torch.zeros(5, 1)
+    one[2] = 1.0
+    assert torch.allclose(weighted_crps(ens, y, one), (ens[2] - y).abs(), atol=1e-6)  # a single member
