@@ -444,6 +444,47 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 최종 N1의 결과는 위 표로 채웁니다.
 
+### 9.3 확장성: N1은 크기에 막혀 있는가 (`stage9_physics/scaling.md`)
+
+**질문 (감자 22:57 KST 10/31):** "지금 클라우드 한계 내에서 scalable도 test해두세요. 즉 확장성 문제인지도 체크." N1과 GraphCast의 격차가 크기(모형 용량, 학습량, 해상도)의 문제인지, 구조의 문제인지 가립니다. 크기의 문제라면 클러스터(96 GB GPU, ERA5 1979–2018)에서 키우면 되고, 구조의 문제라면 키워도 격차가 남습니다.
+
+**두 갈래**
+1. 용량: 한 번에 한 축만 바꾼 N1을 같은 자료(2015–2017)로 학습하고, 같은 2018 초기 시각 31개(11일 간격, 72h)에서 N1과 짝지어 비교합니다(`scripts/report_physics_scaling.py`).
+2. 계산: 합성 상태로 절단 T21–T85에서 6h 예보 한 번, 학습 한 스텝(1스텝 전개, 역전파), 연산자 묶음 호출의 시간과 최대 메모리를 잽니다(`scripts/benchmark_physics.py`). 격자점 수 N에 대한 지수를 맞추고 T119(1°, 180×360)로 외삽합니다. T119 자체는 외삽값이 약 13 GB라서, 학습 두 줄과 같이 돌리면 메모리가 넘칠 수 있어 재지 않았습니다.
+
+| 갈래 | 군 | 바꾼 것 | 대기열 |
+|---|---|---|---|
+| 용량 | w05 | 칼럼 MLP 폭 128 (N1 256) | B줄 |
+| 용량 | w2 | 칼럼 MLP 폭 512 | B줄 |
+| 용량 | l05 | 학습 500스텝 (N1 1000, 전개 길이 일정을 같은 비율로) | B줄 |
+| 용량 | t21 | 코어 T21, 32×64, 40분 (N1 T31, 48×96, 30분) | B줄 |
+| 용량 | osel8 | 11단계 연산자 K = 8 (O-sel K = 4), 2020 가림 게임 | A줄 |
+| 계산 | T21–T85 | 격자 크기 | 별도, 1스레드 |
+
+**결정 규칙 (사전 등록)**
+- S1 폭: w2가 24h나 72h 전체 오차를 5% 이상 낮추고 구간이 0 아래면 폭에 막혀 있습니다. w2가 ±3% 안이고 w05가 5% 이상 나빠지지 않으면 폭은 병목이 아닙니다.
+- S2 학습량: l05가 24·72h에서 N1의 3% 안이면 학습량에 막혀 있지 않습니다. 5% 이상 나쁘면 더 많은 갱신이나 자료가 도움이 됩니다.
+- S3 해상도: T21이 T31보다 24h나 72h에 10% 이상 나쁘면 해상도가 중요하고, 클러스터 T119가 다음 수단입니다.
+- S4 계산: 학습 스텝 시간이 N^1.5보다 빨리 늘지 않고, 외삽한 T119 학습(4스텝 전개)이 96 GB에 들어갑니다.
+- S5 제어기: K = 8이 K = 4보다 2020 가림 24h 오차를 3% 이상 낮춥니다.
+
+**해석 (원인 분석)**
+- S1–S3 모두 "막혀 있지 않음"이면 격차는 구조에서 옵니다. 칼럼은 이웃을 보지 못하고, 코어의 T31 역학과 6h 자료 간격이 정한 한계가 남습니다. 그러면 키우기보다 구조(10단계 기억, 11단계 제어, 칼럼에 이웃 정보 주기)를 바꿔야 합니다.
+- S2만 성립하면 자료를 늘리는 것이 먼저입니다. 클러스터의 1979–2018 시간별 자료가 바로 그 수단입니다.
+- S3이 성립하면 해상도가 먼저입니다. 다만 T21→T31 차이는 T31→T119 효과의 하한일 뿐입니다.
+- S1이 성립하면 칼럼 학습이 용량에 묶여 있습니다. 폭을 키우는 비용은 작습니다(아래 계산 표에서 칼럼은 학습 시간의 일부).
+
+**계산 측정 (CPU 1스레드, 학습 두 줄과 동시 실행이라 시간은 상한)**
+
+| 절단 | 격자 | Δt (분) | 6h 예보 (s) | 학습 스텝 (s) | 연산자 묶음 K=4 (s) | 최대 메모리 (GB) |
+|---|---|---|---|---|---|---|
+| T21 | 34×68 | 40 | 0.61 | 1.27 | 0.039 | 0.94 |
+| T31 | 48×96 | 30 | 0.75 | 2.89 | 0.039 | 1.30 |
+| T42 | 64×128 | 20 | 1.65 | 6.50 | 0.060 | 1.92 |
+| T63 | 96×192 | 15 | 5.71 | 18.5 | 0.135 | 4.04 |
+
+T85와 칼럼 폭별 측정, 지수 맞춤과 외삽은 측정이 끝나면 `stage9_physics/scaling.md`에 채웁니다. 용량 시험은 B줄의 10단계 실험 뒤(11/01 ~06:00–14:00)에 돌고, 보고는 ~14:30 KST입니다.
+
 ## 10단계 — 적응형 기억 커널과 DreamerV3식 유동 학습 (`stage10_memory/`)
 
 **가설 (감자, 10/31 18:32–19:12):** 9단계 N3처럼 세계 모델을 얼리고 기억 없는 제어기만 학습하는 것은 World Models를 잘못 옮긴 것입니다. DreamerV3처럼 세계 모델이 계속 배우고(유동성), 에이전트가 기억을 가져야 합니다. 핵심은 "행위자 입력에 마스크된 관측 → 그 관측을 받는 기억의 물리 → 적응형 기억을 통한 미래 예측"입니다. 설계 문서: [10단계 설계: 적응형 기억 커널과 DreamerV3식 유동 학습](https://claude.ai/artifact/KqNAQg5dARnZhdAkwqfUzj).
@@ -505,6 +546,15 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 ## 재현
 
 ```bash
+# 9단계 확장성 (w05: model.column.hidden=128, w2: 512, t21: model.core.trunc=21 model.core.nlat=32 model.core.nlon=64
+#   model.core.dt_minutes=40, l05: train.steps=500 train.warmup_steps=25 train.rollout_schedule=[[0,1],[100,2],[250,4]])
+python scripts/train_physics.py --config configs/physics_wb2.yaml --data-dir DATA --set output_dir=runs/scale_w2 model.column.hidden=512
+python scripts/eval_physics_causes.py --checkpoint runs/scale_w2/checkpoint.pt --data-dir DATA --year 2018 --inits 31 \
+    --spacing-days 11 --names --out runs/scale_w2/skill_2018.json       # N1도 같은 평가
+for t in 21 31 42 63 85; do python scripts/benchmark_physics.py --checkpoint runs/physics_n1/checkpoint.pt --trunc $t; done > bench.jsonl
+python scripts/report_physics_scaling.py --base runs/physics_n1/skill_2018.json --arms w2=runs/scale_w2/skill_2018.json \
+    --bench bench.jsonl --games osel=runs/stage11_osel/game_eval.json osel8=runs/stage11_osel8/game_eval.json \
+    --out docs/results/stage9_physics/scaling.md
 # 10단계 (N1 위; DATA2020 = 2017-12 .. 2021-01 ERA5)
 python scripts/train_dreamer.py --checkpoint runs/physics_n1/checkpoint.pt --config configs/dreamer_wb2.yaml \
     --data-dir DATA2020 --out runs/stage10_D      # D-blind: --set dreamer.imagination=blind, D-noactor: dreamer.train_actor=false,

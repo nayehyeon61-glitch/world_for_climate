@@ -69,3 +69,32 @@ def test_physics_causes_evaluation(setup, tmp_path):
     again = pc.evaluate_physics_causes(MODEL, state, stats, data, [0, 1], names=names, steps=2,
                                        progress_path=path)
     assert again["interventions"]["sun_off"]["change_all"] == res["interventions"]["sun_off"]["change_all"]
+
+
+def test_scaling_report(setup, tmp_path):
+    import json
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    import report_physics_scaling as rs
+    layout, stats, data, state = setup
+    res = pc.evaluate_physics_causes(MODEL, state, stats, data, [0, 1], names=[], steps=2)
+    assert set(res["interventions"]) == {"full"}
+    base, arm = tmp_path / "n1.json", tmp_path / "w2.json"
+    base.write_text(json.dumps(res))
+    worse = json.loads(json.dumps(res))
+    rec = worse["interventions"]["full"]["records"]
+    rec["all"] = (1.2 * np.array(rec["all"])).tolist()  # an arm 20% worse at every lead
+    arm.write_text(json.dumps(worse))
+    bench = tmp_path / "bench.jsonl"
+    bench.write_text("\n".join(json.dumps({"trunc": t, "grid": [n, 2 * n], "dt_min": 30.0, "column_hidden": 16,
+                                           "params": 1, "forecast_6h_s": 1e-4 * n ** 2, "train_step_s": 1e-4 * n ** 2.5,
+                                           "operator_bank_s": 0.01, "operators": 4, "peak_rss_gb": 0.5 + 1e-4 * n ** 2})
+                               for t, n in ((21, 32), (31, 48), (42, 64))))
+    out = tmp_path / "scaling.md"
+    sys.argv = ["report_physics_scaling.py", "--base", str(base), "--arms", f"w2={arm}", f"t21={arm}",
+                "--bench", str(bench), "--out", str(out)]
+    rs.main()
+    md = out.read_text()
+    assert "| w2 | column width x2 (512) | +20% [+20, +20] | +0% |" in md  # 2 leads: 6 h shown, 12 h judged
+    assert "resolution matters" in md and "p = 1.25" in md and "S5" in md
