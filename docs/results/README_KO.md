@@ -10,6 +10,7 @@
 | 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 완료: P·P−skip 2018 GraphCast 비교, 예측 1–3 판정(1 미지지, 2 부분, 3 P 미지지·P−skip 형식상 지지) | `stage4_pyramid/` |
 | 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | G1 완료(P1 미지지), 원인 분석(자동부호화기 바닥 = skip dropout, P−nodrop으로 확인; denoiser 잡음), G2 학습 중, G3 보류 | `stage5_causal_lie/` |
 | 6 | 쉘 그래프 결합: 쉘 사이의 사슬(s±1) 연결을 학습된 쉘 그래프로 바꾸고, 같은 패치의 쉘 생성원도 그래프로 결합 | 구현 완료, H1·H2 학습 대기(G2 뒤), H0 = P−nodrop | `stage6_shell_graph/` |
+| 7 | 예측 게임과 GNN feature 제어: 학습된 물리 예측 모델을 고정하고, 마스킹된 데이터를 예측하는 게임에서 GNN feature를 조절하는 작은 제어기만 보상으로 학습한 뒤 전체를 시험 (Ha의 World Models) | 구현 완료, C1·C1-grad·C1-open 학습 대기(G2 뒤) | `stage7_prediction_game/` |
 
 ---
 
@@ -243,6 +244,22 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 **예측(사전 등록):** (1) H1은 H0보다 72h 단일 멤버 RMSE가 연직 교환 변수(q700, t850, t2m)에서 2% 이상 낮고 90% 구간이 0을 포함하지 않는다. (2) 비국소 간선이 쓰인다: 상태 의존 비사슬 몫이 사전(0.11)보다 크고, `nonlocal` knock-out이 RMSE를 올린다. (3) 가장 큰 비사슬 가중치는 경계층·지표와 상부 대류권 사이(심층 대류)에 있다. (4) H2의 A는 0이 아니고 `shell_graph` knock-out이 RMSE를 올린다; A가 사슬(하삼각 양수)에 가까운지, 순압 결합(모두 양수)에 가까운지 기록한다.
 ---
 
+## 7단계 — 예측 게임과 GNN feature 제어 (`stage7_prediction_game/`)
+
+**가설 (감자, 10/31 14:06):** Lie 구조에 매몰되지 말고, 세계 모델이 물리를 이해해 미래를 예측하게 만드는 데 집중합니다. 예측을 하나의 게임으로 보고(Ha & Schmidhuber 2018 World Models, Freeman·Metz·Ha 2019 observational dropout), (1) 물리 예측 구조를 먼저 학습해 고정하고, (2) 마스킹된 데이터를 예측하는 게임에서 GNN feature를 조절하는 제어만 보상으로 학습한 뒤, (3) 전체 모델을 시험합니다. 설계 문서: [7단계 설계: 예측 게임과 GNN feature 제어](https://claude.ai/artifact/H8az4WzNqJvUuvWYYGz1LU).
+
+**구현 (`models/feature_control.py`, `train/prediction_game.py`):**
+- 제어기(`FeatureController`, 8.9k 파라미터): 쉘 × 12개 패치마다 잠재 스칼라·벡터 크기 평균, 디코딩한 현재 상태의 물리 진단량(5단계 모듈의 7개 가족을 쉘별 평균), 마스크 비율, 쉘·패치 정체를 보고, 잠재 스칼라에 저차수 FiLM h ← h + 0.1·(h·Uγ + Uβ)(r = 4, U 고정 직교 기저)를 겁니다. 스칼라만 바꾸므로 SO(3) 등변성은 유지되고, 마지막 층이 0에서 시작해 학습 전에는 고정 모델과 똑같습니다. 세계 모델의 하위 모듈로 등록하지 않아 체크포인트는 바뀌지 않습니다(`controlled(model, ctrl)`).
+- 게임: 24h(4스텝) 판마다 변수 하나(모든 층) 또는 표면 묶음, 쉘 하나, 지구 면적 25%의 원형 지역 중 하나를 가리고 기후값(0)으로 채웁니다. 점수 = −Σ_k [0.5·가려진 점의 MSE + 0.5·전체 MSE](GraphCast 가중). 세계 모델은 denoiser를 끈 결정론 모드입니다. 시간 마스킹(확률적으로 실제 관측을 다시 보는 observational dropout)은 구현했지만 1차에서는 끕니다.
+- 학습: `rl` = 상태마다 행동 4개(가우스 정책, σ = 0.5)로 그룹 정규화 이점의 정책 기울기(2단계 GRPO 방식); `grad` = 같은 제어기를 고정 모델을 통한 정확한 기울기로 학습(대조군). 150회 갱신, 같은 창·같은 마스크 순서, 10회마다 이어 하기 저장.
+- 원인 분석: `eval_causes.py --controller --deterministic`에 `no_control`(고정 모델), `random_control`(같은 행동을 섞인 쉘·패치 위치에), `no_diag`(진단량 입력 0) knock-out을 추가했고, `eval_game.py`는 같은 knock-out을 마스킹 게임에서 잽니다.
+
+**팔:** 기본 모델 = P−nodrop(2015–17 학습, 고정). C0 = 행동 0, C1 = RL 제어기, C1-grad = 기울기 대조군, C1-open = 상태를 보지 않는 상수 행동, C1-random·C1-nodiag = C1의 평가 시 knock-out. 게임 학습 2018–19, 시험 2020(31개 초기 시각). 2차 후보: C1-nomask(마스킹 없는 게임), 입력 feature 게이트 행동.
+
+**예측(사전 등록):** Q1 C1이 2020 마스킹 게임에서 가려진 변수의 24h 오차를 C0보다 3% 이상 줄이고 90% 구간이 0을 포함하지 않는다. Q2 C1의 이득이 C1-random·C1-open보다 크다. Q3 마스킹 없는 보통 예보에서 6–72h 어느 리드에서도 0.5% 넘게 나빠지지 않는다. Q4 C1-nodiag가 이득의 절반 이상을 잃는다. Q5(기록) C1 대 C1-grad. Q1과 Q2가 모두 성립하면 지지로 판정합니다.
+
+---
+
 ## 재현
 
 ```bash
@@ -276,6 +293,16 @@ python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --dat
 python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
     "P-skip=runs/wb2_pyramid_noskip/compare_graphcast.json" --pyramid P=runs/wb2_pyramid/pyramid_eval.json \
     "P-skip=runs/wb2_pyramid_noskip/pyramid_eval.json" --out-dir docs/results/stage4_pyramid
+# 7단계 (기본 = P−nodrop 고정; DATA2020 = 2017-12 .. 2021-01 ERA5)
+python scripts/play_game.py --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt --config configs/game_wb2.yaml \
+    --data-dir DATA2020 --mode rl --out runs/game_c1        # C1-grad: --mode grad, C1-open: --set control.use_state=false
+python scripts/eval_game.py C1=runs/game_c1/controller.pt --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt \
+    --config configs/game_wb2.yaml --data-dir DATA2020 --out runs/game_c1/game_eval.json
+python scripts/eval_causes.py --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt --controller runs/game_c1/controller.pt \
+    --data-config configs/game_wb2.yaml --data-dir DATA2020 --deterministic --variants no_control random_control no_diag \
+    --out runs/game_c1/causes_2020.json
+python scripts/report_game.py --game runs/game_*/game_eval.json --forecast C1=runs/game_c1/causes_2020.json \
+    --out-dir docs/results/stage7_prediction_game
 # 6단계 (H0 = P−nodrop, H1, H2)
 python scripts/train.py --config configs/wb2_h1.yaml --data-dir DATA        # H2: wb2_h2.yaml, H0: wb2_pyramid_nodrop.yaml
 python scripts/eval_causes.py --checkpoint runs/wb2_h1/checkpoint.pt --data-dir DATA --variants no_denoiser nonlocal

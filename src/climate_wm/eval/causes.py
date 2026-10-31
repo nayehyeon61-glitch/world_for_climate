@@ -28,6 +28,11 @@ noise) with one part switched off:
                   carry skill?
     shell_graph   the stage 6 coupling of the shells' generators removed
                   (independent shells)
+    no_control    the stage 7 feature controller detached (the frozen model)
+    random_control
+                  the controller's actions applied at shuffled (shell, patch)
+                  places: is the gain from steering or from any perturbation?
+    no_diag       the controller without its physical-diagnostics input
 
 Each variant is compared with the full model per initialisation, so the
 reported change carries a paired bootstrap interval.
@@ -50,6 +55,7 @@ from .graphcast_metrics import rmse_per_init
 
 COMPOSITE_PARTS = ("composite", "shift") + FIB_FAMILIES
 GRAPH_PARTS = ("nonlocal", "shell_graph")
+CONTROL_PARTS = ("no_control", "random_control", "no_diag")
 
 
 def _graph_mixers(model: ClimateWorldModel) -> List[ShellGraphMixer]:
@@ -63,6 +69,8 @@ def available_variants(model: ClimateWorldModel) -> List[str]:
         out.append("nonlocal")
     if getattr(model.lie, "shell_graph", None) is not None:
         out.append("shell_graph")
+    if getattr(model, "feature_control", None) is not None:
+        out += list(CONTROL_PARTS)
     lie = model.lie
     if lie is not None and getattr(lie, "composite", None) is not None:
         out.append("composite")
@@ -75,11 +83,17 @@ def available_variants(model: ClimateWorldModel) -> List[str]:
 @contextlib.contextmanager
 def knocked_out(model: ClimateWorldModel, parts: Sequence[str]) -> Iterator[None]:
     """Sets parts of the composite group to the identity, or restricts the
-    stage 6 shell graphs (GRAPH_PARTS); restores everything on exit.
+    stage 6 shell graphs (GRAPH_PARTS), or switches the stage 7 controller
+    (CONTROL_PARTS); restores everything on exit.
 
     A family's coefficients are scaled by its gain (`fibre_gain`), so a zero
     gain removes the family exactly; a zeroed shift head gives w = 0.
     """
+    control = set(parts) & set(CONTROL_PARTS)
+    if control:
+        with _control_knocked_out(model, control), knocked_out(model, set(parts) - control):
+            yield
+        return
     graph = set(parts) & set(GRAPH_PARTS)
     parts = set(parts) & set(COMPOSITE_PARTS)
     if graph:
@@ -133,6 +147,21 @@ def _graph_knocked_out(model: ClimateWorldModel, parts: set) -> Iterator[None]:
         if coupling is not None:
             with torch.no_grad():
                 coupling.copy_(saved)
+
+
+@contextlib.contextmanager
+def _control_knocked_out(model: ClimateWorldModel, parts: set) -> Iterator[None]:
+    ctrl = getattr(model, "feature_control", None)
+    if ctrl is None:
+        raise ValueError(f"knock-out {sorted(parts)} needs an attached feature controller")
+    saved = ctrl.enabled, ctrl.random_actions, ctrl.zero_diagnostics
+    ctrl.enabled = "no_control" not in parts
+    ctrl.random_actions = "random_control" in parts
+    ctrl.zero_diagnostics = "no_diag" in parts
+    try:
+        yield
+    finally:
+        ctrl.enabled, ctrl.random_actions, ctrl.zero_diagnostics = saved
 
 
 def shell_graph_summary(model: ClimateWorldModel,
@@ -192,9 +221,10 @@ def _bootstrap(diff: np.ndarray, n: int = 2000, seed: int = 0) -> tuple:
 @torch.no_grad()
 def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int], stats,
                         lead_steps: int, variants: Sequence[str] = (), device="cpu",
-                        batch_size: int = 2, seed: int = 0,
+                        batch_size: int = 2, seed: int = 0, sample: bool = True,
                         log: Optional[Callable[[str], None]] = None) -> Dict[str, object]:
-    """Per-variable, per-lead RMSE of total / rec / dyn and of each ablated variant."""
+    """Per-variable, per-lead RMSE of total / rec / dyn and of each ablated variant
+    (`sample` False: the denoiser is off in every run, the stage 7 game setting)."""
     model.eval()
     layout = model.layout
     lat_w = torch.tensor(normalized_latitude_weights(dataset.lat), dtype=torch.float32)
@@ -214,7 +244,7 @@ def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int
             for m in _graph_mixers(model):  # mean shell-graph weights of the full model
                 m.trace = traces[names[id(m)]] if name == "full" else None
             with knocked_out(model, [name]):
-                zs = latent_rollout(model, batch, lead_steps, sample=name != "no_denoiser")
+                zs = latent_rollout(model, batch, lead_steps, sample=sample and name != "no_denoiser")
             runs[name] = torch.stack([phys(model.decode(z)) for z in zs], 1)
         for m in _graph_mixers(model):
             m.trace = None

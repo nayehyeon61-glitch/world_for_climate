@@ -103,6 +103,10 @@ class StepOutput:
 
 class ClimateWorldModel(nn.Module):
 
+    # Stage 7: a FeatureController attached by `feature_control.controlled`
+    # (kept out of the submodules, so checkpoints do not change).
+    feature_control = None
+
     def __init__(self, cfg: WorldModelConfig, layout: ChannelLayout,
                  grid_lat: np.ndarray, grid_lon: np.ndarray):
         super().__init__()
@@ -258,6 +262,8 @@ class ClimateWorldModel(nn.Module):
     def step(self, history: Sequence[Latent], forcing_next: Tensor,
              sample: bool = True, num_denoising_steps: Optional[int] = None
              ) -> StepOutput:
+        if self.feature_control is not None:  # stage 7: the controller steers the GNN features
+            history = list(history[:-1]) + [self.feature_control(self, history[-1])]
         nf = self.node_forcing(forcing_next)
         zbar, omega, joints, terms = self.structural_terms(history, nf)
         pos = self.graphs.latent_pos
