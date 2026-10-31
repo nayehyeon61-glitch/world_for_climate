@@ -40,9 +40,16 @@ EPS_V = 0.608  # T_v = T (1 + EPS_V q)
 
 FIELDS = ("zeta", "div", "temp", "q", "phib")
 TERMS = ("advection", "coriolis", "pgf", "adiabatic", "vertical", "moisture")
-# single coupling paths (eval/physics_causes.py): temp_advection = horizontal and
-# vertical advection of temperature only (the motion -> thermodynamics arrow)
-CUTS = ("temp_advection",)
+# single coupling arrows between the equation blocks (eval/physics_causes.py):
+#   temp_advection  u, omega -> thermodynamics: -V.grad T - omega dT/dp only (the
+#                   adiabatic term kappa T omega / p stays)
+#   density         T' -> momentum: the pressure gradient sees Phi_b (+ the carried
+#                   residual) but not Hy T_v, in the explicit, linear and implicit
+#                   parts alike; the diagnosed geopotential keeps it. CoreConfig.
+#                   density_scale weakens the coupling instead (a soft intervention)
+#   virtual         T_v -> hydrostatic: the momentum and Phi_b equations use T, not
+#                   T (1 + EPS_V q); the diagnosed geopotential keeps T_v
+CUTS = ("temp_advection", "density", "virtual")
 
 # IMEX SIL3 (Whitaker and Kar 2013): explicit and implicit tableaus (4 stages).
 SIL3_EX = ((0, 0, 0, 0), (1 / 3, 0, 0, 0), (1 / 6, 1 / 2, 0, 0), (1 / 2, -1 / 2, 1, 0))
@@ -68,6 +75,7 @@ class CoreConfig:
     surface_drag_days: float = 0.0
     terms: Tuple[str, ...] = TERMS   # knock-outs for the cause analysis
     cuts: Tuple[str, ...] = ()       # CUTS switched off
+    density_scale: float = 1.0       # soft intervention on T' -> momentum ("density" cut = 0)
 
     def __post_init__(self):
         unknown = set(self.cuts) - set(CUTS)
@@ -127,7 +135,8 @@ class PrimitiveCore(nn.Module):
         n_lev = len(p)
         cb = R_DRY * t_ref[-1] / p[-1] if cfg.surface_mass else 0.0
         # Phi_lin = Phi_b + Hy T; d(Phi_lin)/dt|_lin = -G D
-        g = cb * np.outer(np.ones(n_lev), w[-1]) + hy @ (stab[:, None] * w)
+        self.density = 0.0 if "density" in cfg.cuts else float(cfg.density_scale)
+        g = cb * np.outer(np.ones(n_lev), w[-1]) + self.density * hy @ (stab[:, None] * w)
         self.dt = cfg.dt_minutes * 60.0
         eig = self.sh.eig.double().numpy()
         etas = sorted({SIL3_IM[i][i] for i in range(1, 4)})
@@ -197,10 +206,14 @@ class PrimitiveCore(nn.Module):
             au = au + forcing.get("F_u", 0.0)
             av = av + forcing.get("F_v", 0.0)
         dd, cc = sh.div_curl(au, av)
-        tq = sh.to_spec(tg * qg)
+        cuts = set(self.cfg.cuts)
+        tq = None if "virtual" in cuts else sh.to_spec(tg * qg)
         grad_terms = 0.0
         if "pgf" in on:
             grad_terms = self.geopotential(state, tq)
+            if self.density != 1.0:
+                tv = state["temp"] if tq is None else state["temp"] + EPS_V * tq
+                grad_terms = grad_terms - (1.0 - self.density) * self._lev(self.hy, tv)
         if "advection" in on:
             grad_terms = grad_terms + sh.to_spec(0.5 * (u * u + v * v))
         d_div = dd - sh.laplacian(grad_terms) if torch.is_tensor(grad_terms) else dd
@@ -231,7 +244,8 @@ class PrimitiveCore(nn.Module):
         if "advection" in on:
             dbg = dbg - (u[:, -1] * bx + v[:, -1] * by)
         if "pgf" in on and self.cfg.surface_mass:  # column mass convergence raises Phi_b
-            dbg = dbg + R_DRY * tg[:, -1] * (1 + EPS_V * qg[:, -1]) / self.p[-1] * om[:, -1]
+            tv_b = tg[:, -1] if "virtual" in cuts else tg[:, -1] * (1 + EPS_V * qg[:, -1])
+            dbg = dbg + R_DRY * tv_b / self.p[-1] * om[:, -1]
         if forcing is not None and "P_b" in forcing:
             dbg = dbg + forcing["P_b"]
         return {"zeta": cc, "div": d_div, "temp": sh.to_spec(dtg), "q": sh.to_spec(dqg),
@@ -243,7 +257,7 @@ class PrimitiveCore(nn.Module):
         zero = torch.zeros_like
         out = {k: zero(state[k]) for k in FIELDS}
         if "pgf" in on:
-            phi = state["phib"][:, None] + self._lev(self.hy, state["temp"])
+            phi = state["phib"][:, None] + self.density * self._lev(self.hy, state["temp"])
             out["div"] = -self.sh.laplacian(phi)
             wd = self._lev(self.w, state["div"])
             out["temp"] = -self.stab[None, :, None, None] * wd
@@ -256,7 +270,7 @@ class PrimitiveCore(nn.Module):
             return rhs
         eta = self.dt * a
         eig = self.sh.eig
-        phi_r = rhs["phib"][:, None] + self._lev(self.hy, rhs["temp"])
+        phi_r = rhs["phib"][:, None] + self.density * self._lev(self.hy, rhs["temp"])
         b = rhs["div"] + eta * eig * phi_r
         inv = self.inv[self._eta_index[a]]  # [N, L, L]
         br = torch.view_as_real(b)  # [B, L, M, N, 2]

@@ -26,7 +26,7 @@ def test_interventions_cut_their_paths(setup):
     intact = pc.build(MODEL, state, layout, data.lat, data.lon, None)
     full = pc.rollout(intact, batch, 2)
     assert torch.isfinite(full).all()
-    for name in ("no_temp_advection", "no_moisture", "no_heating", "q_to_heating", "sun_off", "sun_to_heating",
+    for name in ("no_temp_advection", "no_density", "weak_density", "no_virtual", "no_moisture", "no_heating", "q_to_heating", "sun_off", "sun_to_heating",
                  "ocean_column", "no_drag", "no_carry"):
         iv = pc.intervention(name)
         m = pc.build(MODEL, state, layout, data.lat, data.lon, iv)

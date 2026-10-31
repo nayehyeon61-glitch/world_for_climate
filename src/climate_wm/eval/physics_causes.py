@@ -11,8 +11,13 @@ budget. The arrows between them are:
   - heating and cooling (radiation -> thermodynamics);
   - heat energy (surface <-> radiation);
   - precipitation and evaporation (surface <-> water).
-Each arrow is cut at evaluation time, without retraining, by one intervention
-(INTERVENTIONS; `edge` names the arrow). The cuts from water and from the sun
+In the equations (pressure coordinates here, sigma in the usual figure), the
+blocks exchange T' (thermodynamics -> momentum, through the pressure
+gradient), u and omega (momentum -> thermodynamics and moisture), T and T_v
+(-> hydrostatic balance) and Phi, Phi_b (hydrostatic balance -> momentum);
+the learned column physics adds Psi_theta to every block. Each arrow is cut
+at evaluation time, without retraining, by one intervention (INTERVENTIONS;
+`edge` names the arrow; the core arrows are primitive_core.CUTS and TERMS). The cuts from water and from the sun
 to the heating are path-specific: only the heating output of the column
 network sees the held input, and its other outputs see the state. In N1,
 evaporation only diagnoses precipitation, so the surface -> water arrow has no
@@ -67,6 +72,7 @@ class Intervention:
     knock: Tuple[str, ...] = ()                # column outputs set to zero (COLUMN_KNOCKS)
     paths: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()  # (column output group, held inputs)
     sun: bool = False                          # do(TISR = 0) for every consumer
+    density_scale: Optional[float] = None      # soft intervention on T' -> momentum
 
     def __add__(self, other: "Intervention") -> "Intervention":
         paths: Dict[str, Tuple[str, ...]] = {}
@@ -76,7 +82,9 @@ class Intervention:
         return Intervention(f"{self.edge} + {other.edge}", uni(self.off_terms, other.off_terms),
                             uni(self.cuts, other.cuts), self.drag_off or other.drag_off,
                             self.carry_off or other.carry_off, uni(self.knock, other.knock),
-                            tuple(paths.items()), self.sun or other.sun)
+                            tuple(paths.items()), self.sun or other.sun,
+                            min((x for x in (self.density_scale, other.density_scale) if x is not None),
+                                default=None))
 
     def needs_column(self) -> bool:
         return bool(self.knock or self.paths or self.sun)
@@ -84,10 +92,14 @@ class Intervention:
 
 I = Intervention
 INTERVENTIONS: Dict[str, Intervention] = {
-    "no_temp_advection": I("motion -> thermodynamics (advection of T)", cuts=("temp_advection",)),
-    "no_adiabatic": I("motion -> thermodynamics (adiabatic compression)", off_terms=("adiabatic",)),
-    "no_moisture": I("motion -> water (advection of q)", off_terms=("moisture",)),
-    "no_pgf": I("thermodynamics -> motion (density: pressure-gradient force)", off_terms=("pgf",)),
+    "no_temp_advection": I("motion -> thermodynamics (u, omega advect T)", cuts=("temp_advection",)),
+    "no_adiabatic": I("motion -> thermodynamics (kappa T omega / p)", off_terms=("adiabatic",)),
+    "no_density": I("thermodynamics -> motion (T' in the pressure gradient: density)", cuts=("density",)),
+    "weak_density": I("thermodynamics -> motion, T' coupling 10% weaker (soft: the full cut blows up)",
+                      density_scale=0.9),
+    "no_virtual": I("water -> hydrostatic balance (T_v: buoyancy of water vapour)", cuts=("virtual",)),
+    "no_moisture": I("motion -> water (u, omega advect q)", off_terms=("moisture",)),
+    "no_pgf": I("hydrostatic balance -> motion (the whole pressure gradient: Phi, Phi_b)", off_terms=("pgf",)),
     "no_advection": I("motion -> motion (horizontal advection of momentum, T and Phi_b)",
                       off_terms=("advection",)),
     "no_coriolis": I("rotation -> motion (Coriolis)", off_terms=("coriolis",)),
@@ -108,7 +120,8 @@ INTERVENTIONS: Dict[str, Intervention] = {
     "ocean_column": I("surface (land / ocean) -> radiation and column physics", paths=(("all", ("land",)),)),
 }
 PAIRS: Tuple[Tuple[str, str], ...] = (
-    ("no_temp_advection", "no_pgf"),     # thermodynamics <-> motion (advection and density)
+    ("no_temp_advection", "weak_density"),  # thermodynamics <-> motion (u, omega and T')
+    ("no_moisture", "no_virtual"),       # motion -> water -> hydrostatic balance -> motion (T_v)
     ("no_moisture", "q_to_heating"),     # motion -> water -> thermodynamics (the latent-heat loop)
     ("t_to_moistening", "q_to_heating"),  # thermodynamics <-> water (condensation)
     ("sun_off", "no_heating"),           # does the column heating carry the sun? (mediation)
@@ -169,6 +182,8 @@ def build(model_cfg: dict, state: dict, layout, lat, lon, iv: Optional[Intervent
             core["cuts"] = list(dict.fromkeys(list(core.get("cuts", ())) + list(iv.cuts)))
         if iv.drag_off:
             core["surface_drag_days"] = 0.0
+        if iv.density_scale is not None:
+            core["density_scale"] = iv.density_scale
         if iv.carry_off:
             cfg["carry_residual"] = False
     model = PhysicsWorldModel(PhysicsModelConfig.from_dict(cfg), layout, lat, lon)
