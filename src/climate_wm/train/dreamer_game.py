@@ -214,7 +214,8 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
                 gen: Optional[torch.Generator] = None, rule: Rule = "posterior",
                 record: Optional[list] = None, keep: Optional[list] = None,
                 noise: Optional[torch.Generator] = None, cap: Optional[float] = None,
-                truncate: bool = False) -> Tuple[Tensor, Tensor]:
+                truncate: bool = False, obs_steps: Optional[int] = None,
+                on_step: Optional[Callable[[int, Tensor, Tensor], None]] = None) -> Tuple[Tensor, Tensor]:
     """One masked episode per initial state; hidden and all-point errors [B * M, K]
     (differentiable through the world model when grad is enabled; the actor's
     actions are not). `rule`: re-observation (see Rule). `record` receives
@@ -226,7 +227,11 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
     errors have K' <= K steps; with gradients, play one sample at a time, as a
     NaN anywhere in a batched graph poisons the parameter gradients), `cap`
     (without gradients) scores a blown-up sample `cap` from then on and
-    restarts its state from the initial one so the batch stays finite."""
+    restarts its state from the initial one so the batch stays finite.
+
+    `obs_steps`: re-observations only after the first `obs_steps` steps (a
+    spin-up, then a free run; eval/memory_climate.py). `on_step(k, pred, dead)`
+    receives every step's forecast and the samples blown up so far."""
     attach_loss(model)
     b = batch["inputs"].shape[0]
     rep = _repeat(batch, members)
@@ -286,7 +291,9 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
                     pred = torch.nan_to_num(pred)
             hidden.append(e_h + cost)
             all_.append(e_a + cost)
-            if obs_prob > 0 and k < horizon - 1:
+            if on_step is not None:
+                on_step(k, pred, dead)
+            if obs_prob > 0 and k < horizon - 1 and (obs_steps is None or k < obs_steps):
                 seen = (torch.rand(b, generator=gen) < obs_prob).repeat_interleave(members)
                 if seen.any():
                     seen = seen.to(pred.device)

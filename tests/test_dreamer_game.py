@@ -183,3 +183,25 @@ def test_memory_control_acts_only_through_the_memory(setup):
     model.memory.control_tau = None
     ratio = shifted / model.memory.tau(x)  # [1, H, W, K]
     assert (ratio[..., 0] > 1).all() and torch.allclose(ratio[..., 1:], torch.ones(1))
+
+
+def test_memory_climate_evaluation(setup, tmp_path):
+    from climate_wm.data.era5_lazy_loader import GraphCastWindowDataset
+    from climate_wm.eval.climatology import Climatology
+    from climate_wm.eval.memory_climate import evaluate_memory_climate
+
+    layout, data, base, model = setup
+    long = GraphCastWindowDataset(data.source, layout, data.stats, target_steps=4)
+    clim = Climatology.from_window_dataset(long, range(len(long)), 1)
+    ctrl, _ = _agent(model, "memory")
+    kw = dict(spinup=2, weeks=2, week=1, variants=["full", "no_actor", "no_memory"])
+    res = evaluate_memory_climate(model, ctrl, base, long, [0, 1], ["none", "region"], clim, long.stats,
+                                  progress_path=str(tmp_path / "p.pt"), **kw)
+    r = res["kinds"]["region"]
+    assert set(r["change"]) >= {"full_hidden", "no_memory_all", "climatology_hidden"}
+    assert np.allclose(r["change"]["full_hidden"]["mean"], 0, atol=1e-6)  # untrained memory = nudging
+    assert len(r["rmse"]["nudging"]["geopotential@500"]) == 2 and r["blowups"]["full"] == 0
+    # resuming from the saved initialisations gives the same result
+    again = evaluate_memory_climate(model, ctrl, base, long, [0, 1], ["none", "region"], clim, long.stats,
+                                    progress_path=str(tmp_path / "p.pt"), **kw)
+    assert again["kinds"]["none"]["mse"] == res["kinds"]["none"]["mse"]

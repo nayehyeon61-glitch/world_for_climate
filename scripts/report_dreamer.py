@@ -8,7 +8,9 @@ eval_2018_19.json (--split train) and train_history.json. All evaluations use
 the same initialisations and seed, so the arms pair per initialisation.
 Changes are relative to nudging on the stage 9 model (N1); negative = lower
 error. Writes memory.md, memory.png and tau.png, with the verdicts on the
-pre-registered predictions P1-P6 (docs/results/README_KO.md).
+pre-registered predictions P1-P6 (docs/results/README_KO.md), and phase 2
+(climate_2020.json, scripts/eval_memory_climate.py: weekly means after a
+10-day observed spin-up) where an arm has it.
 """
 
 import argparse
@@ -215,6 +217,48 @@ def overfit_table(arms):
     return text + [""]
 
 
+def climate_section(arms):
+    rows = [(n, a["climate"]) for n, a in arms.items() if a.get("climate")]
+    if not rows:
+        return []
+    c0 = rows[0][1]
+    weeks = c0["weeks"]
+    text = ["## 7. Phase 2: weekly means after an observed spin-up (2020)", "",
+            f"{c0['inits']} initialisations; {c0['spinup_days']:.0f} days with the masked truth re-observed every "
+            "6 h (the memory absorbs it), then a free run without observations. Weekly-mean error change "
+            "against N1 with nudging (the same spin-up without memory), GraphCast-weighted MSE; `none` = "
+            "everything observed during the spin-up (all points), `region` = a 25% cap hidden throughout "
+            "(hidden points). A blown-up run is scored with the climatology from that step on.", "",
+            "| arm | mask | variant | " + " | ".join(f"week {w}" for w in weeks) + " | blow-ups |",
+            "|---|---|---|" + "---|" * len(weeks) + "---|"]
+    for name, cl in rows:
+        for kind, r in cl["kinds"].items():
+            part = "all" if kind == "none" else "hidden"
+            for v in ["climatology", *[x for x in cl["variants"] if x != cl["reference"]]]:
+                ch = r["change"].get(f"{v}_{part}")
+                if ch is None:
+                    continue
+                m, lo, hi = (np.asarray(ch[x]) for x in ("mean", "lo", "hi"))
+                cells = [_cell(m, lo, hi, w) for w in range(len(weeks))]
+                text.append(f"| {name} | {kind} | {v} | " + " | ".join(cells) + f" | {r['blowups'].get(v, '–')} |")
+            text.append(f"| {name} | {kind} | nudging (N1) | " + " | ".join(["–"] * len(weeks))
+                        + f" | {r['blowups'].get(cl['reference'], 0)} |")
+    text += ["", "Per variable (`none` mask): RMSE / ACC of the weekly means.", "",
+             "| arm | variable | variant | " + " | ".join(f"week {w}" for w in weeks) + " |",
+             "|---|---|---|" + "---|" * len(weeks)]
+    for name, cl in rows:
+        r = cl["kinds"].get("none")
+        if r is None:
+            continue
+        for key in cl["keys"]:
+            for v in ("climatology", cl["reference"], "full", "no_memory"):
+                if v not in r["rmse"]:
+                    continue
+                cells = [f"{r['rmse'][v][key][w]:.3g} / {r['acc'][v][key][w]:.2f}" for w in range(len(weeks))]
+                text.append(f"| {name} | {key} | {v} | " + " | ".join(cells) + " |")
+    return text + [""]
+
+
 def figures(arms, out_dir):
     import matplotlib
     matplotlib.use("Agg")
@@ -268,6 +312,7 @@ def main():
         name, d = item.split("=", 1)
         arms[name] = {"eval": _load(os.path.join(d, "eval_2020.json")),
                       "eval_train": _load(os.path.join(d, "eval_2018_19.json")),
+                      "climate": _load(os.path.join(d, "climate_2020.json")),
                       "history": _load(os.path.join(d, "train_history.json")) or []}
     base = _load(args.base)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -285,6 +330,7 @@ def main():
         for c, q in enumerate(d.get("log10_tau_hours_channel_p10_p50_p90", [])):
             text.append(f"| {c} | {10 ** q[0]:.1f} | {10 ** q[1]:.1f} | {10 ** q[2]:.1f} | {10 ** (q[2] - q[0]):.2f} |")
         text.append("")
+    text += climate_section(arms)
     for fig in figures(arms, args.out_dir):
         text += [f"![{fig}]({fig})", ""]
     with open(os.path.join(args.out_dir, "memory.md"), "w") as f:

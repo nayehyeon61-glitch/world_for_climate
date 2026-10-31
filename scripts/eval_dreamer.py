@@ -32,6 +32,38 @@ def _load(path, update, device, overrides):
     return cfg, state, stats
 
 
+def load_arm(checkpoint, base_path, update, split, target_steps, device="cpu", overrides=()):
+    """The arm (model with its memory), its actor (agent.pt beside the
+    checkpoint, None without one), the stage 9 base model and the split's
+    windows of `target_steps` 6 h targets."""
+    cfg, state, stats = _load(checkpoint, update, device, overrides)
+    layout = pipeline.build_layout(cfg)
+    ds = pipeline.open_dataset(cfg)
+    data = GraphCastWindowDataset(ds, layout, stats, target_steps, **cfg["data"][split])
+    model = pipeline.build_model(cfg, layout, data).to(device)
+    model.load_state_dict(state)
+    bcfg, bstate, _ = _load(base_path, update, device, overrides)
+    base = pipeline.build_model(bcfg, layout, data).to(device)
+    base.load_state_dict(bstate)
+    ctrl = None
+    agent_path = os.path.join(os.path.dirname(checkpoint), "agent.pt")
+    if os.path.exists(agent_path):
+        agent = torch.load(agent_path, map_location=device, weights_only=False)
+        if agent.get("controller"):
+            ctrl = MemoryController(model, TendencyControlConfig(**agent["controller"]["cfg"]))
+            ctrl.load_state_dict(agent["controller"]["state"])
+            ctrl = ctrl.to(device)
+            ctrl.cost_weight = 0.0
+    return cfg, model, base, ctrl, data, stats
+
+
+def usable(variants, model, ctrl):
+    """Drops the variants an arm cannot run (memory knock-outs without a memory, no actor to switch off)."""
+    return [v for v in variants
+            if not (VARIANTS[v][2] == "own" and ((model.memory is None and VARIANTS[v][0])
+                                                 or (ctrl is None and v == "no_actor")))]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="stage 10 arm (OUT/checkpoint.pt, agent.pt beside it)")
@@ -51,27 +83,9 @@ def main():
         torch.set_num_threads(args.threads)
     update = pipeline.load_config(args.config, args.data_dir)
     dc = DreamerConfig(**update.get("dreamer", {}))
-    cfg, state, stats = _load(args.checkpoint, update, args.device, args.set)
-    layout = pipeline.build_layout(cfg)
-    ds = pipeline.open_dataset(cfg)
-    data = GraphCastWindowDataset(ds, layout, stats, dc.horizon, **cfg["data"][args.split])
-    model = pipeline.build_model(cfg, layout, data).to(args.device)
-    model.load_state_dict(state)
-    bcfg, bstate, _ = _load(args.base, update, args.device, args.set)
-    base = pipeline.build_model(bcfg, layout, data).to(args.device)
-    base.load_state_dict(bstate)
-    ctrl = None
-    agent_path = os.path.join(os.path.dirname(args.checkpoint), "agent.pt")
-    if os.path.exists(agent_path):
-        agent = torch.load(agent_path, map_location=args.device, weights_only=False)
-        if agent.get("controller"):
-            ctrl = MemoryController(model, TendencyControlConfig(**agent["controller"]["cfg"]))
-            ctrl.load_state_dict(agent["controller"]["state"])
-            ctrl = ctrl.to(args.device)
-            ctrl.cost_weight = 0.0
-    variants = [v for v in args.variants
-                if not (VARIANTS[v][2] == "own" and ((model.memory is None and VARIANTS[v][0])
-                                                     or (ctrl is None and v == "no_actor")))]
+    cfg, model, base, ctrl, data, _ = load_arm(args.checkpoint, args.base, update, args.split, dc.horizon,
+                                               args.device, args.set)
+    variants = usable(args.variants, model, ctrl)
     indices = np.linspace(0, len(data) - 1, min(args.inits, len(data))).astype(int)
     first, last = data.times[data.indices[indices[0]]], data.times[data.indices[indices[-1]]]
     print(f"{len(indices)} initialisations ({first} .. {last}), kinds {args.kinds}, variants {variants}, "
