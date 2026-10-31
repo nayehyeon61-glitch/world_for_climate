@@ -251,7 +251,7 @@ def main():
     n0s = [r for r in map(_load, args.n0) if r]
     years = [r["year"] for r in n1s]
     md = ["# Stage 9: the coupled physics of N1 under interventions", "",
-          f"Model: `{n1s[0]['checkpoint']}`; {n1s[0]['inits']} initialisations per year ({', '.join(map(str, years))}),"
+          f"Model: `{'/'.join(n1s[0]['checkpoint'].split('/')[-3:])}`; {n1s[0]['inits']} initialisations per year ({', '.join(map(str, years))}),"
           " 72 h, the same dates in N0. Changes: channel-mean normalised MSE vs the intact model"
           " (+ = worse without the arrow). Blow-ups: runs that diverged by 72 h (per year).", "",
           "## The arrows", ""]
