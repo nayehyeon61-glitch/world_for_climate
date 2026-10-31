@@ -47,6 +47,14 @@ GraphCast는 1979–2017년, TPU 32개, 0.25°로 학습했으므로 예산 차�
 - 대표 변수: z500 RMSE 6h −9.4%, 24h −3.0%, 72h −0.8%, 120h −4.6%; T850 120h −10.6%. 반면 T2m +3.9%(6h) ~ +10.1%(120h), U850 24–72h 약 +2%로 지표 변수는 chain이 다소 낫습니다.
 - **판정:** 이 규모에서는 쉘 간 사슬 결합이 이득을 주지 못했고 독립형이 근소하게 낫습니다. 차이는 작고 변수별로 엇갈려 61개 초기 시각의 변동 범위 안으로 봐야 합니다. 지네형 가설은 대규모(0.25°, GPU) 학습에서 다시 판정합니다.
 
+### 1.3 용량 점검: 규모의 문제인가 (`stage1_world_model/scaling/`)
+
+**질문 (감자, 10/31 16:15):** 모든 팔이 72h z500에서 GraphCast보다 약 7배 나쁘고 72h 뒤로는 기후값을 넘지 못합니다. 이것이 가설의 문제인지, 규모(파라미터 0.74M; 2015–17 학습 창 4380개에 배치 2 × 2100 스텝 ≈ 1 epoch)의 문제인지 먼저 가립니다. 새 가설이 아니라 원인 분석이므로 단계를 나누지 않습니다.
+
+**팔 (S = 1.2의 independent, 같은 데이터·같은 평가):** W2 = 모든 feature 폭 2배(2.9M), W4 = 폭 4배(11.4M; 메모리 때문에 데이터를 디스크에서 읽음), L2 = S 폭에 모든 단계의 스텝 2배(학습 길이 대조군). 평가는 5단계 원인 분석과 같은 31개 초기 시각, 72h 단일 멤버 오차 분해(자동부호화기 바닥 + 잠재 동역학)와 denoiser knock-out입니다. 설정: `configs/wb2_scale_w2.yaml`, `wb2_scale_w4.yaml`, `wb2_scale_l2.yaml`.
+
+**판정 규칙(사전 등록):** (1) W2·W4가 72h z500 RMSE를 S보다 5% 이상 낮추고 구간이 0을 포함하지 않으면 용량이 한계입니다. (2) L2가 W2만큼 또는 더 줄이면 용량보다 학습량(1 epoch)이 한계입니다. (3) 셋 다 72h에서 3% 미만이면 이 데이터(3년, 5.625°)와 구조에서는 규모를 키워도 72h가 바뀌지 않으므로, 데이터 쪽(감자 클러스터의 39년 0.25°)이 먼저입니다. 6h는 자동부호화기 바닥, 72h는 잠재 동역학 몫으로 나눠 어느 쪽이 규모에 반응하는지도 기록합니다.
+
 ---
 
 ## 2단계 — 새 데이터로 world model 보강 (`stage2_rl_refinement/`)
@@ -317,6 +325,12 @@ python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --dat
 python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
     "P-skip=runs/wb2_pyramid_noskip/compare_graphcast.json" --pyramid P=runs/wb2_pyramid/pyramid_eval.json \
     "P-skip=runs/wb2_pyramid_noskip/pyramid_eval.json" --out-dir docs/results/stage4_pyramid
+# 1단계 용량 점검 (S = independent; W2·W4·L2 각각)
+python scripts/train.py --config configs/wb2_scale_w2.yaml --data-dir DATA --set output_dir=runs/scale_w2
+python scripts/eval_causes.py --checkpoint runs/scale_w2/checkpoint.pt --data-dir DATA --inits 31 --lead-steps 12 \
+    --variants no_denoiser --out runs/scale_w2/causes.json
+python scripts/report_causes.py S=runs/independent/causes.json W2=runs/scale_w2/causes.json L2=runs/scale_l2/causes.json \
+    W4=runs/scale_w4/causes.json --out-dir docs/results/stage1_world_model/scaling
 # 8단계 1차 (고정 P−nodrop latent; DATA = 2015-01 .. 2019-01-15 ERA5)
 python scripts/eval_topology.py encode --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt \
     --config configs/topology_wb2.yaml --data-dir DATA --out runs/topology
