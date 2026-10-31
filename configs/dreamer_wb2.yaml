@@ -1,0 +1,63 @@
+# Stage 10: the stage 9 physics world model (N1) with an adaptive memory kernel,
+# trained DreamerV3-style (world model on masked 2018-19 sequences, actor and
+# critic in imagination); held-out test 2020. Design: docs/results/README_KO.md §10.
+# data_dir holds era5.zarr (2017-12 .. 2021-01), as for configs/physics_game_wb2.yaml.
+#
+#   python scripts/train_dreamer.py --checkpoint runs/physics_n1/checkpoint.pt \
+#       --config configs/dreamer_wb2.yaml --data-dir DATA --out runs/stage10_D
+#   arms (--set):  D-blind    dreamer.imagination=blind   (DreamerV3's imagination: no observations)
+#                  D-noactor  dreamer.train_actor=false
+#                  D-markov   memory.channels=0
+#                  D-fixed    memory.adaptive=false
+#                  D-frozen   dreamer.train_model=false  (--checkpoint runs/stage10_Dnoactor/checkpoint.pt)
+#   python scripts/eval_dreamer.py --checkpoint runs/stage10_D/checkpoint.pt \
+#       --base runs/physics_n1/checkpoint.pt --config configs/dreamer_wb2.yaml --data-dir DATA --out ...
+data:
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2017-12-01", "2021-01-15"]
+  train: {start: "2018-01-01T06:00", end: "2019-12-31T18:00"}
+  val: {start: "2020-01-01", end: "2020-12-31T12:00"}
+eval:
+  climatology_zarr: "{data_dir}/climatology.zarr"
+
+memory:                 # models/memory_kernel.py
+  channels: 16          # 0: Markov arm (no memory; re-observation = nudging with strength 1)
+  adaptive: true        # false: fixed kernel (constant timescales, linear input and gain)
+  tau_hours: [3.0, 240.0]
+  hidden: 64
+  spread: true
+  innovation: true
+  readout: true
+
+dreamer:                # train/dreamer_game.py
+  steps: 100
+  batch_size: 2
+  horizon: 6            # 36 h, as the stage 9 game
+  imagination: snapshot # episodes from a masked snapshot with ERA5 re-observations, exact rewards
+                        # (감자 19:09 KST); blind = DreamerV3's (posterior start, no observations, reward head)
+  imagine_horizon: 6    # blind only
+  members: 4
+  explore: 0.5
+  gamma: 1.0            # the game's score is the undiscounted sum over the 36 h episode
+  lam: 0.95
+  cap: 10.0             # a blown-up episode scores this error from then on
+  lr_model: 1.0e-4      # column physics + surface head (a third of N1's)
+  lr_new: 1.0e-3        # memory, reward head, actor, critic
+  warmup_steps: 10
+  train_model: true
+  train_actor: true
+  mask_kinds: [variables, shell, region]
+  mask_rate: 1.0
+  region_fraction: 0.25
+  obs_prob: 0.5
+  masked_weight: 0.5
+  log_every: 5
+
+control:                # the stage 9 controller (configs/physics_game_wb2.yaml), plus the memory's harmonics
+  max_degree: 4
+  fields: [temp, zeta, q, phib]
+  layers: [[850, 1000], [500, 700], [200, 400], [50, 150]]
+  hidden: 64
+  action_scale: 0.2
+  use_state: true
+  control_cost: 1.0e-4

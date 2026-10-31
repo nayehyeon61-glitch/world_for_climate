@@ -15,6 +15,11 @@ the diagnosed fields (scales beyond the truncation, the hydrostatic residual,
 surface offsets) to every lead, so the core is not charged for what it cannot
 represent; vertical velocity and precipitation are not carried. Arm N0 = core
 only (no networks).
+
+Stage 10 adds an optional adaptive memory kernel (models/memory_kernel.py):
+a recurrent state m on the Gaussian grid, updated at every column call and
+read into the column tendencies, carried in the state as "mem" (the core
+passes it through); `posterior` re-observes with it.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..data import forcings as forcing_lib
 from ..data.graphcast_mapping import ChannelLayout
+from .memory_kernel import MemoryConfig, MemoryKernel
 from .primitive_core import EPS_V, R_DRY, CoreConfig, PrimitiveCore
 
 GRAV = 9.80665
@@ -64,13 +70,16 @@ class PhysicsModelConfig:
     column: ColumnConfig = dataclasses.field(default_factory=ColumnConfig)
     carry_residual: bool = True
     grad_checkpoint: bool = True
+    memory: Optional[MemoryConfig] = None  # stage 10
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "PhysicsModelConfig":
         d = dict(d or {})
         d.pop("type", None)
+        mem = d.pop("memory", None)
         return cls(core=CoreConfig.from_dict(d.pop("core", None)),
-                   column=ColumnConfig.from_dict(d.pop("column", None)), **d)
+                   column=ColumnConfig.from_dict(d.pop("column", None)),
+                   memory=MemoryConfig.from_dict(mem) if mem else None, **d)
 
 
 def _mlp(d_in: int, hidden: int, d_out: int, layers: int) -> nn.Sequential:
@@ -117,6 +126,12 @@ class PhysicsWorldModel(nn.Module):
             # values + static + forcings + sin(lat)
             s_in = 4 * self.n_low + 1 + 4 + 2 + n_f + 1
             self.surface = _mlp(s_in, cc.hidden // 2, 5, 2)
+        self.memory = None
+        if cfg.memory is not None and cfg.memory.channels > 0:
+            if self.column is None:
+                raise ValueError("the memory kernel reads and feeds the column physics")
+            self.memory = MemoryKernel(cfg.memory, d_in, n_out, len(layout.dynamic), self.core.sh,
+                                       cc.call_minutes * 60.0)
         self.register_buffer("mean", torch.zeros(len(layout.targets)))
         self.register_buffer("std", torch.ones(len(layout.targets)))
         self.register_buffer("in_mean", torch.zeros(len(layout.dynamic)))
@@ -146,6 +161,8 @@ class PhysicsWorldModel(nn.Module):
     def _build_core(self, t_ref) -> None:
         self.core = PrimitiveCore(self.cfg.core, self.levels, t_ref, self.lat, len(self.lon))
         sh = self.core.sh
+        if getattr(self, "memory", None) is not None:
+            self.memory.sh_ref[0] = sh  # the rebuilt core's transforms
         lat_g = sh.lat.double().numpy()
         self.lat_g = lat_g
         self.lon_g = np.arange(sh.nlon) * 360.0 / sh.nlon
@@ -210,6 +227,8 @@ class PhysicsWorldModel(nn.Module):
 
     # ------------------------------------------------------ column physics
     def column_forcing(self, state, static_g: Tensor, forc_g: Optional[Tensor]) -> Dict[str, Tensor]:
+        """Grid tendencies of the column physics; with the memory kernel also the
+        updated memory ("mem")."""
         sh, core = self.core.sh, self.core
         u, v = sh.uv(state["zeta"], state["div"])
         grid = {"temp": sh.to_grid(state["temp"]), "q": sh.to_grid(state["q"]), "u": u, "v": v,
@@ -227,7 +246,12 @@ class PhysicsWorldModel(nn.Module):
         b = zb.shape[0]
         feats.append(self.sinlat_g[None, None, :, None].expand(b, 1, *zb.shape[-2:]))
         x = torch.cat(feats, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
-        y = self.column(x).permute(0, 3, 1, 2)  # [B, C_out, H, W]
+        y = self.column(x)
+        mem = None
+        if self.memory is not None and "mem" in state:
+            mem = self.memory.update(state["mem"], x)
+            y = y + self.memory.tendency(x, mem)
+        y = y.permute(0, 3, 1, 2)  # [B, C_out, H, W]
         n = len(self.levels)
         per_s = 1.0 / DAY
         out = {"Q": y[:, :n] * SCALES["Q"] * per_s, "S": y[:, n:2 * n] * SCALES["S"] * per_s,
@@ -246,6 +270,8 @@ class PhysicsWorldModel(nn.Module):
             evap = torch.nn.functional.softplus(y[:, 4 * n + 1]) * SCALES["E"] / DAY  # kg/m^2/s
             sink = (out["S"] * self.dp_layer[None, :, None, None]).sum(1) / GRAV
             out["precip"] = torch.relu(evap - sink)  # kg/m^2/s
+        if mem is not None:
+            out["mem"] = mem
         return out
 
     def surface_correction(self, phys: Tensor, static: Tensor, forc: Optional[Tensor]) -> Tensor:
@@ -300,6 +326,9 @@ class PhysicsWorldModel(nn.Module):
                "static_g": self._to_gauss(static) if self.column is not None else None,
                "init": batch["init_time"].cpu().numpy().astype(np.int64),
                "forcings_tgt": batch.get("forcings_tgt")}
+        if self.memory is not None:
+            sh = self.core.sh
+            state["mem"] = static.new_zeros(static.shape[0], self.memory.cfg.channels, sh.nlat, sh.nlon)
         return state, ctx
 
     def reobserve(self, ctx, inputs: Tensor):
@@ -307,6 +336,26 @@ class PhysicsWorldModel(nn.Module):
         state, obs = self.initial_state({"inputs": inputs[:, None]})
         ctx["resid"] = self.carried_residual(state, obs)
         return state
+
+    def posterior(self, state, ctx, forecast: Tensor, truth: Tensor, mask: Tensor):
+        """Stage 10 re-observation (normalised dynamic fields [B, C_dyn, H, W],
+        mask 1 = hidden): the observed points restart from the truth, the hidden
+        ones from the forecast plus the memory's readout R(m); the memory
+        absorbs the innovation. Without memory this is nudging with strength 1."""
+        seen = 1 - mask
+        hidden = forecast
+        mem = None
+        if self.memory is not None:
+            g = self._to_gauss
+            mem = self.memory.absorb(state["mem"], g(forecast), g(seen * (truth - forecast)), g(seen))
+            r = self.memory.readout(mem)
+            if r is not None:
+                sh = self.core.sh
+                hidden = forecast + sh.to_grid(sh.to_spec(r), data=True)
+        fresh = self.reobserve(ctx, seen * truth + mask * hidden)
+        if mem is not None:
+            fresh["mem"] = mem
+        return fresh
 
     def advance(self, state, ctx, k: int):
         """Integrates lead k -> k + 1 (6 h). Returns the state and the data-grid
@@ -329,6 +378,8 @@ class PhysicsWorldModel(nn.Module):
                 if self.column is not None and j % call_every == 0:
                     fg = forc_g[:, j // call_every] if forc_g is not None else None
                     forcing = self.column_forcing(st, ctx["static_g"], fg)
+                    if "mem" in forcing:
+                        st["mem"] = forcing.pop("mem")
                     if "precip" in forcing:
                         precip = precip + forcing["precip"] * cc.call_minutes * 60.0 / 1000.0  # m
                 st = core.step(st, forcing)
