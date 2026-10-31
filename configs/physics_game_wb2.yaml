@@ -40,6 +40,6 @@ control:
   fields: [temp, zeta, q, phib]
   layers: [[850, 1000], [500, 700], [200, 400], [50, 150]]
   hidden: 64
-  action_scale: 0.1
+  action_scale: 0.2     # one action unit = 0.2 std of the field's 6 h change in that layer
   use_state: true       # false: open loop
   control_cost: 1.0e-4  # 1/2 |a|^2 per step in the training reward (0: the no-cost ablation)

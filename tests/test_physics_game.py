@@ -37,6 +37,12 @@ def test_controller_actions_move_the_low_harmonics(setup):
     d = (out["temp"] - state["temp"]).abs()
     assert d[0, 0, 0, 0] > 0 and d[0, 1].max() == 0 and d[0, 0].sum() == d[0, 0, 0, 0]
     assert torch.equal(out["zeta"], state["zeta"])
+    # one action unit = action_scale x the std of the layer's 6 h change
+    stats = {c.key: 1.0 + i for i, c in enumerate(layout.targets)}
+    scaled = TendencyController(model, ctrl.cfg, stats)
+    q = scaled.layer_fields.index("q")
+    assert torch.allclose(scaled.unit[q], 0.2 * torch.tensor([stats["specific_humidity@500"],
+                                                              stats["specific_humidity@850"]]))
     # zero-initialised controller: the controlled game equals the uncontrolled one
     gen = torch.Generator().manual_seed(0)
     masks, _ = episode_masks(layout, 1, GameConfig(), data.lat, data.lon, gen)

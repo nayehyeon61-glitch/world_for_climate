@@ -60,10 +60,12 @@ def main():
     if physics:
         for p in model.parameters():
             p.requires_grad_(False)
-        ctrl = tendency_control.TendencyController(model, cc).to(args.device)
+        ctrl = tendency_control.TendencyController(model, cc, stats.diff_std).to(args.device)
         ctrl.cost_weight = cc.control_cost
         print(f"controller: {sum(p.numel() for p in ctrl.parameters()):,} parameters, "
-              f"{ctrl.n_action} actions (n <= {cc.max_degree}, {len(ctrl.groups)} layers)")
+              f"{ctrl.n_action} actions (n <= {cc.max_degree}, {len(ctrl.groups)} layers); action unit "
+              + ", ".join(f"{f} {list(map('{:.2g}'.format, u.tolist()))}" for f, u in zip(ctrl.layer_fields, ctrl.unit))
+              + f", phib {float(ctrl.unit_phib):.3g}")
     else:
         ctrl = FeatureController(model, data.lat, data.lon, cc, stats).to(args.device)
         print(f"controller: {sum(p.numel() for p in ctrl.parameters()):,} parameters, "

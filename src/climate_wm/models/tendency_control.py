@@ -4,7 +4,10 @@ As in Ha and Schmidhuber (2018), the world model (core + column physics, M)
 does not change; a small controller C reads M's state and the game's mask and
 acts on the state before every 6 h step. The action is a nudge of the state in
 the lowest spherical harmonics (n <= max_degree) of temperature, vorticity and
-humidity in a few layers, and of the lowest-level geopotential:
+humidity in a few layers, and of the lowest-level geopotential. One unit of
+action is `action_scale` times the std of the field's 6 h change in that layer
+(for vorticity: of the wind's, at degree 2), so the cost is dimensionless and
+stratospheric humidity is not nudged by tropospheric amounts:
 
     x_{k+1} = M(x_k + B a_k),   cost = 1/2 |a_k|^2,
 
@@ -21,8 +24,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-# physical size of one unit of action (per 6 h step) and of one unit of feature
-ACTION_SCALE = {"temp": 1.0, "zeta": 1e-5, "q": 5e-4, "phib": 100.0}
+# physical size of one unit of feature
 FEATURE_SCALE = {"temp": 10.0, "zeta": 1e-4, "div": 1e-5, "q": 5e-3, "phib": 1000.0}
 MASK_GROUPS = ("temperature", "geopotential", "u_component_of_wind", "v_component_of_wind",
                "vertical_velocity", "specific_humidity", "surface")
@@ -35,7 +37,7 @@ class TendencyControlConfig:
     # layers (hPa, inclusive) that share one nudge
     layers: Tuple[Tuple[int, int], ...] = ((850, 1000), (500, 700), (200, 400), (50, 150))
     hidden: int = 64
-    action_scale: float = 0.1
+    action_scale: float = 0.2      # one action unit, in stds of the 6 h change
     use_state: bool = True        # False: open loop (mask and step only)
     control_cost: float = 1e-4    # weight of 1/2 |a|^2 in the training reward
     max_horizon: int = 8
@@ -48,7 +50,7 @@ class TendencyControlConfig:
 
 class TendencyController(nn.Module):
 
-    def __init__(self, model, cfg: TendencyControlConfig):
+    def __init__(self, model, cfg: TendencyControlConfig, diff_std: Optional[Dict[str, float]] = None):
         super().__init__()
         self.cfg = cfg
         sh = model.core.sh
@@ -87,6 +89,24 @@ class TendencyController(nn.Module):
         self.register_buffer("t_ref_layer", self.avg @ t_ref, persistent=False)
         k = model.tgt["z"][-1]
         self.register_buffer("phib_mean", model.mean[k].clone(), persistent=False)
+        # physical size of one action unit per field and layer (saved with the
+        # controller); without diff_std, a tenth of the model's normalisation std
+        keys = [c.key for c in model.layout.targets]
+        name = {"temp": "temperature", "zeta": "u_component_of_wind", "q": "specific_humidity"}
+
+        def change_std(var, level=None):
+            key = var if level is None else f"{var}@{level}"
+            if diff_std is not None:
+                return diff_std[key]
+            return 0.1 * float(model.std[keys.index(key)])
+
+        unit = torch.tensor([[np.mean([change_std(name[f], levels[i]) for i in idx]) for idx in groups]
+                             for f in self.layer_fields], dtype=torch.float32)
+        if "zeta" in self.layer_fields:  # wind change -> vorticity at degree 2
+            unit[self.layer_fields.index("zeta")] *= np.sqrt(6.0) / model.core.sh.radius
+        self.register_buffer("unit", cfg.action_scale * unit)
+        self.register_buffer("unit_phib", torch.tensor(
+            cfg.action_scale * change_std("geopotential", levels[-1]), dtype=torch.float32))
         dyn = [c for c in model.layout.dynamic]
         self.mask_index = [[i for i, c in enumerate(dyn)
                             if (c.name if c.level is not None else "surface") == g] for g in MASK_GROUPS]
@@ -152,15 +172,15 @@ class TendencyController(nn.Module):
         out = dict(state)
         n_g, n_c = len(self.groups), self.n_coef
         j = 0
-        for f in self.layer_fields:
-            a = action[:, j:j + n_g * n_c].view(-1, n_g, n_c) * ACTION_SCALE[f] * self.cfg.action_scale
+        for i, f in enumerate(self.layer_fields):
+            a = action[:, j:j + n_g * n_c].view(-1, n_g, n_c) * self.unit[i, :, None]
             j += n_g * n_c
             inc = self._from_low(a, state[f][:, :n_g])  # [B, G, M, N]
             per_level = torch.view_as_complex(torch.einsum("gl,bg...c->bl...c", self.member,
                                                            torch.view_as_real(inc)).contiguous())
             out[f] = state[f] + per_level
         if "phib" in self.cfg.fields:
-            a = action[:, j:j + n_c] * ACTION_SCALE["phib"] * self.cfg.action_scale
+            a = action[:, j:j + n_c] * self.unit_phib
             out["phib"] = state["phib"] + self._from_low(a, state["phib"])
         return out
 
