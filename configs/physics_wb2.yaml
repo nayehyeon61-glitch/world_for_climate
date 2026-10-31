@@ -1,0 +1,64 @@
+# Stage 9 (N1): physics-centred world model on WeatherBench-2 ERA5 64 x 32.
+# Spectral primitive-equation core (T31, 30 min steps) + learned column physics.
+# Train: python scripts/train_physics.py --config configs/physics_wb2.yaml --data-dir DATA
+# Compare: python scripts/compare_graphcast.py --checkpoint runs/physics_n1/checkpoint.pt --data-dir DATA
+# N0 (core only): --set model.column.enabled=false train.steps=0 output_dir=runs/physics_n0
+experiment: physics_n1
+output_dir: runs/physics_n1
+
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2015-01-01", "2019-01-15"]
+  load_into_memory: false
+  train: {start: "2015-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 256
+  stats_path: "{data_dir}/stats_physics.json"
+
+task:
+  name: graphcast_13
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null
+
+model:
+  type: physics
+  carry_residual: true
+  grad_checkpoint: true
+  core:
+    trunc: 31
+    nlat: 48
+    nlon: 96
+    dt_minutes: 30.0
+    diffusion_order: 4
+    diffusion_hours: 3.0
+  column:
+    enabled: true
+    hidden: 256
+    layers: 3
+    call_minutes: 60.0
+    budget: true
+    use_forcings: true
+
+train:
+  batch_size: 1
+  num_workers: 0
+  steps: 1000
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 50
+  grad_clip: 1.0
+  log_every: 10
+  save_every: 25
+  # rollout length (6 h steps) from a given update on: a short curriculum
+  rollout_schedule: [[0, 1], [200, 2], [500, 4]]
+  stages:
+    - {name: physics, steps: 1000, rollout_steps: 4}
+
+eval:
+  lead_steps: 20
+  members: 1
+  batch_size: 1
+  init_hours: [0, 12]
+  climatology_zarr: "{data_dir}/climatology.zarr"

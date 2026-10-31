@@ -128,8 +128,13 @@ def build_datasets(cfg: dict, layout: gm.ChannelLayout, ds,
 
 
 def build_model(cfg: dict, layout: gm.ChannelLayout, dataset) -> ClimateWorldModel:
-    model = ClimateWorldModel(WorldModelConfig.from_dict(cfg["model"]), layout,
-                              dataset.lat, dataset.lon)
+    if cfg["model"].get("type") == "physics":  # stage 9: primitive-equation core
+        from .models.physics_world_model import PhysicsModelConfig, PhysicsWorldModel
+        model = PhysicsWorldModel(PhysicsModelConfig.from_dict(cfg["model"]), layout,
+                                  dataset.lat, dataset.lon)
+    else:
+        model = ClimateWorldModel(WorldModelConfig.from_dict(cfg["model"]), layout,
+                                  dataset.lat, dataset.lon)
     stats = getattr(dataset, "stats", None)
     if stats is not None:
         model.set_normalization(stats)  # a loaded checkpoint carries the same buffers
