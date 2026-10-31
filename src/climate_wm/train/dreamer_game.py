@@ -214,7 +214,8 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
                 gen: Optional[torch.Generator] = None, rule: Rule = "posterior",
                 record: Optional[list] = None, keep: Optional[list] = None,
                 noise: Optional[torch.Generator] = None, cap: Optional[float] = None,
-                truncate: bool = False, obs_steps: Optional[int] = None,
+                truncate: bool = False, truncate_above: Optional[float] = None,
+                obs_steps: Optional[int] = None,
                 on_step: Optional[Callable[[int, Tensor, Tensor], None]] = None) -> Tuple[Tensor, Tensor]:
     """One masked episode per initial state; hidden and all-point errors [B * M, K]
     (differentiable through the world model when grad is enabled; the actor's
@@ -225,9 +226,12 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
     Blow-ups (a non-finite forecast; the learned column physics can blow up on
     masked states): `truncate` stops the episode before the first one (the
     errors have K' <= K steps; with gradients, play one sample at a time, as a
-    NaN anywhere in a batched graph poisons the parameter gradients), `cap`
-    (without gradients) scores a blown-up sample `cap` from then on and
-    restarts its state from the initial one so the batch stays finite.
+    NaN anywhere in a batched graph poisons the parameter gradients;
+    `truncate_above` also stops at a finite all-point error above it, since a
+    blown-up state teaches nothing), `cap` (without gradients) bounds every
+    step's score, control cost included, scores a blown-up sample `cap` from
+    then on and restarts its state from the initial one so the batch stays
+    finite.
 
     `obs_steps`: re-observations only after the first `obs_steps` steps (a
     spin-up, then a free run; eval/memory_climate.py). `on_step(k, pred, dead)`
@@ -277,20 +281,25 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
             pred = model.predict(state, ctx, k, precip)
             e_h, e_a = errors(model, pred, rep["targets"][:, k], tmask)
             bad = ~(torch.isfinite(e_h) & torch.isfinite(e_a) & _finite(state))
+            if truncate_above is not None:
+                bad = bad | (e_a > truncate_above)
             if truncate and bad.any():
                 if record is not None and acting:
                     record.pop()
                 break
+            e_h, e_a = e_h + cost, e_a + cost
             if cap is not None:
                 dead = dead | bad
-                e_h = torch.where(dead, torch.full_like(e_h, cap), e_h.clamp(max=cap))
-                e_a = torch.where(dead, torch.full_like(e_a, cap), e_a.clamp(max=cap))
+                # the cap bounds the whole score: the control cost of a huge action (a state
+                # on its way to a blow-up) once overflowed to inf here and made the critic NaN
+                e_h = torch.where(dead, torch.full_like(e_h, cap), torch.nan_to_num(e_h, nan=cap).clamp(max=cap))
+                e_a = torch.where(dead, torch.full_like(e_a, cap), torch.nan_to_num(e_a, nan=cap).clamp(max=cap))
                 if bad.any():  # restart blown-up samples so the batch stays finite
                     state = {key: _select(bad, first[key], v) for key, v in state.items()}
                     ctx["resid"] = _select(bad, first_resid, ctx["resid"])
                     pred = torch.nan_to_num(pred)
-            hidden.append(e_h + cost)
-            all_.append(e_a + cost)
+            hidden.append(e_h)
+            all_.append(e_a)
             if on_step is not None:
                 on_step(k, pred, dead)
             if obs_prob > 0 and k < horizon - 1 and (obs_steps is None or k < obs_steps):
@@ -452,7 +461,8 @@ def train_dreamer(model, ctrl: Optional[MemoryController], heads: Optional[Heads
             with torch.set_grad_enabled(cfg.train_model):
                 h, a = play_memory(model, ctrl, one, masks[i:i + 1], cfg.horizon, control=acting,
                                    explore=cfg.explore if acting else 0.0, obs_prob=cfg.obs_prob, gen=obs_gen,
-                                   record=record, keep=keep, noise=noise, truncate=True)
+                                   record=record, keep=keep, noise=noise, truncate=True,
+                                   truncate_above=cfg.cap)
             done = h.shape[1]  # the states kept up to a blow-up are finite
             steps_done += done
             if done == 0:
@@ -502,9 +512,13 @@ def train_dreamer(model, ctrl: Optional[MemoryController], heads: Optional[Heads
                 rews_i = step_rewards(h_i, a_i, cfg.masked_weight).t()  # [K, M], incl. the control cost
                 feats_i = torch.stack([f for f, _, _ in record] + [torch.zeros_like(record[0][0])])
                 acts_i = torch.stack([x for _, x, _ in record])
-                cont = torch.ones_like(rews_i)
+                # a blown-up member (scored the cap from then on) ends at its last finite
+                # step: its later steps leave the losses and its chain of returns
+                dead_i = (h_i >= cfg.cap).t()  # [K, M], cumulative
+                cont = torch.cat([(~dead_i[1:]).float(), torch.zeros_like(rews_i[:1])])
                 cont[-1] = 0.0  # terminal: the game's score ends at the horizon
-                logs["imagined_blowups"] = float((h_i >= cfg.cap).any(1).sum())
+                live_i = (~dead_i).float()
+                logs["imagined_blowups"] = float(dead_i.any(0).sum())
             else:
                 pick = int(torch.randint(len(keep), (1,), generator=gen))
                 start = keep[pick]
@@ -512,33 +526,47 @@ def train_dreamer(model, ctrl: Optional[MemoryController], heads: Optional[Heads
                 feats_i, acts_i, rews_i, cont = imagine(model, ctrl, heads, start,
                                                         masks[sample:sample + 1].to(device), cfg.imagine_horizon,
                                                         cfg.members, cfg.explore, noise, cfg.blowup_penalty)
+                live_i = None
                 logs["imagined_blowups"] = float((1 - cont[-1]).sum())
             steps_i = rews_i.shape[0]
             with torch.no_grad():
                 values = heads.value(feats_i)
                 ret = lambda_returns(rews_i, values, cfg.gamma, cfg.lam, cont)  # [T, N]
                 alive = torch.cat([torch.ones_like(cont[:1]), cont[:-1]])  # the step's state exists
-                lo, hi = torch.quantile(ret[alive > 0], torch.tensor([0.05, 0.95], device=ret.device))
-                s_now = float(hi - lo)
-                scale = s_now if scale is None else cfg.return_ema * scale + (1 - cfg.return_ema) * s_now
-                adv = (ret - values[:-1]) / max(1.0, scale)
-                n_alive = alive.sum().clamp(min=1)
+                if live_i is not None:
+                    alive = alive * live_i
+                n_alive = alive.sum()
+                if n_alive > 0:
+                    lo, hi = torch.quantile(ret[alive > 0], torch.tensor([0.05, 0.95], device=ret.device))
+                    s_now = float(hi - lo)
+                    if math.isfinite(s_now):  # a non-finite scale would never recover
+                        scale = s_now if scale is None else cfg.return_ema * scale + (1 - cfg.return_ema) * s_now
+                adv = (ret - values[:-1]) / max(1.0, scale if scale is not None else 1.0)
             ctrl.explore = cfg.explore
             logp = torch.stack([ctrl.log_prob(feats_i[t], acts_i[t]) for t in range(steps_i)])
-            loss_actor = -(adv * logp * alive).sum() / n_alive
+            loss_actor = -(adv * logp * alive).sum() / n_alive.clamp(min=1)
             v_pred = heads.critic(feats_i[:-1])[..., 0]
             with torch.no_grad():
                 v_ema = heads.critic_ema(feats_i[:-1])[..., 0]
             loss_critic = (((v_pred - symlog(ret)).square() + cfg.critic_reg * (v_pred - v_ema).square())
-                           * alive).sum() / n_alive
+                           * alive).sum() / n_alive.clamp(min=1)
             opt_a.zero_grad(set_to_none=True)
-            (loss_actor + loss_critic).backward()
-            logs["grad_agent"] = float(torch.nn.utils.clip_grad_norm_(
-                list(ctrl.parameters()) + list(heads.critic.parameters()), cfg.grad_clip))
-            opt_a.step()
-            heads.update_ema(cfg.critic_ema)
+            loss_agent = loss_actor + loss_critic
+            logs["grad_agent"] = float("nan")
+            if n_alive > 0 and torch.isfinite(loss_agent):
+                loss_agent.backward()
+                gnorm_a = torch.nn.utils.clip_grad_norm_(list(ctrl.parameters()) + list(heads.critic.parameters()),
+                                                         cfg.grad_clip)
+                logs["grad_agent"] = float(gnorm_a)
+                if torch.isfinite(gnorm_a):  # one non-finite update makes the agent NaN for good
+                    opt_a.step()
+                    heads.update_ema(cfg.critic_ema)
+                else:
+                    logs["skipped_agent"] = 1.0
+            else:
+                logs["skipped_agent"] = 1.0
             logs.update(loss_actor=float(loss_actor.detach()), loss_critic=float(loss_critic.detach()),
-                        return_scale=scale,
+                        return_scale=scale if scale is not None else float("nan"),
                         imagined_return=float(ret[0].mean()), action_rms=float(ctrl.net(feats_i[0]).detach()
                                                                               .square().mean().sqrt()))
         for s in scheds:

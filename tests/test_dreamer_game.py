@@ -157,6 +157,29 @@ def test_blowups_are_cut_or_capped(setup, monkeypatch):
     assert h.shape == (1, 1) and torch.isfinite(h).all()
 
 
+def test_huge_actions_stay_within_the_cap_and_the_agent_stays_finite(setup):
+    # D and D-frozen went NaN at iteration 49 and 43 on 10/31: a member on its way to a
+    # blow-up gave a huge action, 0.5 a^2 overflowed to inf past the cap, the critic's
+    # loss was inf and one unguarded update made the agent NaN for good
+    layout, data, base, model = setup
+    ctrl, heads = _agent(model)
+    with torch.no_grad():
+        ctrl.net[-1].bias.fill_(1e20)
+    batch = {k: v[None] for k, v in data[0].items()}
+    masks = torch.zeros(1, len(layout.dynamic), len(data.lat), len(data.lon))
+    with torch.no_grad():
+        h, a = play_memory(model, ctrl, batch, masks, 2, members=2, cap=10.0)
+    assert torch.isfinite(h).all() and (h <= 10.0).all() and torch.isfinite(a).all()
+    h, _ = play_memory(model, None, batch, masks, 2, truncate=True, truncate_above=1e-9)
+    assert h.shape == (1, 0)  # a finite error above the limit also stops the training rollout
+    cfg = DreamerConfig(steps=2, batch_size=1, horizon=2, members=2, obs_prob=1.0, log_every=1,
+                        warmup_steps=0, train_model=False)
+    loader = DataLoader(data, batch_size=1, shuffle=True, generator=torch.Generator().manual_seed(0))
+    hist = train_dreamer(model, ctrl, heads, loader, cfg)
+    assert hist[-1]["imagined_blowups"] == 2 and hist[-1]["skipped_agent"] == 1.0
+    assert all(torch.isfinite(p).all() for p in list(ctrl.parameters()) + list(heads.parameters()))
+
+
 def test_memory_control_acts_only_through_the_memory(setup):
     layout, data, base, model = setup
     ctrl, _ = _agent(model, "memory")
