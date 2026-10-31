@@ -100,6 +100,17 @@ def test_lambda_returns():
     assert torch.allclose(ret[:, 0], torch.tensor([1 + 0.5 * (1 + 0.5 * 10), 1 + 0.5 * 10]))
 
 
+def test_group_advantage():
+    from climate_wm.train.dreamer_game import group_advantage
+    ret = torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 5.0], [2.0, 7.0, 0.0, 0.0]])
+    alive = torch.ones_like(ret)
+    alive[1, 3] = 0.0   # a dead member is excluded: the alive ones tie, so no advantage
+    alive[2, 1:] = 0.0  # one alive member: nothing to compare with
+    adv = group_advantage(ret, alive)
+    assert abs(adv[0].mean()) < 1e-6 and abs(adv[0].std() - 1) < 1e-5 and adv[0].argmax() == 3
+    assert torch.equal(adv[1], torch.zeros(4)) and torch.equal(adv[2], torch.zeros(4))
+
+
 @pytest.mark.parametrize("arm", ["D", "D-blind", "D-noactor", "D-markov", "D-fixed", "D-frozen", "D-memctrl"])
 def test_dreamer_training_and_eval(setup, arm, tmp_path):
     layout, data, base, _ = setup

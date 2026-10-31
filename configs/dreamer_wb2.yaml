@@ -46,6 +46,8 @@ dreamer:                # train/dreamer_game.py
   gamma: 1.0            # the game's score is the undiscounted sum over the 36 h episode
   lam: 0.95
   cap: 10.0             # a blown-up episode scores this error from then on
+  advantage: scale      # DreamerV3's (R - v) / max(1, S); group: GRPO-style over the members of one start
+                        # (arms D-frozen-g, D-frozen-memctrl-g, D-memctrl-g: --set dreamer.advantage=group dreamer.members=8)
   lr_model: 1.0e-4      # column physics + surface head (a third of N1's)
   lr_new: 1.0e-3        # memory, reward head, actor, critic
   warmup_steps: 10

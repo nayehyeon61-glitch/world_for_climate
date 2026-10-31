@@ -80,6 +80,8 @@ class DreamerConfig:
     cap: float = 10.0               # snapshot: a blown-up episode scores this error from then on
     blowup_penalty: float = 10.0    # blind: per remaining imagined step when the state blows up
     return_ema: float = 0.99
+    advantage: str = "scale"        # scale: DreamerV3's (R - v) / max(1, S); group: GRPO-style, each step's
+                                    # return against the members of the same start (as stages 7, 9 and 11)
     head_hidden: int = 128
     mask_kinds: Tuple[str, ...] = MASK_KINDS
     mask_rate: float = 1.0
@@ -93,6 +95,8 @@ class DreamerConfig:
         self.mask_kinds = tuple(self.mask_kinds)
         if self.imagination not in ("snapshot", "blind"):
             raise ValueError("imagination must be snapshot or blind")
+        if self.advantage not in ("scale", "group"):
+            raise ValueError("advantage must be scale or group")
 
     def game(self) -> GameConfig:
         return GameConfig(mask_kinds=self.mask_kinds, mask_rate=self.mask_rate,
@@ -390,6 +394,20 @@ def lambda_returns(rewards: Tensor, values: Tensor, gamma: float, lam: float,
     return torch.stack(out[::-1])
 
 
+def group_advantage(ret: Tensor, alive: Tensor) -> Tensor:
+    """GRPO-style advantage [T, M]: each step's return against the mean and std
+    of the alive members of the same start (zero where fewer than two are alive).
+    The return-scale normalisation of DreamerV3 divides by the spread of returns
+    across starts, which the mask kind sets; with one start and four members per
+    iteration it left the action's own effect (~1% of that spread) invisible,
+    and the trained actors were inert (11/01)."""
+    n = alive.sum(1, keepdim=True)
+    mean = (ret * alive).sum(1, keepdim=True) / n.clamp(min=1)
+    var = (((ret - mean) * alive) ** 2).sum(1, keepdim=True) / (n - 1).clamp(min=1)
+    adv = (ret - mean) / (var.sqrt() + 1e-6)
+    return torch.where((n >= 2) & (alive > 0), adv, torch.zeros_like(adv))
+
+
 # --------------------------------------------------------------- training
 def _schedule(cfg: DreamerConfig):
     def f(step):
@@ -541,7 +559,10 @@ def train_dreamer(model, ctrl: Optional[MemoryController], heads: Optional[Heads
                     s_now = float(hi - lo)
                     if math.isfinite(s_now):  # a non-finite scale would never recover
                         scale = s_now if scale is None else cfg.return_ema * scale + (1 - cfg.return_ema) * s_now
-                adv = (ret - values[:-1]) / max(1.0, scale if scale is not None else 1.0)
+                if cfg.advantage == "group":
+                    adv = group_advantage(ret, alive)
+                else:
+                    adv = (ret - values[:-1]) / max(1.0, scale if scale is not None else 1.0)
             ctrl.explore = cfg.explore
             logp = torch.stack([ctrl.log_prob(feats_i[t], acts_i[t]) for t in range(steps_i)])
             loss_actor = -(adv * logp * alive).sum() / n_alive.clamp(min=1)
