@@ -17,7 +17,8 @@ from report_pyramid import ARM_COLORS, UNITS, parse_named
 
 VARIANT_LABEL = {"no_denoiser": "no denoiser (group action only)", "composite": "composite group off",
                  "shift": "vertical shift off", "radiation": "radiation off", "mixing": "mixing off",
-                 "surface": "surface off", "condensation": "condensation off"}
+                 "surface": "surface off", "condensation": "condensation off",
+                 "nonlocal": "non-chain shell edges off", "shell_graph": "generator coupling off"}
 
 
 def _value(res, name, lead, key):
@@ -79,6 +80,44 @@ def ablation_table(arms, leads, keys):
     return text
 
 
+def shell_graph_table(arms):
+    """Stage 6: learned shell graphs (mean over the mixers) and the generator coupling."""
+    graphs = {n: r["shell_graph"] for n, r in arms.items() if r.get("shell_graph")}
+    if not graphs:
+        return []
+    text = ["", "## 3. Learned shell graphs (stage 6)", "",
+            "Share of the mixing weight on non-chain edges (not s±1), mean over the mixers: the "
+            "bias alone (`prior`, 0.11 at the start) and with the state-dependent part, averaged "
+            "over the validation rollouts (`state`).", "",
+            "| arm | mixers | prior | state | max over mixers (state) |", "|---|---|---|---|---|"]
+    for n, g in graphs.items():
+        mix = g.get("mixers", {})
+        if not mix:
+            continue
+        prior = [m["prior_nonlocal_share"] for m in mix.values()]
+        state = [m["nonlocal_share"] for m in mix.values() if "nonlocal_share" in m]
+        top = max(mix, key=lambda k: mix[k].get("nonlocal_share", 0))
+        text.append(f"| {n} | {len(mix)} | {np.mean(prior):.3f} | {np.mean(state):.3f} | "
+                    f"{mix[top].get('nonlocal_share', 0):.3f} (`{top}`) |")
+    for n, g in graphs.items():
+        shells = arms[n].get("shells") or [f"shell {i}" for i in range(len(g.get("generator_coupling", [])) or 5)]
+        means = [np.array(m["mean"]) for m in g.get("mixers", {}).values() if "mean" in m]
+        if means:
+            w = np.mean(means, 0)
+            names = list(shells[:len(w)])
+            text += ["", f"Mean mixing weights of {n} (row = receiving shell):", "",
+                     "| | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
+            text += [f"| {names[i]} | " + " | ".join(f"{x:.2f}" for x in row) + " |" for i, row in enumerate(w)]
+        if "generator_coupling" in g:
+            a = np.array(g["generator_coupling"])
+            names = list(shells[:len(a)])
+            text += ["", f"Generator coupling A of {n} (omega_s = delta_s + sum A_ss' delta_s'; diagonal unused):", "",
+                     "| | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
+            text += [f"| {names[i]} | " + " | ".join("–" if i == j else f"{x:+.3f}" for j, x in enumerate(row)) + " |"
+                     for i, row in enumerate(a)]
+    return text
+
+
 def figure(arms, path, keys=("geopotential@500", "2m_temperature", "specific_humidity@700")):
     import matplotlib
     matplotlib.use("Agg")
@@ -117,6 +156,7 @@ def main():
             f"Arms {', '.join(arms)}; initialisations {n_init}; leads {args.leads} h.", ""]
     text += decomposition_table(arms, args.leads, keys)
     text += ablation_table(arms, args.leads, keys)
+    text += shell_graph_table(arms)
     md = "\n".join(text) + "\n"
     with open(os.path.join(args.out_dir, "causes.md"), "w") as f:
         f.write(md)

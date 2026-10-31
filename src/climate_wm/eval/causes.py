@@ -23,6 +23,11 @@ noise) with one part switched off:
                   identity (stage 5 arms), i.e. the arm without its new terms
     shift, radiation, mixing, surface, condensation
                   one part of the composite group set to the identity
+    nonlocal      the stage 6 shell graphs of the GNN processors restricted
+                  to the chain edges (s-1, s+1): do the non-local shell links
+                  carry skill?
+    shell_graph   the stage 6 coupling of the shells' generators removed
+                  (independent shells)
 
 Each variant is compared with the full model per initialisation, so the
 reported change carries a paired bootstrap interval.
@@ -38,16 +43,26 @@ import torch
 from torch import Tensor
 
 from ..geometry.composite_group import FIB_FAMILIES
+from ..models.layers import ShellGraphMixer
 from ..models.world_model import ClimateWorldModel
 from ..train.losses import normalized_latitude_weights
 from .graphcast_metrics import rmse_per_init
 
 COMPOSITE_PARTS = ("composite", "shift") + FIB_FAMILIES
+GRAPH_PARTS = ("nonlocal", "shell_graph")
+
+
+def _graph_mixers(model: ClimateWorldModel) -> List[ShellGraphMixer]:
+    return [m for m in model.modules() if isinstance(m, ShellGraphMixer)]
 
 
 def available_variants(model: ClimateWorldModel) -> List[str]:
     """Ablations that apply to this model."""
     out = ["no_denoiser"] if model.denoiser is not None else []
+    if _graph_mixers(model):
+        out.append("nonlocal")
+    if getattr(model.lie, "shell_graph", None) is not None:
+        out.append("shell_graph")
     lie = model.lie
     if lie is not None and getattr(lie, "composite", None) is not None:
         out.append("composite")
@@ -59,12 +74,18 @@ def available_variants(model: ClimateWorldModel) -> List[str]:
 
 @contextlib.contextmanager
 def knocked_out(model: ClimateWorldModel, parts: Sequence[str]) -> Iterator[None]:
-    """Sets parts of the composite group to the identity; restores them on exit.
+    """Sets parts of the composite group to the identity, or restricts the
+    stage 6 shell graphs (GRAPH_PARTS); restores everything on exit.
 
     A family's coefficients are scaled by its gain (`fibre_gain`), so a zero
     gain removes the family exactly; a zeroed shift head gives w = 0.
     """
+    graph = set(parts) & set(GRAPH_PARTS)
     parts = set(parts) & set(COMPOSITE_PARTS)
+    if graph:
+        with _graph_knocked_out(model, graph), knocked_out(model, parts):
+            yield
+        return
     if not parts:
         yield
         return
@@ -90,6 +111,54 @@ def knocked_out(model: ClimateWorldModel, parts: Sequence[str]) -> Iterator[None
             if lie.shift is not None:
                 for p, v in zip(lie.shift.parameters(), saved["shift"]):
                     p.copy_(v)
+
+
+@contextlib.contextmanager
+def _graph_knocked_out(model: ClimateWorldModel, parts: set) -> Iterator[None]:
+    mixers = _graph_mixers(model) if "nonlocal" in parts else []
+    coupling = getattr(model.lie, "shell_graph", None) if "shell_graph" in parts else None
+    if ("nonlocal" in parts and not mixers) or ("shell_graph" in parts and coupling is None):
+        raise ValueError(f"knock-out {sorted(parts)} needs the stage 6 shell graph")
+    saved = coupling.detach().clone() if coupling is not None else None
+    for m in mixers:
+        m.local_only = True
+    if coupling is not None:
+        with torch.no_grad():
+            coupling.zero_()
+    try:
+        yield
+    finally:
+        for m in mixers:
+            m.local_only = False
+        if coupling is not None:
+            with torch.no_grad():
+                coupling.copy_(saved)
+
+
+def shell_graph_summary(model: ClimateWorldModel,
+                        traces: Optional[Dict[str, list]] = None) -> Dict[str, object]:
+    """The learned shell graphs: per mixer the bias-only weights softmax(B) and,
+    from `traces`, the mean state-dependent weights with the share of weight on
+    non-chain edges; the generator coupling A."""
+    out: Dict[str, object] = {}
+    names = {id(m): n for n, m in model.named_modules()}
+    mixers = {}
+    for m in _graph_mixers(model):
+        nonlocal_share = lambda w: float((w * (~m.chain_edge).cpu().float()).sum(-1).mean())
+        with torch.no_grad():
+            prior = torch.softmax(m.bias.masked_fill(m.self_edge, float("-inf")), -1).cpu()
+        entry = {"prior": prior.tolist(), "prior_nonlocal_share": nonlocal_share(prior)}
+        trace = (traces or {}).get(names[id(m)])
+        if trace:
+            mean = torch.stack(trace).mean(0)
+            entry.update(mean=mean.tolist(), nonlocal_share=nonlocal_share(mean))
+        mixers[names[id(m)]] = entry
+    if mixers:
+        out["mixers"] = mixers
+    coupling = getattr(model.lie, "shell_graph", None)
+    if coupling is not None:
+        out["generator_coupling"] = coupling.detach().cpu().tolist()
+    return out
 
 
 def latent_rollout(model: ClimateWorldModel, batch: Dict[str, Tensor], steps: int,
@@ -133,6 +202,8 @@ def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int
     rows: Dict[str, List[np.ndarray]] = {}
     add = lambda k, v: rows.setdefault(k, []).append(v)
     done = 0
+    names = {id(m): n for n, m in model.named_modules()}
+    traces = {names[id(m)]: [] for m in _graph_mixers(model)}
     for n_b, batch in enumerate(_batches(dataset, indices, batch_size, device)):
         target = phys(batch["targets"][:, :lead_steps])  # [B, L, C, H, W]
         rec = torch.stack([phys(model.decode(model.encode_target(batch, k)))
@@ -140,9 +211,13 @@ def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int
         runs = {}
         for name in ("full", *variants):
             torch.manual_seed(seed + n_b)  # the same denoiser noise for every variant
+            for m in _graph_mixers(model):  # mean shell-graph weights of the full model
+                m.trace = traces[names[id(m)]] if name == "full" else None
             with knocked_out(model, [name]):
                 zs = latent_rollout(model, batch, lead_steps, sample=name != "no_denoiser")
             runs[name] = torch.stack([phys(model.decode(z)) for z in zs], 1)
+        for m in _graph_mixers(model):
+            m.trace = None
         err = lambda a, b: rmse_per_init(a, b, lat_w).numpy()  # [B, L, C]
         add("rec", err(rec, target))
         add("dyn", err(runs["full"], rec))
@@ -155,6 +230,7 @@ def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int
     full = per_init["full"]
     out = {"lead_h": [6 * (k + 1) for k in range(lead_steps)],
            "variables": [c.key for c in layout.targets],
+           "shells": [sh.name for sh in layout.shells.shells],
            "inits": len(full),
            "rmse": {k: v.mean(0).tolist() for k, v in per_init.items()}}
     # share of the squared error the autoencoder alone explains (mean over inits)
@@ -165,4 +241,7 @@ def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int
         mean, lo, hi = _bootstrap(rel, seed=seed)
         changes[name] = {"mean": mean.tolist(), "lo": lo.tolist(), "hi": hi.tolist()}
     out["variant_change"] = changes  # (variant - full) / full RMSE, paired over inits
+    graphs = shell_graph_summary(model, traces)
+    if graphs:
+        out["shell_graph"] = graphs
     return out

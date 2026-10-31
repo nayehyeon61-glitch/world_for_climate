@@ -9,6 +9,7 @@
 | 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 완료: 1차(VQ-Lie vs 연속), 2차(잔차 physics 코드 미지지, 2020 불변성 확인) | `stage3_theory/` |
 | 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 완료: P·P−skip 2018 GraphCast 비교, 예측 1–3 판정(1 미지지, 2 부분, 3 P 미지지·P−skip 형식상 지지) | `stage4_pyramid/` |
 | 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | G1 완료(P1 미지지), 원인 분석(자동부호화기 바닥·denoiser 잡음), P−nodrop 원인 ablation 학습 중, G2 대기 | `stage5_causal_lie/` |
+| 6 | 쉘 그래프 결합: 쉘 사이의 사슬(s±1) 연결을 학습된 쉘 그래프로 바꾸고, 같은 패치의 쉘 생성원도 그래프로 결합 | 구현 완료, H1·H2 학습 대기(G2 뒤), H0 = P−nodrop | `stage6_shell_graph/` |
 
 ---
 
@@ -219,6 +220,22 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **방향성:** 측정된 가장 큰 오차원은 짧은 리드의 자동부호화기 바닥과 긴 리드의 잠재 동역학·denoiser 잡음이고, 5단계의 물리 생성자는 어느 쪽도 직접 겨냥하지 않습니다. 추천 순서: (1) P−nodrop으로 자동부호화기 원인 확인(학습 중), (2) 진단량 입력 G2는 설계대로 실행(아직 검증 안 된 유일한 5단계 요소), (3) G3는 critic 점수가 오차를 추적할 때까지 보류, (4) 다음 후보는 결정론적 Lie 이송을 평균으로 쓰고 denoiser는 보정된 퍼짐만 내는 확률 단계입니다.
 
+
+---
+
+## 6단계 — 쉘 그래프 결합 (`stage6_shell_graph/`)
+
+**가설 (감자, 10/31 13:18):** 쉘 사이 사슬 결합을 놓고 그래프 단위로 연결합니다. 회전의 사슬(g_s = g_{s−1}·exp δ_s)은 1단계 ablation 뒤로 이미 꺼져 있었고, 사슬이 남아 있던 곳은 모든 GNN 층의 수직 혼합(바로 위아래 쉘만 보는 `VerticalShellMixer`)과 5단계의 쉘 축 라플라시안이었습니다. 5개 쉘(지표·경계층·하부 대류권·상부 대류권·성층권)을 완전 그래프로 이으면 심층 대류(경계층 ↔ 상부 대류권), 지표 복사·플럭스처럼 이웃을 건너뛰는 연직 결합을 직접 표현할 수 있고, 5단계 G1에서 사슬 혼합이 꺼진 것도 국소 사슬 구조가 맞지 않았기 때문인지 가릴 수 있습니다.
+
+**구현 (`models/layers.py`, `models/pyramid_transition.py`, `eval/causes.py`):**
+- `ShellGraphMixer` (`model.gnn.vertical: graph`): 모든 쉘 쌍의 메시지 전달. 가중치 a_ss' = softmax(B_ss' + ⟨q(h_s), k(h_s')⟩/√d), B는 사슬 이웃을 선호하도록 초기화(비사슬 간선 몫 0.11)하고 q는 0에서 시작합니다. 받는 쉘은 다른 쉘 상태의 가중 평균과 쉘 쌍 임베딩의 가중 평균(어디서 온 정보인지)을 받습니다. 같은 노드의 쉘은 접평면을 공유하므로 벡터 이송이 필요 없고 SO(3) 등변성이 유지됩니다. 인코더·디코더·V-Net·전이·denoiser의 사슬 혼합기 13개를 모두 바꿉니다(파라미터 +9%).
+- 생성원 그래프 결합 (`model.lie.shell_coupling: graph`, 피라미드 전이): 모든 패치·레벨에서 ω_s = δ_s + Σ_{s'≠s} A_ss' δ_s'. A = 0이면 독립 쉘, 엄격 하삼각 1이면 1단계 사슬의 1차(BCH) 근사입니다(테스트로 확인). 관측 바람의 생성원(5단계 critic)에는 적용하지 않습니다.
+- 원인 분석: `nonlocal`(혼합기를 사슬 간선으로 제한), `shell_graph`(A = 0) knock-out, 학습된 그래프(사전 B, 상태 의존 평균 가중치, 비사슬 몫, A) 요약을 `eval_causes.py`·`report_causes.py`에 추가했습니다.
+- 물리 수준의 그래프 라플라시안 혼합(L = D − W, W ≥ 0)은 H 팔에 복합 군이 없어 보류했습니다.
+
+**팔:** H0 = P−nodrop(사슬 혼합, 독립 쉘; skip dropout을 끈 4단계 P), H1 = H0 + 쉘 그래프 혼합기(`configs/wb2_h1.yaml`), H2 = H1 + 생성원 그래프 결합(`configs/wb2_h2.yaml`). 같은 데이터·단계·스텝 예산.
+
+**예측(사전 등록):** (1) H1은 H0보다 72h 단일 멤버 RMSE가 연직 교환 변수(q700, t850, t2m)에서 2% 이상 낮고 90% 구간이 0을 포함하지 않는다. (2) 비국소 간선이 쓰인다: 상태 의존 비사슬 몫이 사전(0.11)보다 크고, `nonlocal` knock-out이 RMSE를 올린다. (3) 가장 큰 비사슬 가중치는 경계층·지표와 상부 대류권 사이(심층 대류)에 있다. (4) H2의 A는 0이 아니고 `shell_graph` knock-out이 RMSE를 올린다; A가 사슬(하삼각 양수)에 가까운지, 순압 결합(모두 양수)에 가까운지 기록한다.
 ---
 
 ## 재현
@@ -254,6 +271,11 @@ python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --dat
 python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
     "P-skip=runs/wb2_pyramid_noskip/compare_graphcast.json" --pyramid P=runs/wb2_pyramid/pyramid_eval.json \
     "P-skip=runs/wb2_pyramid_noskip/pyramid_eval.json" --out-dir docs/results/stage4_pyramid
+# 6단계 (H0 = P−nodrop, H1, H2)
+python scripts/train.py --config configs/wb2_h1.yaml --data-dir DATA        # H2: wb2_h2.yaml, H0: wb2_pyramid_nodrop.yaml
+python scripts/eval_causes.py --checkpoint runs/wb2_h1/checkpoint.pt --data-dir DATA --variants no_denoiser nonlocal
+python scripts/report_causes.py H0=runs/wb2_pyramid_nodrop/causes.json H1=runs/wb2_h1/causes.json \
+    H2=runs/wb2_h2/causes.json --out-dir docs/results/stage6_shell_graph
 # 5단계 (G1–G3 각각; G0 = 4단계 P 체크포인트)
 python scripts/train.py --config configs/wb2_g1.yaml --data-dir DATA
 python scripts/compare_graphcast.py --checkpoint runs/wb2_g1/checkpoint.pt --data-dir DATA --init-stride 3

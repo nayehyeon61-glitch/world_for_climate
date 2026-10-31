@@ -208,6 +208,7 @@ class VerticalShellMixer(nn.Module):
 
     def __init__(self, d: int, cv: int, hidden_layers: int = 1):
         super().__init__()
+        self.d, self.cv, self.hidden_layers = d, cv, hidden_layers
         self.mlp = MLP(3 * d, d, d, hidden_layers)
         self.vec = nn.ModuleList([VectorLinear(cv, cv) for _ in range(3)])
         self.gate = nn.Linear(d, 3 * cv)
@@ -228,6 +229,72 @@ class VerticalShellMixer(nn.Module):
         v_new = v
         for g, lin, vv in zip(gates, self.vec, (v_lo, v, v_hi)):
             v_new = v_new + g[..., None] * lin(vv)
+        return h_new, v_new
+
+
+class ShellGraphMixer(nn.Module):
+    """Message passing over a learned graph of all shells at every node (stage 6).
+
+    Replaces the chain neighbourhood of `VerticalShellMixer` (s-1 and s+1) by
+    every other shell s', with weights
+
+        a_ss' = softmax_{s' != s}( B_ss' + <q(h_s), k(h_s')> / sqrt(d) )
+
+    B is a learned shell-pair bias, initialised to favour the chain neighbours
+    (-chain_bias per extra shell of distance); the query is zero-initialised,
+    so the graph starts as the bias and the state learns to reweight it (e.g.
+    tie the boundary layer to the upper troposphere in a convective column).
+    A shell receives the weighted mean of the other shells' states and the
+    weighted mean of a learned shell-pair embedding, so it still knows where
+    the message comes from (above or below, near or far); the cost is that of
+    the chain mixer (no per-pair message MLP). Shells at one node share the
+    tangent plane: vectors need no transport, and the vector update is a gated
+    sum of vectors (equivariant as before).
+
+    `local_only` restricts the graph to the chain edges (renormalised): the
+    knock-out of the non-local edges in the cause analysis. `trace`, when a
+    list, collects the mean weights [S, S] of every call.
+    """
+
+    def __init__(self, d: int, cv: int, num_shells: int, hidden_layers: int = 1,
+                 chain_bias: float = 2.0):
+        super().__init__()
+        s = num_shells
+        dist = (torch.arange(s)[:, None] - torch.arange(s)[None]).abs().float()
+        self.bias = nn.Parameter(-chain_bias * (dist - 1).clamp_min(0))
+        self.pair = nn.Parameter(0.02 * torch.randn(s, s, d))
+        self.query = nn.Linear(d, d, bias=False)
+        self.key = nn.Linear(d, d, bias=False)
+        nn.init.zeros_(self.query.weight)
+        self.mlp = MLP(3 * d, d, d, hidden_layers)
+        self.vec_self = VectorLinear(cv, cv)
+        self.vec_msg = VectorLinear(cv, cv)
+        self.gate = nn.Linear(d, 2 * cv)
+        self.register_buffer("self_edge", torch.eye(s, dtype=torch.bool), persistent=False)
+        self.register_buffer("chain_edge", dist == 1, persistent=False)
+        self.local_only = False
+        self.trace: Optional[list] = None
+
+    def weights(self, h: Tensor) -> Tensor:
+        """h [B, S, N, d] -> edge weights [B, N, S, S'] (rows sum to 1)."""
+        hs = h.transpose(1, 2)  # [B, N, S, d]
+        logits = self.bias + torch.einsum("bnsd,bntd->bnst", self.query(hs),
+                                          self.key(hs)) / math.sqrt(h.shape[-1])
+        blocked = self.self_edge | (~self.chain_edge if self.local_only else False)
+        return torch.softmax(logits.masked_fill(blocked, float("-inf")), -1)
+
+    def forward(self, h: Tensor, v: Tensor):
+        """h [B, S, N, d], v [B, S, N, cv, 3]."""
+        a = self.weights(h)
+        if self.trace is not None:
+            self.trace.append(a.detach().float().mean((0, 1)).cpu())
+        hs = h.transpose(1, 2)  # [B, N, S, d]
+        agg = torch.einsum("bnst,bntd->bnsd", a, hs)
+        source = torch.einsum("bnst,std->bnsd", a, self.pair)  # where the message came from
+        h_new = h + self.mlp(torch.cat([hs, agg, source], -1)).transpose(1, 2)
+        m_v = torch.einsum("bnst,btnci->bsnci", a, v)
+        g_self, g_msg = torch.sigmoid(self.gate(h_new)).chunk(2, dim=-1)
+        v_new = v + g_self[..., None] * self.vec_self(v) + g_msg[..., None] * self.vec_msg(m_v)
         return h_new, v_new
 
 
@@ -263,6 +330,19 @@ class ShellProcessor(nn.Module):
                 h_, v_ = vertical(hf.unflatten(0, (b, s)), vf.unflatten(0, (b, s)))
                 hf, vf = h_.flatten(0, 1), v_.flatten(0, 1)
         return hf.unflatten(0, (b, s)), vf.unflatten(0, (b, s))
+
+
+def use_shell_graph(module: nn.Module, num_shells: int, chain_bias: float = 2.0) -> int:
+    """Replaces every `VerticalShellMixer` under `module` by a `ShellGraphMixer`
+    of the same width (model.gnn.vertical = graph); returns how many."""
+    count = 0
+    for proc in [m for m in module.modules() if isinstance(m, ShellProcessor)]:
+        for i, m in enumerate(proc.vertical):
+            if isinstance(m, VerticalShellMixer):
+                proc.vertical[i] = ShellGraphMixer(m.d, m.cv, num_shells, m.hidden_layers,
+                                                   chain_bias)
+                count += 1
+    return count
 
 
 class BipartiteBlock(nn.Module):

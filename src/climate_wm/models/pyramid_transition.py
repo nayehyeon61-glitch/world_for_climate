@@ -75,8 +75,8 @@ class PyramidLieGenerator(nn.Module):
         super().__init__()
         if graphs.pyramid is None:
             raise ValueError("the pyramid transition needs mesh.pyramid_levels")
-        if cfg.shell_coupling != "independent":
-            raise ValueError("the pyramid transition supports shell_coupling=independent only")
+        if cfg.shell_coupling not in ("independent", "graph"):
+            raise ValueError("the pyramid transition supports shell_coupling independent or graph")
         self.cfg = cfg
         self.embed = LatentEmbedding(history, cs, cv_latent, forcing_dim,
                                      graphs.latent_struct_dim, num_shells, d, cv,
@@ -91,6 +91,11 @@ class PyramidLieGenerator(nn.Module):
         # CFL-like cap per state level: a fraction of that level's edge length.
         self.register_buffer("max_angle", torch.tensor(
             [cfg.max_rotation_edges * e for e in graphs.pyramid.max_edge]), persistent=False)
+        # Stage 6 graph coupling of the shells' generators at every patch,
+        # omega_s = delta_s + sum_{s' != s} A_ss' delta_s' (A = 0: independent shells;
+        # strictly lower-triangular ones would be the stage 1 chain to first order).
+        self.shell_graph = (nn.Parameter(torch.zeros(num_shells, num_shells))
+                            if cfg.shell_coupling == "graph" else None)
         self.composite = composite if composite is not None and composite.enabled else None
         if self.composite is not None:
             c = self.composite
@@ -149,12 +154,21 @@ class PyramidLieGenerator(nn.Module):
 
     def _algebra(self, graphs: WorldGraphs, h: Tensor, v: Tensor):
         u = (self.velocity(h)[..., None] * v).sum(-2)  # tangent velocity [B, S, N, 3]
-        return self.project(graphs, u, self.spin(h))
+        return self.project(graphs, u, self.spin(h), couple=True)
 
-    def project(self, graphs: WorldGraphs, u: Tensor, spin: Optional[Tensor] = None):
+    def couple_shells(self, part: Tensor) -> Tensor:
+        """Generators [B, S, P, 3] -> coupled over the shell graph (identity if off)."""
+        if self.shell_graph is None:
+            return part
+        a = self.shell_graph * (1 - torch.eye(part.shape[1], device=part.device))
+        return part + torch.einsum("st,btpi->bspi", a, part)
+
+    def project(self, graphs: WorldGraphs, u: Tensor, spin: Optional[Tensor] = None,
+                couple: bool = False):
         """Node velocities u [B, S, N, 3] (rad per step) and spins [B, S, N, 1]
         -> the pyramid (omega, omega_node, joints) as in `forward`. Also used for
-        the generators implied by an observed wind field (stage 5 critic)."""
+        the generators implied by an observed wind field (stage 5 critic), which
+        are not coupled over the shell graph (`couple`)."""
         pyr = graphs.pyramid
         b, s = u.shape[:2]
         if spin is None:
@@ -174,6 +188,8 @@ class PyramidLieGenerator(nn.Module):
             om = om + patches.pool(spin_levels[src]) * patches.centres[None]
             omegas.append(om)
         parts = [p.unflatten(0, (b, s)) for p in pyr.pyramid[-1].details(omegas)]
+        if couple:
+            parts = [self.couple_shells(p) for p in parts]
         omega_node = self.node_algebra(graphs, parts)
         omega = torch.cat(parts, 2)
         joints = torch.cat(parts[1:], 2) if len(parts) > 1 else None

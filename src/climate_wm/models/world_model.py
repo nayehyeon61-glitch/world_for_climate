@@ -43,6 +43,7 @@ from ..train.losses import GraphCastLoss
 from .critic import CriticConfig, RealityCritic
 from .graphs import MeshConfig, WorldGraphs
 from .latent import Latent
+from .layers import use_shell_graph
 from .lie_generator import LieConfig, LieGenerator
 from .pyramid_transition import PyramidLieGenerator
 from .residual_dynamics import ResidualDynamics
@@ -148,6 +149,8 @@ class ClimateWorldModel(nn.Module):
         self.theory = (TheoryProgram(**theory_args, lie_cfg=cfg.lie, cfg=cfg.theory,
                                      static_dim=len(layout.static))
                        if t == "lie_program" else None)
+        if g.vertical == "graph":  # stage 6: shells mixed over a learned graph, not a chain
+            use_shell_graph(self, len(layout.shells))
         self.loss_fn = GraphCastLoss(layout, grid_lat)
         # Stage 5 reality critic: its own diagnostics (all families) of decoded states.
         self.critic = None

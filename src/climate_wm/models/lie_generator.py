@@ -50,7 +50,7 @@ class LieConfig:
     layers: int = 2
     max_rotation_edges: float = 1.5  # |omega dt| cap in latent-mesh edge lengths
     dt: float = 1.0  # one GraphCast step (6h) per transition
-    shell_coupling: str = "independent"  # "independent" | "chain"
+    shell_coupling: str = "independent"  # "independent" | "chain" | "graph" (pyramid only, stage 6)
 
 
 def compose(a: Tensor, b: Tensor) -> Tensor:
@@ -71,7 +71,9 @@ class LieGenerator(nn.Module):
         self.processor = ShellProcessor(d, cv, graphs.latent_mesh.edge_dim,
                                         cfg.layers, num_shells, hidden_layers)
         if cfg.shell_coupling not in ("independent", "chain"):
-            raise ValueError(f"unknown shell_coupling {cfg.shell_coupling}")
+            raise ValueError(f"shell_coupling {cfg.shell_coupling} needs the pyramid transition"
+                             if cfg.shell_coupling == "graph" else
+                             f"unknown shell_coupling {cfg.shell_coupling}")
         self.velocity = nn.Linear(d, cv)
         self.spin = nn.Linear(d, 1)
         self.joint_gate = nn.Linear(d, 1) if cfg.shell_coupling == "chain" else None

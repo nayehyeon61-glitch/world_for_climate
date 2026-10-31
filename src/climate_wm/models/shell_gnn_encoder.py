@@ -35,6 +35,12 @@ class ShellGNNConfig:
     encoder_layers: int = 2  # message-passing steps on the mesh
     latent_layers: int = 1  # steps on the latent mesh (if pooled)
     decoder_layers: int = 2
+    vertical: str = "chain"  # shell mixing in every processor layer: chain (s-1, s+1) | graph
+    # (all shells, learned weights: stage 6, layers.ShellGraphMixer)
+
+    def __post_init__(self):
+        if self.vertical not in ("chain", "graph"):
+            raise ValueError("gnn.vertical must be chain or graph")
 
 
 class ShellGNNEncoder(nn.Module):
