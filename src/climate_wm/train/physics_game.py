@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from ..train.losses import GraphCastLoss
-from .prediction_game import _repeat, errors, target_mask
+from .prediction_game import _repeat, errors, reobserved_fields, target_mask
 
 
 def attach_loss(model) -> None:
@@ -33,9 +33,10 @@ def _select(seen: Tensor, new: Tensor, old: Tensor) -> Tensor:
 
 def play_physics(model, ctrl, batch, masks: Tensor, horizon: int, members: int = 1,
                  control: bool = True, obs_prob: float = 0.0, gen: Optional[torch.Generator] = None,
-                 record: Optional[list] = None) -> Tuple[Tensor, Tensor]:
+                 record: Optional[list] = None, nudge: Optional[float] = None) -> Tuple[Tensor, Tensor]:
     """One episode per initial state (members share the mask and the
-    re-observation draws). Returns hidden and all-point errors [B * M, K]."""
+    re-observation draws). Returns hidden and all-point errors [B * M, K].
+    `nudge`: re-observe by nudging (prediction_game.reobserved_fields)."""
     attach_loss(model)
     b = batch["inputs"].shape[0]
     rep = _repeat(batch, members)
@@ -63,7 +64,7 @@ def play_physics(model, ctrl, batch, masks: Tensor, horizon: int, members: int =
                 seen = (torch.rand(b, generator=gen) < obs_prob).repeat_interleave(members)
                 if seen.any():
                     seen = seen.to(pred.device)
-                    dyn = rep["targets"][:, k][:, t2d] * (1 - mask)
+                    dyn = reobserved_fields(rep["targets"][:, k][:, t2d], pred[:, t2d], mask, nudge)
                     old_resid = ctx["resid"]
                     fresh = model.reobserve(ctx, dyn)
                     ctx["resid"] = _select(seen, ctx["resid"], old_resid)

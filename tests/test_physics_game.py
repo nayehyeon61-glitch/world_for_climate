@@ -52,12 +52,13 @@ def test_controller_actions_move_the_low_harmonics(setup):
     assert torch.allclose(h1, h0) and torch.allclose(a1, a0) and (h0 > 0).all()
 
 
-@pytest.mark.parametrize("mode", ["rl", "grad"])
-def test_physics_game_training_and_eval(setup, mode, tmp_path):
+@pytest.mark.parametrize("mode,nudge", [("rl", None), ("grad", None), ("rl", 0.5)])
+def test_physics_game_training_and_eval(setup, mode, nudge, tmp_path):
     layout, data, model = setup
     ctrl = _ctrl(model)
     ctrl.cost_weight = 1e-4
-    cfg = GameConfig(mode=mode, steps=2, batch_size=1, members=2, horizon=2, obs_prob=0.5, log_every=1)
+    cfg = GameConfig(mode=mode, steps=2, batch_size=1, members=2, horizon=2, obs_prob=0.5, log_every=1,
+                     nudge=nudge)
     loader = DataLoader(data, batch_size=1, shuffle=True, generator=torch.Generator().manual_seed(0))
     before = [p.clone() for p in ctrl.parameters()]
     hist = train_controller(model, ctrl, loader, cfg, play_fn=play_physics, log=lambda *_: None)
@@ -67,6 +68,10 @@ def test_physics_game_training_and_eval(setup, mode, tmp_path):
     again = load_controller(model, saved)
     assert all(torch.equal(a, b) for a, b in zip(ctrl.state_dict().values(), again.state_dict().values()))
     res = evaluate_game(model, again, data, [0, 1], ["none", "region"], 2, obs_prob=0.5,
-                        play_fn=play_physics)
+                        play_fn=play_physics, nudge=nudge)
     ch = res["kinds"]["region"]["change"]
-    assert {"control_hidden", "random_control_hidden", "no_diag_hidden"} <= set(ch)
+    assert {"control_hidden", "random_control_hidden", "no_diag_hidden", "nudging_hidden"} <= set(ch)
+    # nothing hidden: direct insertion is the game's full re-observation; a nudged
+    # arm's no_control is the nudging baseline of the same strength
+    same = "nudging" if nudge is None else "nudging_half"
+    assert np.allclose(res["kinds"]["none"]["change"][f"{same}_all"]["mean"], 0, atol=1e-6)

@@ -32,6 +32,8 @@ game:                   # identical to stage 7 (configs/game_wb2.yaml)
   mask_rate: 1.0
   region_fraction: 0.25
   obs_prob: 0.5
+  nudge: null           # re-observation: null = restart from the observed part (hidden at the mean);
+                        # 0.5 = nudging arm (C1nudge / n3nudge: keep the forecast, pull observed points halfway)
   masked_weight: 0.5
   log_every: 10
 

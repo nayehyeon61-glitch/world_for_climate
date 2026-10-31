@@ -150,8 +150,11 @@ def test_evaluation_and_cause_variants(setup):
         r = res["kinds"][kind]
         assert len(r["labels"]) == 3 and len(r["mse"]["control_hidden"]) == 2
         assert np.abs(r["change"]["control_hidden"]["mean"]).max() > 0
-        assert {"random_control_hidden", "no_diag_all"} <= set(r["change"])
+        assert {"random_control_hidden", "no_diag_all", "nudging_hidden", "nudging_half_all"} <= set(r["change"])
     assert np.allclose(res["kinds"]["none"]["mse"]["control_hidden"], res["kinds"]["none"]["mse"]["control_all"])
+    # nothing hidden: direct insertion is the game's full re-observation
+    assert np.allclose(res["kinds"]["none"]["change"]["nudging_all"]["mean"], 0, atol=1e-6)
+    assert np.abs(res["kinds"]["region"]["change"]["nudging_hidden"]["mean"]).max() > 0
     with controlled(model, ctrl):
         variants = causes.available_variants(model)
         assert {"no_control", "random_control", "no_diag"} <= set(variants)
@@ -161,6 +164,16 @@ def test_evaluation_and_cause_variants(setup):
             assert np.abs(np.array(out["variant_change"][name]["mean"])).max() > 0
         assert ctrl.enabled and not ctrl.random_actions and not ctrl.zero_diagnostics
     assert "no_control" not in causes.available_variants(model)
+
+
+def test_reobserved_fields():
+    truth, forecast = torch.full((1, 2, 3, 4), 2.0), torch.full((1, 2, 3, 4), 1.0)
+    mask = torch.zeros(2, 3, 4)
+    mask[0] = 1.0  # first channel hidden
+    game_rule = game.reobserved_fields(truth, forecast, mask)
+    assert (game_rule[0, 0] == 0).all() and (game_rule[0, 1] == 2).all()
+    half = game.reobserved_fields(truth, forecast, mask, 0.5)
+    assert (half[0, 0] == 1).all() and (half[0, 1] == 1.5).all()
 
 
 def test_reward_to_go():

@@ -66,6 +66,8 @@ class GameConfig:
     mask_rate: float = 1.0        # share of episodes with a mask (0: the no-mask game)
     region_fraction: float = 0.25
     obs_prob: float = 0.0         # chance to re-observe the masked truth after a step
+    nudge: Optional[float] = None  # re-observation: None = restart from the observed part
+                                   # (hidden points at their mean), x = nudging of strength x
     masked_weight: float = 0.5
     log_every: int = 10
     seed: int = 0
@@ -155,12 +157,23 @@ def _repeat(batch: Dict[str, Tensor], n: int) -> Dict[str, Tensor]:
             for k, v in batch.items()}
 
 
+def reobserved_fields(truth: Tensor, forecast: Tensor, mask: Tensor, nudge: Optional[float] = None) -> Tensor:
+    """Fields a re-observation restarts from (normalised dynamic channels).
+    The game's rule (nudge None): the observed part, hidden points at their
+    mean (0). Nudging, the classical baseline: the forecast, with the observed
+    points pulled towards the truth by `nudge` (1 = direct insertion)."""
+    if nudge is None:
+        return truth * (1 - mask)
+    return forecast + nudge * (1 - mask) * (truth - forecast)
+
+
 def play(model: ClimateWorldModel, ctrl: FeatureController, batch: Dict[str, Tensor],
          masks: Tensor, horizon: int, members: int = 1, control: bool = True,
          obs_prob: float = 0.0, gen: Optional[torch.Generator] = None,
-         record: Optional[list] = None) -> Tuple[Tensor, Tensor]:
+         record: Optional[list] = None, nudge: Optional[float] = None) -> Tuple[Tensor, Tensor]:
     """Plays one episode per initial state (members share the mask and the
-    re-observation draws). Returns hidden and all-point errors [B * M, K]."""
+    re-observation draws). Returns hidden and all-point errors [B * M, K].
+    `nudge`: re-observe by nudging (see `reobserved_fields`)."""
     b = batch["inputs"].shape[0]
     rep = _repeat(batch, members)
     mask = masks.to(rep["inputs"].device).repeat_interleave(members, 0)
@@ -183,7 +196,7 @@ def play(model: ClimateWorldModel, ctrl: FeatureController, batch: Dict[str, Ten
                     seen = (torch.rand(b, generator=gen) < obs_prob).repeat_interleave(members)
                     if seen.any():
                         seen = seen.to(pred.device)
-                        dyn = rep["targets"][:, k][:, t2d] * (1 - mask)
+                        dyn = reobserved_fields(rep["targets"][:, k][:, t2d], pred[:, t2d], mask, nudge)
                         z_obs = model.encode(dyn, rep["forcings_tgt"][:, k], rep["static"])
                         sel = lambda a, o: torch.where(seen.view(-1, *[1] * (a.ndim - 1)), o, a)
                         z = Latent(sel(z.h, z_obs.h), sel(z.v, z_obs.v))
@@ -257,7 +270,8 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
         if cfg.mode == "grad" or logged:  # the uncontrolled score of the same episodes
             with torch.no_grad():
                 r0 = episode_return(*play(model, ctrl, batch, masks, cfg.horizon, control=False,
-                                          obs_prob=cfg.obs_prob, gen=obs_gen()), cfg.masked_weight)
+                                          obs_prob=cfg.obs_prob, gen=obs_gen(), nudge=cfg.nudge),
+                                    cfg.masked_weight)
         opt.zero_grad(set_to_none=True)
         logs: Dict[str, float] = {}
         if cfg.mode == "rl":
@@ -265,7 +279,7 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
             ctrl.explore = cfg.explore
             with torch.no_grad():
                 rewards = step_rewards(*play(model, ctrl, batch, masks, cfg.horizon, cfg.members,
-                                             obs_prob=cfg.obs_prob, gen=obs_gen(), record=record),
+                                             obs_prob=cfg.obs_prob, gen=obs_gen(), record=record, nudge=cfg.nudge),
                                        cfg.masked_weight)  # [B * M, K]
             ret = rewards.sum(1).view(b, cfg.members)
             adv = reward_to_go_advantages(rewards, cfg.members)
@@ -277,7 +291,7 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
         else:
             ctrl.explore = 0.0
             ret = episode_return(*play(model, ctrl, batch, masks, cfg.horizon,
-                                       obs_prob=cfg.obs_prob, gen=obs_gen()), cfg.masked_weight)
+                                       obs_prob=cfg.obs_prob, gen=obs_gen(), nudge=cfg.nudge), cfg.masked_weight)
             loss = -(ret / r0.abs()).mean()  # relative to the uncontrolled score of the episode
             loss.backward()
             logs["gain"] = float(((ret.detach() - r0) / r0.abs()).mean())
@@ -290,7 +304,7 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
             ctrl.explore = 0.0
             with torch.no_grad():  # the mean policy on the same episodes
                 rm = episode_return(*play(model, ctrl, batch, masks, cfg.horizon,
-                                          obs_prob=cfg.obs_prob, gen=obs_gen()), cfg.masked_weight)
+                                          obs_prob=cfg.obs_prob, gen=obs_gen(), nudge=cfg.nudge), cfg.masked_weight)
             logs["gain_mean_policy"] = float(((rm - r0) / r0.abs()).mean())
             terms = " ".join(f"{k}={v:.4g}" for k, v in logs.items() if k not in ("step",))
             log(f"[game:{cfg.mode}] step {step:>4} {terms} ({time.time() - t0:.0f}s) {labels}")
@@ -303,17 +317,23 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
 
 
 # -------------------------------------------------------------- evaluation
-CONTROL_VARIANTS = ("no_control", "random_control", "no_diag")
+# baselines without a controller: re-observation by nudging, with this strength
+NUDGE_VARIANTS = {"nudging": 1.0, "nudging_half": 0.5}
+CONTROL_VARIANTS = ("no_control", "random_control", "no_diag", *NUDGE_VARIANTS)
 
 
 @torch.no_grad()
 def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, indices: Sequence[int],
                   kinds: Sequence[str], horizon: int, device="cpu", seed: int = 0,
                   region_fraction: float = 0.25, variants: Sequence[str] = CONTROL_VARIANTS,
-                  obs_prob: float = 0.0, log=None, play_fn: Optional[Callable] = None) -> Dict[str, object]:
-    """Masked-game errors per kind and lead for the controller and its knock-outs,
-    paired over initialisations (each init gets one fixed mask per kind and, with
-    `obs_prob` > 0, one fixed sequence of re-observations)."""
+                  obs_prob: float = 0.0, log=None, play_fn: Optional[Callable] = None,
+                  nudge: Optional[float] = None) -> Dict[str, object]:
+    """Masked-game errors per kind and lead for the controller, its knock-outs
+    and the nudging baselines (NUDGE_VARIANTS, no controller), paired over
+    initialisations (each init gets one fixed mask per kind and, with
+    `obs_prob` > 0, one fixed sequence of re-observations). `nudge`: the
+    re-observation rule the controller was trained with (GameConfig.nudge),
+    used by it and its knock-outs; the baselines keep their own."""
     play = play_fn or globals()["play"]
     model.eval()
     ctrl.explore = 0.0
@@ -335,8 +355,10 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                 ctrl.random_actions = name == "random_control"
                 ctrl.zero_diagnostics = name == "no_diag"
                 torch.manual_seed(seed + n)
-                h, a = play(model, ctrl, batch, mask[None], horizon, control=name != "no_control",
-                            obs_prob=obs_prob, gen=torch.Generator().manual_seed(seed + 7919 * n))
+                h, a = play(model, ctrl, batch, mask[None], horizon,
+                            control=name != "no_control" and name not in NUDGE_VARIANTS,
+                            obs_prob=obs_prob, gen=torch.Generator().manual_seed(seed + 7919 * n),
+                            nudge=NUDGE_VARIANTS.get(name, nudge))
                 rows.setdefault(f"{name}_hidden", []).append(h[0])
                 rows.setdefault(f"{name}_all", []).append(a[0])
             ctrl.random_actions = ctrl.zero_diagnostics = False

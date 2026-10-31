@@ -7,8 +7,12 @@
 Every initialisation gets one fixed mask per kind (and, with the game's
 obs_prob > 0, one fixed sequence of re-observations); the controller, the frozen
 model (no_control), the controller's actions at shuffled places
-(random_control) and the controller without its diagnostics (no_diag) play
-the same episodes, so changes are paired over initialisations. The unmasked
+(random_control), the controller without its diagnostics (no_diag) and the
+classical baseline, nudging without a controller (nudging: direct insertion
+of the observed points, keeping the forecast elsewhere; nudging_half: half
+strength), play the same episodes, so changes are paired over initialisations.
+A controller trained with nudged re-observations (game.nudge) is played, with
+its knock-outs and no_control, under that rule. The unmasked
 6-72 h forecast of the same arms comes from scripts/eval_causes.py --controller.
 A physics checkpoint (stage 9) is played with its tendency controllers; no_diag
 then hides the state from the controller.
@@ -70,7 +74,8 @@ def main():
         res = evaluate_game(model, ctrl, test, indices, args.kinds, gc.horizon, args.device,
                             region_fraction=gc.region_fraction,
                             variants=["no_control", *[v for v in args.variants if v != "no_control"]],
-                            obs_prob=gc.obs_prob, log=print, play_fn=play_physics if physics else None)
+                            obs_prob=gc.obs_prob, log=print, play_fn=play_physics if physics else None,
+                            nudge=saved.get("config", {}).get("game", {}).get("nudge"))
         res.update(controller=path, history=saved.get("history", []))
         out["arms"][name] = res
         for kind, r in res["kinds"].items():
@@ -78,7 +83,7 @@ def main():
             line = (f"{name:10s} {kind:10s} 24h hidden {100 * ch['control_hidden']['mean'][-1]:+.2f}% "
                     f"[{100 * ch['control_hidden']['lo'][-1]:+.2f}, {100 * ch['control_hidden']['hi'][-1]:+.2f}] "
                     f"all {100 * ch['control_all']['mean'][-1]:+.2f}%")
-            for v in ("random_control", "no_diag"):
+            for v in ("random_control", "no_diag", "nudging", "nudging_half"):
                 if f"{v}_hidden" in ch:
                     line += f" | {v} {100 * ch[f'{v}_hidden']['mean'][-1]:+.2f}%"
             print(line)

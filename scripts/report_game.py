@@ -22,7 +22,9 @@ from climate_wm.eval.graphcast_metrics import HEADLINE_KEYS
 from report_pyramid import ARM_COLORS, parse_named
 
 VARIANT_LABEL = {"control": "controller", "random_control": "same actions, shuffled places",
-                 "no_diag": "controller without diagnostics"}
+                 "no_diag": "controller without diagnostics",
+                 "nudging": "nudging, no controller (direct insertion)",
+                 "nudging_half": "nudging, no controller (half strength)"}
 
 
 def _cell(ch, li):
@@ -38,14 +40,16 @@ def game_table(game):
             f"{next(iter(game['arms'].values())).get('obs_prob', 0.0)}); "
             "GraphCast-weighted MSE change against the frozen model (no control), "
             "mean and 90% bootstrap interval. `hidden` = the masked points, `all` = every point. "
-            "Bold: the interval excludes 0.", ""]
+            "Bold: the interval excludes 0. Nudging (the classical baseline) keeps the forecast at a "
+            "re-observation and pulls only the observed points towards the truth, where the game restarts "
+            "from the observed part with the hidden points at their mean.", ""]
     for name, arm in game["arms"].items():
         lead = arm["lead_h"]
         text += [f"### {name}", "",
                  "| mask | variant | " + " | ".join(f"hidden {l}h" for l in lead) + f" | all {lead[-1]}h |",
                  "|---|---|" + "---|" * (len(lead) + 1)]
         for kind, r in arm["kinds"].items():
-            for v in ("control", "random_control", "no_diag"):
+            for v in VARIANT_LABEL:
                 h, a = r["change"].get(f"{v}_hidden"), r["change"].get(f"{v}_all")
                 if h is None:
                     continue
