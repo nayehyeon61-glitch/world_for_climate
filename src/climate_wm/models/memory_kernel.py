@@ -88,7 +88,8 @@ class MemoryKernel(nn.Module):
         self.kappa = nn.Parameter(torch.full((k,), -3.0))  # softplus: diffusion per update at n = trunc
         self.knock: set = set()                        # evaluation knock-outs (KNOCKOUTS)
         self.track: Optional[list] = None              # set to a list: log10 tau (hours) per update,
-                                                       # zonal means [H] + quantiles 10/50/90 [3]
+                                                       # zonal means [H], quantiles 10/50/90 over all
+                                                       # channels [3] and per channel [K * 3]
 
     # ---------------------------------------------------------------- kernel
     def tau(self, x: Tensor) -> Tensor:
@@ -105,10 +106,13 @@ class MemoryKernel(nn.Module):
             return torch.zeros_like(m)
         tau = self.tau(x)
         if self.track is not None:
-            lt = torch.log10(tau.detach().float() / 3600.0)
-            q = torch.quantile(lt.flatten()[:: max(1, lt.numel() // 100000)],
-                               torch.tensor([0.1, 0.5, 0.9], device=lt.device))
-            self.track.append(torch.cat([lt.mean((0, 2, 3)), q]).cpu())
+            lt = torch.log10(tau.detach().float() / 3600.0)  # [B, H, W, K]
+            qs = torch.tensor([0.1, 0.5, 0.9], device=lt.device)
+            flat = lt.reshape(-1, lt.shape[-1])
+            flat = flat[:: max(1, flat.shape[0] // 20000)]
+            # the per-channel spread is the state dependence (the channels start log-spaced)
+            per = torch.quantile(flat, qs, dim=0).t().flatten()
+            self.track.append(torch.cat([lt.mean((0, 2, 3)), torch.quantile(flat.flatten(), qs), per]).cpu())
         a = torch.exp(-self.dt / tau)
         b = torch.tanh(self.inp(x)) if self.cfg.adaptive else self.inp(x)
         m = (a * m.permute(0, 2, 3, 1) + (1 - a) * b).permute(0, 3, 1, 2)

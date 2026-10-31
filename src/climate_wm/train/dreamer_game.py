@@ -48,7 +48,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from ..models.tendency_control import TendencyControlConfig, TendencyController
-from .physics_game import _select, attach_loss
+from .physics_game import _detach, _finite, _select, attach_loss
 from .prediction_game import (MASK_KINDS, GameConfig, _repeat, episode_masks, errors, reobserved_fields,
                               sample_mask, step_rewards, target_mask)
 from .trainer import _forever, _to
@@ -181,20 +181,6 @@ class Heads(nn.Module):
 
 
 # ------------------------------------------------------------------- game
-def _detach(state: Dict[str, Tensor]) -> Dict[str, Tensor]:
-    return {k: v.detach() for k, v in state.items()}
-
-
-def _finite(state: Dict[str, Tensor]) -> Tensor:
-    """Per-sample finiteness [B] of a core state."""
-    ok = None
-    for v in state.values():
-        r = torch.view_as_real(v) if torch.is_complex(v) else v
-        f = torch.isfinite(r).flatten(1).all(1)
-        ok = f if ok is None else ok & f
-    return ok
-
-
 def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, horizon: int,
                 members: int = 1, control: bool = True, explore: float = 0.0, obs_prob: float = 0.0,
                 gen: Optional[torch.Generator] = None, rule: Rule = "posterior",
@@ -619,7 +605,9 @@ def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset,
                                                        "hi": np.percentile(means, 97.5, 0).tolist()}
         out["kinds"][kind] = res
     if tau_track:
-        z = torch.stack(tau_track).mean(0)  # [H + 3] averaged over updates
-        out["log10_tau_hours_zonal"] = z[:-3].tolist()
-        out["log10_tau_hours_p10_p50_p90"] = z[-3:].tolist()
+        k = model.memory.cfg.channels
+        z = torch.stack(tau_track).mean(0)  # [H + 3 + 3K] averaged over updates
+        out["log10_tau_hours_zonal"] = z[:-3 * (k + 1)].tolist()
+        out["log10_tau_hours_p10_p50_p90"] = z[-3 * (k + 1):-3 * k].tolist()
+        out["log10_tau_hours_channel_p10_p50_p90"] = z[-3 * k:].view(k, 3).tolist()
     return out

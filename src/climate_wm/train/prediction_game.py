@@ -33,6 +33,7 @@ verification reward, as in stage 2.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -69,6 +70,8 @@ class GameConfig:
     nudge: Optional[float] = None  # re-observation: None = restart from the observed part
                                    # (hidden points at their mean), x = nudging of strength x
     masked_weight: float = 0.5
+    cap: Optional[float] = None   # physics game: errors clipped here, a blown-up episode scores it
+                                  # from then on (train/physics_game.play_physics)
     log_every: int = 10
     seed: int = 0
 
@@ -233,8 +236,11 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
                      play_fn: Optional[Callable] = None) -> List[Dict[str, float]]:
     """Trains the controller; `save` receives a resumable `progress` dict every
     `save_every` updates (the same windows, masks and draws as an uninterrupted run).
-    `play_fn` replaces `play` for another world model (stage 9: train/physics_game.py)."""
+    `play_fn` replaces `play` for another world model (stage 9: train/physics_game.py).
+    An update whose gradient is not finite is skipped (counted as "skipped")."""
     play = play_fn or globals()["play"]
+    if cfg.cap is not None:
+        play = functools.partial(play, cap=cfg.cap)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -296,7 +302,10 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
             loss.backward()
             logs["gain"] = float(((ret.detach() - r0) / r0.abs()).mean())
         grad_norm = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        opt.step()
+        if torch.isfinite(grad_norm):
+            opt.step()
+        else:
+            logs["skipped"] = 1.0
         sched.step()
         logs.update(loss=float(loss.detach()), grad_norm=float(grad_norm), step=step,
                     masks=sum(l != "none" for l in labels))
@@ -327,21 +336,25 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                   kinds: Sequence[str], horizon: int, device="cpu", seed: int = 0,
                   region_fraction: float = 0.25, variants: Sequence[str] = CONTROL_VARIANTS,
                   obs_prob: float = 0.0, log=None, play_fn: Optional[Callable] = None,
-                  nudge: Optional[float] = None) -> Dict[str, object]:
+                  nudge: Optional[float] = None, cap: Optional[float] = None) -> Dict[str, object]:
     """Masked-game errors per kind and lead for the controller, its knock-outs
     and the nudging baselines (NUDGE_VARIANTS, no controller), paired over
     initialisations (each init gets one fixed mask per kind and, with
     `obs_prob` > 0, one fixed sequence of re-observations). `nudge`: the
     re-observation rule the controller was trained with (GameConfig.nudge),
-    used by it and its knock-outs; the baselines keep their own."""
+    used by it and its knock-outs; the baselines keep their own. `cap`
+    (GameConfig.cap): a blown-up episode scores `cap` from then on and is
+    counted in "blowups" per variant."""
     play = play_fn or globals()["play"]
+    if cap is not None:
+        play = functools.partial(play, cap=cap)
     model.eval()
     ctrl.explore = 0.0
     out: Dict[str, object] = {"lead_h": [6 * (k + 1) for k in range(horizon)], "obs_prob": obs_prob,
                               "kinds": {}}
     for kind in kinds:
         rows: Dict[str, List[Tensor]] = {}
-        labels = []
+        labels, blowups = [], {}
         for n, i in enumerate(indices):
             item = dataset[int(i)]
             batch = {k: v[None].to(device) for k, v in item.items()}
@@ -359,6 +372,8 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                             control=name != "no_control" and name not in NUDGE_VARIANTS,
                             obs_prob=obs_prob, gen=torch.Generator().manual_seed(seed + 7919 * n),
                             nudge=NUDGE_VARIANTS.get(name, nudge))
+                if cap is not None:
+                    blowups[name] = blowups.get(name, 0) + int((h >= cap).any())
                 rows.setdefault(f"{name}_hidden", []).append(h[0])
                 rows.setdefault(f"{name}_all", []).append(a[0])
             ctrl.random_actions = ctrl.zero_diagnostics = False
@@ -366,6 +381,8 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                 log(f"[game eval] {kind}: {n + 1}/{len(indices)}")
         per = {k: torch.stack(v).cpu().numpy() for k, v in rows.items()}  # [N, K]
         res = {"labels": labels, "mse": {k: v.mean(0).tolist() for k, v in per.items()}, "change": {}}
+        if cap is not None:
+            res["blowups"] = blowups
         base = {part: per[f"no_control_{part}"] for part in ("hidden", "all")}
         for name in ("control", *[v for v in variants if v != "no_control"]):
             for part in ("hidden", "all"):

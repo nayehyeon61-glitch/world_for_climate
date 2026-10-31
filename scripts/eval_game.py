@@ -75,7 +75,8 @@ def main():
                             region_fraction=gc.region_fraction,
                             variants=["no_control", *[v for v in args.variants if v != "no_control"]],
                             obs_prob=gc.obs_prob, log=print, play_fn=play_physics if physics else None,
-                            nudge=saved.get("config", {}).get("game", {}).get("nudge"))
+                            nudge=saved.get("config", {}).get("game", {}).get("nudge"),
+                            cap=gc.cap if physics else None)
         res.update(controller=path, history=saved.get("history", []))
         out["arms"][name] = res
         for kind, r in res["kinds"].items():
@@ -86,6 +87,8 @@ def main():
             for v in ("random_control", "no_diag", "nudging", "nudging_half"):
                 if f"{v}_hidden" in ch:
                     line += f" | {v} {100 * ch[f'{v}_hidden']['mean'][-1]:+.2f}%"
+            if r.get("blowups"):
+                line += f" | blow-ups {r['blowups']}"
             print(line)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:

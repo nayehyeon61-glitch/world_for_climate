@@ -75,3 +75,35 @@ def test_physics_game_training_and_eval(setup, mode, nudge, tmp_path):
     # arm's no_control is the nudging baseline of the same strength
     same = "nudging" if nudge is None else "nudging_half"
     assert np.allclose(res["kinds"]["none"]["change"][f"{same}_all"]["mean"], 0, atol=1e-6)
+
+
+def test_physics_game_caps_blowups(setup, monkeypatch):
+    layout, data, model = setup
+    batch = {k: torch.stack([data[0][k], data[1][k]]) for k in data[0]}
+    masks = torch.zeros(2, len(layout.dynamic), len(data.lat), len(data.lon))
+    advance = model.advance
+
+    def exploding(state, ctx, k):  # the second sample blows up in its second step
+        state, precip = advance(state, ctx, k)
+        if k == 1:
+            state = dict(state, temp=state["temp"].clone())
+            state["temp"][-1] = float("nan")
+        return state, precip
+
+    monkeypatch.setattr(model, "advance", exploding)
+    ctrl = _ctrl(model)
+    h, a = play_physics(model, ctrl, batch, masks, 2, cap=10.0)
+    assert torch.isfinite(h).all() and torch.isfinite(a).all()
+    assert h[1, 1] == 10.0 and (h[0] < 10.0).all()
+    # training stays finite (rl) or skips the step (grad), and evaluation counts the blow-up
+    loader = DataLoader(data, batch_size=2, shuffle=False)
+    for mode in ("rl", "grad"):
+        cfg = GameConfig(mode=mode, steps=1, batch_size=2, members=2, horizon=2, obs_prob=0.5, cap=10.0,
+                         log_every=1)
+        trained = _ctrl(model)
+        hist = train_controller(model, trained, loader, cfg, play_fn=play_physics, log=lambda *_: None)
+        assert all(p.isfinite().all() for p in trained.parameters())
+        assert hist[0].get("skipped") if mode == "grad" else np.isfinite(hist[0]["loss"])
+    res = evaluate_game(model, ctrl, data, [0, 1], ["none"], 2, play_fn=play_physics, cap=10.0,
+                        variants=["no_control", "nudging"])
+    assert res["kinds"]["none"]["blowups"] == {"control": 2, "no_control": 2, "nudging": 2}  # batches of one

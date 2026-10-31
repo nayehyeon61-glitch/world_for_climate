@@ -88,6 +88,9 @@ def main():
         print(line)
     if "log10_tau_hours_p10_p50_p90" in res:
         print("timescales (h) p10/p50/p90:", [f"{10 ** x:.1f}" for x in res["log10_tau_hours_p10_p50_p90"]])
+        spread = [10 ** (q[2] - q[0]) for q in res["log10_tau_hours_channel_p10_p50_p90"]]
+        print(f"state dependence, p90/p10 of tau per channel: median {np.median(spread):.2f}, "
+              f"max {max(spread):.2f}")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)

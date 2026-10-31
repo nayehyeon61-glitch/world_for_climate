@@ -130,6 +130,7 @@ def test_dreamer_training_and_eval(setup, arm, tmp_path):
     assert "full_hidden" in ch and "game_rule_hidden" in ch and "nudging_hidden" not in ch
     if model.memory is not None and model.memory.cfg.adaptive:
         assert len(res["log10_tau_hours_zonal"]) == 8
+        assert np.shape(res["log10_tau_hours_channel_p10_p50_p90"]) == (model.memory.cfg.channels, 3)
 
 
 def test_blowups_are_cut_or_capped(setup, monkeypatch):
