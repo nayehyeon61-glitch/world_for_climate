@@ -675,7 +675,9 @@ def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset,
         out["kinds"][kind] = res
     if tau_track:
         k = model.memory.cfg.channels
-        z = torch.stack(tau_track).mean(0)  # [H + 3 + 3K] averaged over updates
+        z = torch.stack(tau_track)
+        z = z[torch.isfinite(z).all(1)].mean(0)  # [H + 3 + 3K] averaged over the finite updates
+        # (a blown-up episode's updates are NaN and would have hidden every timescale)
         out["log10_tau_hours_zonal"] = z[:-3 * (k + 1)].tolist()
         out["log10_tau_hours_p10_p50_p90"] = z[-3 * (k + 1):-3 * k].tolist()
         out["log10_tau_hours_channel_p10_p50_p90"] = z[-3 * k:].view(k, 3).tolist()
