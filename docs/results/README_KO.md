@@ -13,6 +13,7 @@
 | 7 | 예측 게임과 GNN feature 제어: 학습된 물리 예측 모델을 고정하고, 마스킹된 데이터를 예측하는 게임에서 GNN feature를 조절하는 작은 제어기만 보상으로 학습한 뒤 전체를 시험 (Ha의 World Models) | 구현 완료(36h 순차형 게임, reward-to-go), C1·C1-grad·C1-open 학습 대기(G2 뒤) | `stage7_prediction_game/` |
 | 8 | 동역학적 대기의 위상: 물리적 전이 비용(시간 포함, 준거리)으로 근방을 정의하고, 그 왕복 버전인 커뮤트 타임을 보존하는 임베딩(CTWM)을 학습해 새 위상인지 새 기하인지, 비용 근방이 예측에 좋은지 시험 | 1차 완료(고정 latent 위 사후 학습): P1·P2·P4 미지지, P3(전역 위상 없음)은 예측대로 → 2차 보류, 실제 제어 비용은 9단계 물리 모델 위에서 다시 시험 | `stage8_topology/` |
 | 9 | 물리 중심 세계 모델: 상태 = 물리 변수(잠재 벡터 없음), 미분 가능한 원시방정식 스펙트럴 코어 + 신경망 칼럼 물리를 다중 스텝 롤아웃으로 학습, 고정한 모델 위에 Ha 2018 방식 제어기(N3)로 마스킹 예측 게임 | N0(학습 없는 코어) 완료: 72h z500 S보다 22% 낮음(Q1 지지), 경계층 마찰 추가. N1·N3(nudging 기준선 포함) 큐 대기 | `stage9_physics/` |
+| 10 | 적응형 기억 커널(Mori–Zwanzig) + DreamerV3식 유동 학습: 9단계 N1 위에 칼럼별 기억 m(상태 의존 시간 척도), 재관측 때 혁신 흡수와 숨은 점 판독, 세계 모델과 행위자·비평가를 번갈아 학습, 상상은 마스크된 한 시점에서 ERA5 재관측과 함께 | 코드·테스트 완료(d20b0d3). N1 학습 뒤 6팔 큐 대기, 보고 11/01 ~10:00 | `stage10_memory/` |
 
 ---
 
@@ -372,11 +373,32 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **방향성:** N0가 실패하는 곳(지표, 습윤 과정, 복사에 의한 표류)이 정확히 N1 칼럼 물리가 맡을 몫입니다. 그래서 N1은 계획대로 진행합니다. 자유 대기의 패턴은 이미 방정식이 잡고 있으므로, 신경망이 배울 것은 "칼럼 안의 원천과 소멸"뿐입니다. 학습 목표가 이렇게 좁아진다는 점이 1–8단계와 다른 지점입니다. knock-out이 가리키는 구체적인 몫은 세 가지입니다. 습도의 응결 소멸, 최하층 온도의 지표 열 교환, 그리고 상승 운동과 맞물린 가열입니다. N1에서 볼 것은 Q2(S보다 30% 이상 낮음)와, 72h 표류가 줄어드는지(RMSE와 ACC의 간격), 그리고 연직 이송·수분 이송 knock-out의 부호가 뒤집히는지(물리가 생기면 이 항들이 도움이 되어야 함)입니다. 뒤집히지 않으면 다음 원인 후보는 초기 발산의 잡음이고, 디지털 필터 같은 초기화를 시험합니다.
 
+## 10단계 — 적응형 기억 커널과 DreamerV3식 유동 학습 (`stage10_memory/`)
+
+**가설 (감자, 10/31 18:32–19:12):** 9단계 N3처럼 세계 모델을 얼리고 기억 없는 제어기만 학습하는 것은 World Models를 잘못 옮긴 것입니다. DreamerV3처럼 세계 모델이 계속 배우고(유동성), 에이전트가 기억을 가져야 합니다. 핵심은 "행위자 입력에 마스크된 관측 → 그 관측을 받는 기억의 물리 → 적응형 기억을 통한 미래 예측"입니다. 설계 문서: [10단계 설계: 적응형 기억 커널과 DreamerV3식 유동 학습](https://claude.ai/artifact/KqNAQg5dARnZhdAkwqfUzj).
+
+**구현 (`models/memory_kernel.py`, `models/physics_world_model.py`, `train/dreamer_game.py`, `scripts/train_dreamer.py`, `scripts/eval_dreamer.py`, `configs/dreamer_wb2.yaml`):**
+- 기억: Mori–Zwanzig 기억 적분 ∫K(τ, X)X(t−τ)dτ 를 지수함수 합으로 두면 칼럼별 선형 점화식 m ← a⊙m + (1−a)⊙b(x), a = e^{−Δt/τ(x)} 가 됩니다(K = 16채널, τ 초기값 3시간–10일). 매시간 칼럼 물리 호출 때 갱신하고, 구면조화 확산 e^{−κ n(n+1)}(κ 학습)으로 이웃에 퍼지며, 칼럼 경향에 더해집니다. 적응형 = τ(x)와 b(x)가 칼럼 상태의 함수(선택적 상태공간), 고정 = τ 상수와 선형 b·G.
+- 관측: 첫 시점의 마스크된 스냅샷과 이후 재관측마다 기억이 혁신을 흡수합니다(m += G(예측, 혁신, 관측 여부, m)). 숨은 점은 평균값 대신 예측 + R(m)으로 채웁니다. 기억의 출력층은 모두 0에서 시작하므로 학습 전 모델은 N1 + nudging(α=1)과 정확히 같습니다(테스트로 확인).
+- 학습(한 반복): ① 세계 모델: 2018–19 마스크 시퀀스 2개를 현재 행위자와 함께 36시간 굴려 GraphCast 가중 오차로 칼럼 물리(학습률 1e-4)와 기억·G·R(1e-3)을 갱신합니다. ② 행위자·비평가: 마스크된 한 시점에서 기억 0으로 시작해 행동 4개로 36시간을 굴리고, 그동안 ERA5 관측이 확률 0.5로 들어옵니다. 보상은 정확한 음의 오차, λ-수익(γ=1, λ=0.95), 수익 정규화 S = EMA(P95−P5), REINFORCE, EMA 비평가. 행위자는 9단계 제어기에 최근 마스크 관측과 기억의 저차 계수를 더 읽습니다. D-blind는 DreamerV3 그대로(사후 상태에서 관측 없이 상상, 보상 머리)입니다.
+- 폭주: 스모크에서 학습 중인 N1(200/1000)이 영역 마스크 상태에서 36시간 안에 폭주했습니다(N0는 안정). 평균값으로 채운 숨은 영역이 칼럼 물리에 낯선 입력이기 때문으로 봅니다. 학습은 폭주 직전에서 끊고(배치 안의 NaN 하나가 기울기를 망치므로 샘플별로 굴림), 점수는 상한 10으로 매기고 폭주 횟수를 따로 보고합니다.
+
+**팔:** D(본안), D-blind(관측 없는 상상), D-noactor(행위자 없음), D-markov(기억 없음), D-fixed(고정 커널), D-frozen(D-noactor의 세계 모델을 얼리고 행위자만). 기준: N1 + nudging(α=1, 기준점), nudging_half, 7·9단계 게임 규칙. 평가 끄기: 기억, 혁신, 판독, 확산, τ 고정, 행위자. 시험은 2020년 31개 초기 시각 × 마스크 3종(변수·셸·영역), D와 D-markov는 2018–19 15개로 과적합도 봅니다.
+
+**예측(사전 등록):** P1 D가 nudging보다 24시간 숨은 오차 10% 이상 낮음. P2 적응형이 고정 커널보다 3% 이상 좋음. P3 D-markov가 nudging보다 5% 이상 좋고 2018–19와 2020 차이 < 5%. P4 행위자의 추가 이득 < 2%. P5 기억의 이득은 영역 마스크에서 가장 크고 확산을 끄면 절반 이상 사라짐. P6 학습된 τ(x)의 90/10 백분위 비 ≥ 2.
+
 ---
 
 ## 재현
 
 ```bash
+# 10단계 (N1 위; DATA2020 = 2017-12 .. 2021-01 ERA5)
+python scripts/train_dreamer.py --checkpoint runs/physics_n1/checkpoint.pt --config configs/dreamer_wb2.yaml \
+    --data-dir DATA2020 --out runs/stage10_D      # D-blind: --set dreamer.imagination=blind, D-noactor: dreamer.train_actor=false,
+                                                  # D-markov: memory.channels=0, D-fixed: memory.adaptive=false,
+                                                  # D-frozen: --checkpoint runs/stage10_Dnoactor/checkpoint.pt --set dreamer.train_model=false
+python scripts/eval_dreamer.py --checkpoint runs/stage10_D/checkpoint.pt --base runs/physics_n1/checkpoint.pt \
+    --config configs/dreamer_wb2.yaml --data-dir DATA2020 --out runs/stage10_D/eval_2020.json
 # 1단계
 python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA              # chain
 python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA \
