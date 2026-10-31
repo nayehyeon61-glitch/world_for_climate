@@ -206,3 +206,19 @@ def test_physics_model_rollout_and_gradients():
                 p -= 1e-2 * (p.grad if p.grad is not None else 0)
     grads = {n: p.grad.abs().sum().item() for n, p in n1.named_parameters() if p.grad is not None}
     assert grads["column.0.weight"] > 0 and grads["surface.0.weight"] > 0
+
+
+def test_evaluation_resumes_where_it_stopped(tmp_path):
+    from climate_wm import pipeline
+    layout, stats, data = _tiny()
+    model = _model(layout, stats, data, column=True)
+    cfg = {"eval": {"lead_steps": 2, "batch_size": 1, "climatology_window_days": 1}}
+    clim = pipeline.build_climatology(cfg, data)
+    idx = list(range(len(data)))
+    full = pipeline.evaluate(cfg, model, data, stats, clim, indices=idx)["metrics"]
+    path = str(tmp_path / "progress.pt")
+    pipeline.evaluate(cfg, model, data, stats, clim, indices=idx, progress_path=path, max_batches=1)
+    resumed = pipeline.evaluate(cfg, model, data, stats, clim, indices=idx, progress_path=path)["metrics"]
+    for name in ("model", "persistence"):
+        a, b = full[name].compute(), resumed[name].compute()
+        assert np.allclose(a["rmse"], b["rmse"]) and np.allclose(a["acc"], b["acc"], equal_nan=True)

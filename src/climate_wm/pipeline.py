@@ -279,7 +279,7 @@ def evaluate(cfg: dict, model: ClimateWorldModel, val_ds, stats: NormalizationSt
              climatology: Climatology, device="cpu", max_batches: Optional[int] = None,
              indices: Optional[Sequence[int]] = None,
              extra_forecasts: Optional[Dict[str, Callable]] = None,
-             log=None) -> Dict[str, object]:
+             log=None, progress_path: Optional[str] = None) -> Dict[str, object]:
     """GraphCast protocol on `val_ds`: lat-weighted RMSE (eq. 20/21) and ACC
     (eq. 29) in physical units for the model and the B0 baselines; CRPS /
     spread-skill for the ensemble.
@@ -287,6 +287,10 @@ def evaluate(cfg: dict, model: ClimateWorldModel, val_ds, stats: NormalizationSt
     `extra_forecasts` maps a name to fn(init_times [B] in s, lead) returning
     physical forecasts [B, L, C_tgt, H, W] (e.g. GraphCast from WeatherBench-2),
     scored on exactly the same initialisations and targets.
+
+    `progress_path`: the accumulated scores (and the random state) are saved
+    there after every batch, and an existing file is continued, so a long
+    evaluation survives being killed.
     """
     layout = val_ds.layout
     lead = cfg["eval"]["lead_steps"]
@@ -298,7 +302,15 @@ def evaluate(cfg: dict, model: ClimateWorldModel, val_ds, stats: NormalizationSt
              *(extra_forecasts or {}), "persistence", "climatology"]
     metrics = {name: GraphCastMetrics(layout.targets, val_ds.lat, hours) for name in names}
     ens = EnsembleMetrics(layout.targets, val_ds.lat, hours) if members > 1 else None
-    data = val_ds if indices is None else Subset(val_ds, list(indices))
+    order = list(range(len(val_ds))) if indices is None else list(indices)
+    done = 0
+    if progress_path is not None and os.path.exists(progress_path):
+        saved = torch.load(progress_path, weights_only=False)
+        metrics, ens, done = saved["metrics"], saved["ensemble"], saved["done"]
+        torch.set_rng_state(saved["rng"])
+        if log is not None:
+            log(f"[eval] resumed after {done}/{len(order)} initialisations")
+    data = Subset(val_ds, order[done:])
     loader = DataLoader(data, batch_size=cfg["eval"].get("batch_size", 2))
     model.eval()
     step_s = 6 * 3600
@@ -322,8 +334,13 @@ def evaluate(cfg: dict, model: ClimateWorldModel, val_ds, stats: NormalizationSt
         pers = persistence_forecast({k: v.cpu() for k, v in batch.items()}, layout, clim_norm)
         metrics["persistence"].update(stats.unnormalize(pers, layout.targets), target, clim)
         metrics["climatology"].update(clim, target, clim)
+        n = done + min((i + 1) * loader.batch_size, len(data))
+        if progress_path is not None:
+            torch.save({"metrics": metrics, "ensemble": ens, "done": n, "rng": torch.get_rng_state()},
+                       progress_path + ".tmp")
+            os.replace(progress_path + ".tmp", progress_path)
         if log is not None:
-            log(f"[eval] {min((i + 1) * loader.batch_size, len(data))}/{len(data)} initialisations")
+            log(f"[eval] {n}/{len(order)} initialisations")
     out = {"metrics": metrics}
     if ens is not None:
         out["ensemble"] = ens

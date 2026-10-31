@@ -76,6 +76,8 @@ def main():
                              "WB2 0.25 deg store on gs:// read lazily")
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
                         help="override the checkpoint config, e.g. data.val.start=2020-01-01")
+    parser.add_argument("--resume", action="store_true",
+                        help="save the scores after every batch (OUT.progress.pt) and continue from them")
     parser.add_argument("--coarsen", type=int, default=1,
                         help="coarsen the GraphCast forecasts to the model grid (4: 0.25 -> 1 deg)")
     args = parser.parse_args()
@@ -104,12 +106,13 @@ def main():
     usable = np.where(gc.available(inits))[0][::args.init_stride]
     print(f"{len(usable)} common initialisations "
           f"({val_ds.times[val_ds.indices[usable[0]]]} .. {val_ds.times[val_ds.indices[usable[-1]]]})")
+    out = args.out or os.path.join(cfg["output_dir"], "compare_graphcast.json")
+    progress = out + ".progress.pt" if args.resume else None
     results = pipeline.evaluate(cfg, model, val_ds, stats, clim, args.device,
                                 indices=usable, extra_forecasts={"graphcast": gc},
-                                log=print)
+                                log=print, progress_path=progress)
     metrics = results["metrics"]
     print(format_scorecard(metrics, "model", "graphcast"))
-    out = args.out or os.path.join(cfg["output_dir"], "compare_graphcast.json")
     pipeline.results_to_json(results, out)
     theirs = metrics["graphcast"].compute()
     index = {c.key: i for i, c in enumerate(layout.targets)}
@@ -126,6 +129,8 @@ def main():
                 }
     with open(out.replace(".json", "_summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
+    if progress is not None and os.path.exists(progress):
+        os.remove(progress)
     print(f"saved {out}")
 
 
