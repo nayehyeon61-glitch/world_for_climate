@@ -25,7 +25,7 @@ passes it through); `posterior` re-observes with it.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -45,6 +45,14 @@ SURFACE_VARS = ("2m_temperature", "mean_sea_level_pressure", "10m_u_component_of
                 "10m_v_component_of_wind", "total_precipitation_6hr")
 COLUMN_IN = ("temp", "q", "u", "v", "omega")
 DAY = 86400.0
+# cause analysis (eval/physics_causes.py): column-physics outputs per knock-out,
+# and the inputs a path cut can hold at a reference value (COLUMN_IN, the
+# lowest-level geopotential, the land-sea mask, the solar radiation)
+COLUMN_KNOCKS = {"heating": ("Q",), "moistening": ("S",), "momentum": ("F_u", "F_v"),
+                 "surface_pressure": ("P_b",)}
+PATH_INPUTS = COLUMN_IN + ("phib", "land", "sun")
+PATH_OUTPUTS = ("heating", "moistening", "momentum", "surface_pressure", "evaporation")
+
 # output scales per day: heating K, moistening kg/kg, momentum m/s, Phi_b m^2/s^2,
 # evaporation kg/m^2 (= mm)
 SCALES = {"Q": 10.0, "S": 2e-3, "F": 10.0, "P_b": 500.0, "E": 5.0}
@@ -140,6 +148,12 @@ class PhysicsWorldModel(nn.Module):
         self.register_buffer("static_std", torch.ones(len(layout.static)))
         self.register_buffer("forcing_mean", torch.zeros(len(layout.forcings)))
         self.register_buffer("forcing_std", torch.ones(len(layout.forcings)))
+        # interventions for the cause analysis (eval/physics_causes.py), not saved
+        self.column_knock: set = set()               # COLUMN_KNOCKS outputs set to zero
+        self.forcing_override: Dict[str, float] = {}  # forcing key -> physical value (e.g. TISR := 0)
+        # path cuts: PATH_OUTPUTS group (or "all") -> PATH_INPUTS it sees at their reference
+        # (the global-mean profile; no land; no sun) while the other outputs see the state
+        self.column_paths: Dict[str, Tuple[str, ...]] = {}
 
     # ------------------------------------------------------------ set-up
     def _indices(self, channels) -> Dict[str, object]:
@@ -217,6 +231,8 @@ class PhysicsWorldModel(nn.Module):
         t = np.asarray(times_s).astype("datetime64[s]")
         f = {"toa_incident_solar_radiation": forcing_lib.toa_incident_solar_radiation(t, lat, lon)}
         f.update(forcing_lib.time_forcings(t, lon, len(lat)))
+        for key, value in self.forcing_override.items():
+            f[key] = np.full_like(f[key], value)
         arr = np.stack([f[k] for k in self.forcing_keys], 1)
         x = torch.from_numpy(np.ascontiguousarray(arr)).to(self.mean.device)
         return (x - self.forcing_mean[:, None, None]) / self.forcing_std[:, None, None]
@@ -246,11 +262,22 @@ class PhysicsWorldModel(nn.Module):
         b = zb.shape[0]
         feats.append(self.sinlat_g[None, None, :, None].expand(b, 1, *zb.shape[-2:]))
         x = torch.cat(feats, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
+        if "all" in self.column_paths:
+            x = self._hold_inputs(x, self.column_paths["all"])
         y = self.column(x)
         mem = None
         if self.memory is not None and "mem" in state:
             mem = self.memory.update(state["mem"], x)
             y = y + self.memory.tendency(x, mem)
+        for group, inputs in self.column_paths.items():
+            if group != "all":
+                held = self._hold_inputs(x, inputs)
+                y_held = self.column(held)
+                if mem is not None:
+                    y_held = y_held + self.memory.tendency(held, mem)
+                j = self._path_outputs(group)
+                y = y.clone()
+                y[..., j] = y_held[..., j]
         y = y.permute(0, 3, 1, 2)  # [B, C_out, H, W]
         n = len(self.levels)
         per_s = 1.0 / DAY
@@ -270,9 +297,45 @@ class PhysicsWorldModel(nn.Module):
             evap = torch.nn.functional.softplus(y[:, 4 * n + 1]) * SCALES["E"] / DAY  # kg/m^2/s
             sink = (out["S"] * self.dp_layer[None, :, None, None]).sum(1) / GRAV
             out["precip"] = torch.relu(evap - sink)  # kg/m^2/s
+        for name in self.column_knock:  # after the budget: precipitation is still diagnosed
+            for key in COLUMN_KNOCKS[name]:
+                out[key] = torch.zeros_like(out[key])
         if mem is not None:
             out["mem"] = mem
         return out
+
+    def _hold_inputs(self, x: Tensor, inputs: Sequence[str]) -> Tensor:
+        """Column input [B, H, W, C] with the PATH_INPUTS `inputs` at their reference."""
+        n = len(self.levels)
+        x = x.clone()
+        for name in inputs:
+            if name in COLUMN_IN:
+                i = COLUMN_IN.index(name)
+                x[..., i * n:(i + 1) * n] = 0.0  # normalised: the global-mean profile
+            elif name == "phib":
+                x[..., 5 * n] = 0.0
+            elif name == "land":
+                j = self.static_keys.index("land_sea_mask")
+                x[..., 5 * n + 1 + j] = -self.static_mean[j] / self.static_std[j]
+            elif name == "sun":
+                if not self.cfg.column.use_forcings:
+                    raise ValueError("the column sees no forcings")
+                j = self.forcing_keys.index("toa_incident_solar_radiation")
+                x[..., 5 * n + 3 + j] = -self.forcing_mean[j] / self.forcing_std[j]
+            else:
+                raise ValueError(f"unknown path input {name!r} (known: {PATH_INPUTS})")
+        return x
+
+    def _path_outputs(self, group: str) -> list:
+        """Column output channels of a PATH_OUTPUTS group."""
+        n = len(self.levels)
+        budget = self.cfg.column.budget
+        groups = {"heating": list(range(n)), "moistening": list(range(n, 2 * n)),
+                  "momentum": list(range(2 * n, 4 * n)) + ([4 * n + 2] if budget else []),
+                  "surface_pressure": [4 * n], "evaporation": [4 * n + 1] if budget else []}
+        if group not in groups:
+            raise ValueError(f"unknown path output {group!r} (known: {PATH_OUTPUTS})")
+        return groups[group]
 
     def surface_correction(self, phys: Tensor, static: Tensor, forc: Optional[Tensor]) -> Tensor:
         """Normalised corrections [B, 5, H, W] for the single-level targets from the

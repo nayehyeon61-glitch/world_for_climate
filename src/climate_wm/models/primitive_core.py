@@ -40,6 +40,9 @@ EPS_V = 0.608  # T_v = T (1 + EPS_V q)
 
 FIELDS = ("zeta", "div", "temp", "q", "phib")
 TERMS = ("advection", "coriolis", "pgf", "adiabatic", "vertical", "moisture")
+# single coupling paths (eval/physics_causes.py): temp_advection = horizontal and
+# vertical advection of temperature only (the motion -> thermodynamics arrow)
+CUTS = ("temp_advection",)
 
 # IMEX SIL3 (Whitaker and Kar 2013): explicit and implicit tableaus (4 stages).
 SIL3_EX = ((0, 0, 0, 0), (1 / 3, 0, 0, 0), (1 / 6, 1 / 2, 0, 0), (1 / 2, -1 / 2, 1, 0))
@@ -64,12 +67,19 @@ class CoreConfig:
     # 1/surface_drag_days at the lowest level, linear in p/p_bottom down to 0 at 0.7
     surface_drag_days: float = 0.0
     terms: Tuple[str, ...] = TERMS   # knock-outs for the cause analysis
+    cuts: Tuple[str, ...] = ()       # CUTS switched off
+
+    def __post_init__(self):
+        unknown = set(self.cuts) - set(CUTS)
+        if unknown:
+            raise ValueError(f"unknown core cuts {sorted(unknown)} (known: {CUTS})")
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "CoreConfig":
         d = dict(d or {})
-        if "terms" in d:
-            d["terms"] = tuple(d["terms"])
+        for key in ("terms", "cuts"):
+            if key in d:
+                d[key] = tuple(d[key])
         return cls(**d)
 
 
@@ -197,9 +207,10 @@ class PrimitiveCore(nn.Module):
         # temperature
         tx, ty = sh.grad(temp)
         dtg = 0.0 * tg
-        if "advection" in on:
+        t_adv = "temp_advection" not in self.cfg.cuts
+        if "advection" in on and t_adv:
             dtg = dtg - (u * tx + v * ty)
-        if vert:
+        if vert and t_adv:
             dtg = dtg - om * self._lev(self.dp, tg)
         if "adiabatic" in on:
             dtg = dtg + KAPPA * tg * om / self.p[:, None, None]
