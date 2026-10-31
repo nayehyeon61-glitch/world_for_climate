@@ -111,7 +111,14 @@ def symexp(x: Tensor) -> Tensor:
 class MemoryController(TendencyController):
     """The stage 9 tendency controller, also reading the latest masked observation
     (low harmonics of the observed fields per variable group, and its age in
-    steps / 6) and the low harmonics of the memory."""
+    steps / 6) and the low harmonics of the memory.
+
+    `cfg.target = "memory"` (arm D-memctrl, 감자: adaptive memory through
+    control): the action does not touch the physical state. Per memory channel
+    it writes low harmonics (n <= cfg.mem_degree) into m and shifts ln tau for
+    the next 6 h, so the controller decides what the memory keeps and for how
+    long, and the physics sees it only through the memory's tendency term and
+    readout."""
 
     def __init__(self, model, cfg: TendencyControlConfig, diff_std=None):
         super().__init__(model, cfg, diff_std)
@@ -120,6 +127,27 @@ class MemoryController(TendencyController):
         self.in_dim += self.obs_dim + self.mem_channels * self.n_coef
         self.net[0] = nn.Linear(self.in_dim, cfg.hidden)
         self.last_obs: Optional[Tensor] = None  # [N, obs_dim], set by the game
+        if cfg.target == "memory":
+            if not self.mem_channels:
+                raise ValueError("control.target=memory needs a memory (memory.channels > 0)")
+            n = cfg.mem_degree
+            self.mem_coords = [(m, l, part) for m in range(n + 1) for l in range(m, n + 1)
+                               for part in ((0,) if m == 0 else (0, 1))]
+            self.n_action = 2 * self.mem_channels * len(self.mem_coords)  # write and ln tau per channel
+            self.net[-1] = nn.Linear(cfg.hidden, self.n_action)
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+
+    def apply(self, state: Dict[str, Tensor], action: Tensor) -> Dict[str, Tensor]:
+        if self.cfg.target != "memory":
+            return super().apply(state, action)
+        memory = self.model_ref[0].memory
+        sh = memory.sh_ref[0]
+        a = action.view(action.shape[0], 2, self.mem_channels, len(self.mem_coords))
+        like = sh.to_spec(state["mem"])
+        grid = lambda x, unit: sh.to_grid(self._from_low(x * unit, like, self.mem_coords))
+        memory.control_tau = grid(a[:, 1], self.cfg.mem_tau_unit)  # held for this step's updates
+        return dict(state, mem=state["mem"] + grid(a[:, 0], self.cfg.mem_write_unit))
 
     def observation_features(self, obs: Tensor, mask: Tensor) -> Tensor:
         """Masked observation (normalised dynamic fields [N, C_dyn, H, W], 1 = hidden) -> [N, obs_dim] (age 0)."""
@@ -210,6 +238,8 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
     acting = ctrl is not None and control
     if acting:
         ctrl.set_mask(mask)
+    if model.memory is not None:
+        model.memory.control_tau = None
     hidden, all_ = [], []
     try:
         state, ctx = model.begin(obs)
@@ -277,6 +307,8 @@ def play_memory(model, ctrl: Optional[MemoryController], batch, masks: Tensor, h
         if acting:
             ctrl.set_mask(None)
             ctrl.last_obs = None
+        if model.memory is not None:
+            model.memory.control_tau = None
     if not hidden:
         empty = mask.new_zeros(b * members, 0)
         return empty, empty
@@ -325,6 +357,8 @@ def imagine(model, ctrl: MemoryController, heads: Heads, start, mask: Tensor, ho
     finally:
         ctrl.set_mask(None)
         ctrl.last_obs = None
+        if model.memory is not None:
+            model.memory.control_tau = None
     return torch.stack(feats), torch.stack(acts), torch.stack(rews), torch.stack(conts)
 
 

@@ -33,8 +33,9 @@ def setup():
     return layout, data, base, model
 
 
-def _agent(model):
-    cfg = TendencyControlConfig(max_degree=2, layers=((500, 500), (850, 850)), hidden=8)
+def _agent(model, target="state"):
+    cfg = TendencyControlConfig(max_degree=2, layers=((500, 500), (850, 850)), hidden=8, target=target,
+                                mem_degree=1)
     torch.manual_seed(0)
     ctrl = MemoryController(model, cfg)
     ctrl.cost_weight = 1e-4
@@ -99,14 +100,15 @@ def test_lambda_returns():
     assert torch.allclose(ret[:, 0], torch.tensor([1 + 0.5 * (1 + 0.5 * 10), 1 + 0.5 * 10]))
 
 
-@pytest.mark.parametrize("arm", ["D", "D-blind", "D-noactor", "D-markov", "D-fixed", "D-frozen"])
+@pytest.mark.parametrize("arm", ["D", "D-blind", "D-noactor", "D-markov", "D-fixed", "D-frozen", "D-memctrl"])
 def test_dreamer_training_and_eval(setup, arm, tmp_path):
     layout, data, base, _ = setup
     memory = {"D-markov": None, "D-fixed": {"channels": 4, "hidden": 8, "adaptive": False}}.get(
         arm, {"channels": 4, "hidden": 8})
     model = _mem_model(layout, data.stats, data, memory)
     model.load_state_dict(base.state_dict(), strict=False)
-    ctrl, heads = _agent(model)
+    target = "memory" if arm == "D-memctrl" else "state"
+    ctrl, heads = _agent(model, target)
     cfg = DreamerConfig(steps=2, batch_size=1, horizon=2, imagine_horizon=2, members=2, obs_prob=1.0,
                         log_every=1, warmup_steps=0, train_actor=arm != "D-noactor",
                         train_model=arm != "D-frozen", imagination="blind" if arm == "D-blind" else "snapshot")
@@ -121,7 +123,7 @@ def test_dreamer_training_and_eval(setup, arm, tmp_path):
         assert np.isfinite(hist[-1]["loss_actor"]) and hist[-1]["return_scale"] is not None
     # resuming from the first save repeats the second iteration
     model2 = _mem_model(layout, data.stats, data, memory)
-    ctrl2, heads2 = _agent(model2)
+    ctrl2, heads2 = _agent(model2, target)
     hist2 = train_dreamer(model2, ctrl2, heads2, loader, cfg, progress=saved[0])
     assert len(hist2) == 2 and abs(hist2[1]["hidden"] - hist[1]["hidden"]) < 1e-5
     res = evaluate_memory_game(model, ctrl if cfg.train_actor else None, base, data, [0, 1], ["region"], 2,
@@ -153,3 +155,31 @@ def test_blowups_are_cut_or_capped(setup, monkeypatch):
     one = {k: v[1:] for k, v in batch.items()}
     h, a = play_memory(model, None, one, masks[1:], 2, truncate=True)
     assert h.shape == (1, 1) and torch.isfinite(h).all()
+
+
+def test_memory_control_acts_only_through_the_memory(setup):
+    layout, data, base, model = setup
+    ctrl, _ = _agent(model, "memory")
+    assert ctrl.n_action == 2 * model.memory.cfg.channels * 4  # write and ln tau, (1 + 1)^2 harmonics
+    batch = {k: v[None] for k, v in data[0].items()}
+    masks = torch.zeros(1, len(layout.dynamic), len(data.lat), len(data.lon))
+    masks[:, :, :2] = 1.0
+    with torch.no_grad():  # zero-initialised: the same game as without control
+        h1, _ = play_memory(model, ctrl, batch, masks, 2, obs_prob=1.0, gen=torch.Generator().manual_seed(1))
+        h0, _ = play_memory(model, ctrl, batch, masks, 2, control=False, obs_prob=1.0,
+                            gen=torch.Generator().manual_seed(1))
+    assert torch.allclose(h1, h0) and model.memory.control_tau is None
+    state, ctx = model.begin(batch)
+    action = torch.zeros(1, ctrl.n_action)
+    action[0, 0] = 1.0                    # write: channel 0, (n, m) = (0, 0)
+    action[0, ctrl.n_action // 2] = 1.0   # ln tau: channel 0, (0, 0)
+    out = ctrl.apply(state, action)
+    d = (out["mem"] - state["mem"])
+    assert d[0, 0].abs().min() > 0 and d[0, 1:].abs().max() == 0  # uniform write into channel 0 only
+    assert all(torch.equal(out[k], state[k]) for k in state if k != "mem")
+    k = model.memory.cfg.channels
+    x = torch.zeros(1, *state["mem"].shape[2:], model.memory.tend[0].in_features - k)
+    shifted = model.memory.tau(x)
+    model.memory.control_tau = None
+    ratio = shifted / model.memory.tau(x)  # [1, H, W, K]
+    assert (ratio[..., 0] > 1).all() and torch.allclose(ratio[..., 1:], torch.ones(1))

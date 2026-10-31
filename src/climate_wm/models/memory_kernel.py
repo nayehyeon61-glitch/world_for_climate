@@ -87,18 +87,25 @@ class MemoryKernel(nn.Module):
         self.read = _net(k, h, n_dyn)                  # R: hidden-point restart correction
         self.kappa = nn.Parameter(torch.full((k,), -3.0))  # softplus: diffusion per update at n = trunc
         self.knock: set = set()                        # evaluation knock-outs (KNOCKOUTS)
+        self.control_tau: Optional[Tensor] = None      # [B, K, H, W] shift of ln tau set by a memory
+                                                       # controller for the current step (stage 10 D-memctrl)
         self.track: Optional[list] = None              # set to a list: log10 tau (hours) per update,
                                                        # zonal means [H], quantiles 10/50/90 over all
                                                        # channels [3] and per channel [K * 3]
 
     # ---------------------------------------------------------------- kernel
     def tau(self, x: Tensor) -> Tensor:
-        """Timescales [B, H, W, K] in seconds for column features x [B, H, W, F]."""
+        """Timescales [B, H, W, K] in seconds for column features x [B, H, W, F]
+        (with a controller's shift `control_tau`, clipped to e^{+-4})."""
         if not self.cfg.adaptive:
-            return torch.exp(self.log_tau0 + self.log_tau).expand(*x.shape[:-1], -1)
-        if "adaptive" in self.knock:
-            return torch.exp(self.log_tau0).expand(*x.shape[:-1], -1)
-        return torch.exp(self.log_tau0 + 2.0 * torch.tanh(self.rate(x)))  # within e^{+-2} of tau0
+            log = (self.log_tau0 + self.log_tau).expand(*x.shape[:-1], -1)
+        elif "adaptive" in self.knock:
+            log = self.log_tau0.expand(*x.shape[:-1], -1)
+        else:
+            log = self.log_tau0 + 2.0 * torch.tanh(self.rate(x))  # within e^{+-2} of tau0
+        if self.control_tau is not None:
+            log = log + self.control_tau.clamp(-4.0, 4.0).permute(0, 2, 3, 1)
+        return torch.exp(log)
 
     def update(self, m: Tensor, x: Tensor) -> Tensor:
         """One step of the recurrence (one column-physics call)."""

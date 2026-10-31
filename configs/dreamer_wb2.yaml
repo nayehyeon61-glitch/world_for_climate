@@ -10,6 +10,11 @@
 #                  D-markov   memory.channels=0
 #                  D-fixed    memory.adaptive=false
 #                  D-frozen   dreamer.train_model=false  (--checkpoint runs/stage10_Dnoactor/checkpoint.pt)
+#                  D-memctrl  control.target=memory      (the actor acts only on the adaptive memory)
+#                  D-frozen-memctrl  control.target=memory dreamer.train_model=false
+#                                                        (--checkpoint runs/stage10_Dnoactor/checkpoint.pt)
+#   staged training = N1 (physical memory) -> D-noactor (adaptive memory) -> D-frozen[-memctrl] (RL);
+#   D and D-memctrl alternate the updates instead
 #   python scripts/eval_dreamer.py --checkpoint runs/stage10_D/checkpoint.pt \
 #       --base runs/physics_n1/checkpoint.pt --config configs/dreamer_wb2.yaml --data-dir DATA --out ...
 data:
@@ -61,3 +66,7 @@ control:                # the stage 9 controller (configs/physics_game_wb2.yaml)
   action_scale: 0.2
   use_state: true
   control_cost: 1.0e-4
+  target: state         # memory: write into m and shift ln tau per channel (n <= mem_degree), not the state
+  mem_degree: 2
+  mem_write_unit: 0.2
+  mem_tau_unit: 0.5

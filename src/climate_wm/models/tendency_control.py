@@ -42,10 +42,19 @@ class TendencyControlConfig:
     control_cost: float = 1e-4    # weight of 1/2 |a|^2 in the training reward
     max_horizon: int = 8
     seed: int = 0
+    # stage 10 (train/dreamer_game.MemoryController): "state" nudges the physical state as above;
+    # "memory" acts only on the adaptive memory: per channel, low harmonics (n <= mem_degree) of a
+    # write into m and of a shift of log tau for the next 6 h (the physics sees it through m)
+    target: str = "state"
+    mem_degree: int = 2
+    mem_write_unit: float = 0.2   # change of m per action unit (m is O(1))
+    mem_tau_unit: float = 0.5     # shift of ln tau per action unit
 
     def __post_init__(self):
         self.fields = tuple(self.fields)
         self.layers = tuple(tuple(l) for l in self.layers)
+        if self.target not in ("state", "memory"):
+            raise ValueError("control target must be state or memory")
 
 
 class TendencyController(nn.Module):
@@ -128,10 +137,10 @@ class TendencyController(nn.Module):
         r = torch.view_as_real(c)
         return torch.stack([r[..., m, l, part] for m, l, part in self.coords], -1)
 
-    def _from_low(self, x: Tensor, like: Tensor) -> Tensor:
+    def _from_low(self, x: Tensor, like: Tensor, coords=None) -> Tensor:
         """Real vector [..., n_coef] -> complex coefficients shaped like `like` (zero elsewhere)."""
         r = torch.zeros(like.shape + (2,), dtype=x.dtype, device=x.device)
-        for j, (m, l, part) in enumerate(self.coords):
+        for j, (m, l, part) in enumerate(coords or self.coords):
             r[..., m, l, part] = x[..., j]
         return torch.view_as_complex(r)
 
