@@ -9,7 +9,7 @@
 | 3 | World Theory Model: 6시간 변화를 so(3) 원시 연산의 짧은 프로그램으로 설명 (Learning-to-Theorize) | 완료: 1차(VQ-Lie vs 연속), 2차(잔차 physics 코드 미지지, 2020 불변성 확인) | `stage3_theory/` |
 | 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 완료: P·P−skip 2018 GraphCast 비교, 예측 1–3 판정(1 미지지, 2 부분, 3 P 미지지·P−skip 형식상 지지) | `stage4_pyramid/` |
 | 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | G1 완료(P1 미지지), 원인 분석(자동부호화기 바닥 = skip dropout, P−nodrop으로 확인; denoiser 잡음), G2 학습 중, G3 보류 | `stage5_causal_lie/` |
-| 6 | 쉘 그래프 결합: 쉘 사이의 사슬(s±1) 연결을 학습된 쉘 그래프로 바꾸고, 같은 패치의 쉘 생성원도 그래프로 결합 | 구현 완료, H1·H2 학습 대기(G2 뒤), H0 = P−nodrop | `stage6_shell_graph/` |
+| 6 | 쉘 그래프 결합: 쉘 사이의 사슬(s±1) 연결을 학습된 쉘 그래프로 바꾸고, 같은 패치의 쉘 생성원도 그래프로 결합 | 구현 완료, 7단계 뒤 H1만 학습(H2 = Lie 생성원 결합은 보류, 10/31 결정), H0 = P−nodrop | `stage6_shell_graph/` |
 | 7 | 예측 게임과 GNN feature 제어: 학습된 물리 예측 모델을 고정하고, 마스킹된 데이터를 예측하는 게임에서 GNN feature를 조절하는 작은 제어기만 보상으로 학습한 뒤 전체를 시험 (Ha의 World Models) | 구현 완료, C1·C1-grad·C1-open 학습 대기(G2 뒤) | `stage7_prediction_game/` |
 
 ---
