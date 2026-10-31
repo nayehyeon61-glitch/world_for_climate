@@ -26,7 +26,8 @@ model:
   type: physics
   carry_residual: true
   grad_checkpoint: true
-  core: {trunc: 42, nlat: 64, nlon: 128, dt_minutes: 20.0, diffusion_order: 4, diffusion_hours: 3.0}
+  core: {trunc: 42, nlat: 64, nlon: 128, dt_minutes: 20.0, diffusion_order: 4, diffusion_hours: 3.0,
+         surface_drag_days: 1.0}  # boundary-layer friction, as in configs/physics_wb2.yaml
   column: {enabled: true, hidden: 256, layers: 3, call_minutes: 60.0, budget: true, use_forcings: true}
 
 train:

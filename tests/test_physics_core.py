@@ -124,6 +124,22 @@ def test_core_gravity_waves_stay_bounded(core):
     assert torch.isfinite(u).all() and u.abs().max() < 30 and v.abs().max() < 30
 
 
+def test_boundary_layer_drag():
+    c = pc.PrimitiveCore(pc.CoreConfig(trunc=10, nlat=16, nlon=32, surface_drag_days=1.0,
+                                       terms=("pgf",)), LEVELS, T_REF)
+    sigma = np.array(LEVELS) / LEVELS[-1]
+    expect = np.clip((sigma - 0.7) / 0.3, 0, None) / 86400.0
+    assert np.allclose(c.drag.numpy(), expect) and c.drag[-1] * 86400 == 1 and (c.drag[:9] == 0).all()
+    sh = c.sh
+    zeta = torch.zeros(1, len(LEVELS), sh.trunc + 1, sh.trunc + 1, dtype=torch.complex64)
+    zeta[0, :, 0, 1] = 1e-5  # solid-body rotation at every level
+    temp = sh.to_spec(torch.tensor(T_REF, dtype=torch.float32)[None, :, None, None].expand(1, len(LEVELS), 16, 32).contiguous())
+    st = {"zeta": zeta, "div": torch.zeros_like(zeta), "temp": temp, "q": torch.zeros_like(temp),
+          "phib": torch.zeros_like(temp[:, 0])}
+    dz = c.tendencies(st)["zeta"][0, :, 0, 1]
+    assert torch.allclose(dz.real, -c.drag * 1e-5, atol=1e-13)  # only the drag acts on the rotation
+
+
 def test_core_term_knockouts_build_and_run():
     for term in pc.TERMS:
         terms = tuple(t for t in pc.TERMS if t != term)

@@ -60,6 +60,9 @@ class CoreConfig:
     diffusion_hours: float = 3.0     # e-folding time at n = trunc
     divergence_damping_hours: float = 0.0  # extra del^2 damping of D at n = trunc (0: off)
     surface_mass: bool = True        # column mass convergence moves Phi_b
+    # Rayleigh friction of the boundary layer (Held and Suarez 1994): rate
+    # 1/surface_drag_days at the lowest level, linear in p/p_bottom down to 0 at 0.7
+    surface_drag_days: float = 0.0
     terms: Tuple[str, ...] = TERMS   # knock-outs for the cause analysis
 
     @classmethod
@@ -140,6 +143,10 @@ class PrimitiveCore(nn.Module):
         ddamp = (self.dt / (cfg.divergence_damping_hours * 3600.0) * lam
                  if cfg.divergence_damping_hours > 0 else 0 * lam)
         buf("div_damping", np.exp(-ddamp))
+        sigma = p / p[-1]
+        drag = (np.clip((sigma - 0.7) / 0.3, 0, None) / (cfg.surface_drag_days * 86400.0)
+                if cfg.surface_drag_days > 0 else 0 * sigma)
+        buf("drag", drag)
 
     # ----------------------------------------------------------- helpers
     def _lev(self, mat: Tensor, x: Tensor) -> Tensor:
@@ -173,6 +180,9 @@ class PrimitiveCore(nn.Module):
         if vert:
             au = au - om * self._lev(self.dp, u)
             av = av - om * self._lev(self.dp, v)
+        if self.cfg.surface_drag_days > 0:
+            au = au - self.drag[:, None, None] * u
+            av = av - self.drag[:, None, None] * v
         if forcing is not None:
             au = au + forcing.get("F_u", 0.0)
             av = av + forcing.get("F_v", 0.0)

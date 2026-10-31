@@ -39,6 +39,8 @@ model:
     dt_minutes: 30.0
     diffusion_order: 4
     diffusion_hours: 3.0
+    surface_drag_days: 1.0  # boundary-layer Rayleigh friction (Held-Suarez); without it 3 of 31
+                            # 2018 inits blew up at 1000 hPa (high-latitude winter) within 48-66 h
   column:
     enabled: true
     hidden: 256
