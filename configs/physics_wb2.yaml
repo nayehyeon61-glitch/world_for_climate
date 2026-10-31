@@ -3,6 +3,12 @@
 # Train: python scripts/train_physics.py --config configs/physics_wb2.yaml --data-dir DATA
 # Compare: python scripts/compare_graphcast.py --checkpoint runs/physics_n1/checkpoint.pt --data-dir DATA
 # N0 (core only): --set model.column.enabled=false train.steps=0 output_dir=runs/physics_n0
+# Width arms (extension): --set model.column.hidden=512 output_dir=runs/physics_n1_w2
+#                         --set model.column.hidden=1024 output_dir=runs/physics_n1_w4
+# Cause ablations: model.column.budget=false (no water budget / drag structure),
+#   train.rollout_schedule=[[0,1]] (one-step training), model.column.use_forcings=false;
+#   eval-time core-term knock-outs: --set model.core.terms=[advection,coriolis,pgf,adiabatic,moisture]
+# Larger grids: configs/physics_wb2_1p5deg.yaml (T42), configs/physics_era5_1deg.yaml (T119, cluster).
 experiment: physics_n1
 output_dir: runs/physics_n1
 

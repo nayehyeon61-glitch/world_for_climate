@@ -1,0 +1,45 @@
+# Stage 9 (N3): the stage 7 prediction game on the frozen physics model (N1),
+# with a World-Models controller C (Ha and Schmidhuber 2018) that nudges the
+# physical state in low spherical harmonics (models/tendency_control.py).
+#   base model: runs/physics_n1 (trained on 2015-2017)
+#   game (controller training): 2018-2019        held-out test: 2020
+# data_dir holds era5.zarr (2017-12 .. 2021-01), as for configs/game_wb2.yaml.
+#
+#   python scripts/play_game.py --checkpoint runs/physics_n1/checkpoint.pt \
+#       --config configs/physics_game_wb2.yaml --data-dir DATA --mode rl --out runs/physics_n3
+#   python scripts/play_game.py ... --mode grad --out runs/physics_n3_grad     # exact gradient through the core
+#   python scripts/play_game.py ... --set control.use_state=false --out runs/physics_n3_open
+#   python scripts/eval_game.py --checkpoint runs/physics_n1/checkpoint.pt \
+#       --config configs/physics_game_wb2.yaml --data-dir DATA N3=runs/physics_n3/controller.pt ...
+data:
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2017-12-01", "2021-01-15"]
+  train: {start: "2018-01-01T06:00", end: "2019-12-31T18:00"}
+  val: {start: "2020-01-01", end: "2020-12-31T12:00"}
+eval:
+  climatology_zarr: "{data_dir}/climatology.zarr"
+
+game:                   # identical to stage 7 (configs/game_wb2.yaml)
+  mode: rl
+  steps: 100
+  batch_size: 2
+  lr: 1.0e-3
+  warmup_steps: 10
+  members: 4
+  explore: 0.5
+  horizon: 6
+  mask_kinds: [variables, shell, region]
+  mask_rate: 1.0
+  region_fraction: 0.25
+  obs_prob: 0.5
+  masked_weight: 0.5
+  log_every: 10
+
+control:
+  max_degree: 4         # (4 + 1)^2 = 25 coefficients per field and layer
+  fields: [temp, zeta, q, phib]
+  layers: [[850, 1000], [500, 700], [200, 400], [50, 150]]
+  hidden: 64
+  action_scale: 0.1
+  use_state: true       # false: open loop
+  control_cost: 1.0e-4  # 1/2 |a|^2 per step in the training reward (0: the no-cost ablation)

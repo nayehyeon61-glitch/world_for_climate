@@ -1,0 +1,51 @@
+# Stage 9 extension: the physics-centred world model on WeatherBench-2 ERA5 at
+# 1.5 deg (240 x 121, with poles): T42 core on a quadratic Gaussian grid (64 x 128),
+# 20 min steps. Data (its own directory):
+#   python scripts/download_weatherbench2.py --grid 240x121 --out DATA_1P5 --start 2015-01-01 --end 2019-01-15
+#   python scripts/train_physics.py --config configs/physics_wb2_1p5deg.yaml --data-dir DATA_1P5 --resume
+experiment: physics_1p5deg
+output_dir: runs/physics_1p5deg
+
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2015-01-01", "2019-01-15"]
+  load_into_memory: false
+  train: {start: "2015-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 256
+  stats_path: "{data_dir}/stats_physics.json"
+
+task:
+  name: graphcast_13
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null
+
+model:
+  type: physics
+  carry_residual: true
+  grad_checkpoint: true
+  core: {trunc: 42, nlat: 64, nlon: 128, dt_minutes: 20.0, diffusion_order: 4, diffusion_hours: 3.0}
+  column: {enabled: true, hidden: 256, layers: 3, call_minutes: 60.0, budget: true, use_forcings: true}
+
+train:
+  batch_size: 1
+  num_workers: 2
+  steps: 2000
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 50
+  grad_clip: 1.0
+  log_every: 10
+  save_every: 25
+  rollout_schedule: [[0, 1], [300, 2], [900, 4]]
+  stages:
+    - {name: physics, steps: 2000, rollout_steps: 4}
+
+eval:
+  lead_steps: 20
+  members: 1
+  batch_size: 1
+  init_hours: [0, 12]
+  climatology_zarr: "{data_dir}/climatology.zarr"

@@ -280,75 +280,92 @@ class PhysicsWorldModel(nn.Module):
                 obs[:, kt] = x[:, kd]
         return state, obs
 
-    def forward_rollout(self, batch: Dict[str, Tensor], steps: int, controller=None) -> Tensor:
-        """Normalised predictions [B, L, C, H, W] (differentiable).
-
-        `controller(k, state, info)` may return a dict of spectral increments
-        added to the state after each 6 h step (stage 9 arm N3)."""
-        core, cc = self.core, self.cfg.column
-        state, obs = self.initial_state(batch)
-        diag0 = self.diagnose(state)
-        resid = obs - diag0 if self.cfg.carry_residual else torch.zeros_like(obs)
+    def carried_residual(self, state, obs: Tensor) -> Tensor:
+        """obs - diagnosis of the initial state (zero for omega and precipitation)."""
+        if not self.cfg.carry_residual:
+            return torch.zeros_like(obs)
+        resid = obs - self.diagnose(state)
         tp = self.tgt["surface"][4]
         if tp >= 0:
             resid[:, tp] = 0.0  # precipitation is accumulated, never carried
         if self.tgt["omega"] is not None:
             resid[:, self.tgt["omega"]] = 0.0  # diagnosed omega: carrying adds noise (checked)
+        return resid
+
+    def begin(self, batch: Dict[str, Tensor]):
+        """Initial state and the rollout context of a batch."""
+        state, obs = self.initial_state(batch)
+        static = ((batch["static"] - self.static_mean[:, None, None]) / self.static_std[:, None, None])
+        ctx = {"resid": self.carried_residual(state, obs), "static": static,
+               "static_g": self._to_gauss(static) if self.column is not None else None,
+               "init": batch["init_time"].cpu().numpy().astype(np.int64),
+               "forcings_tgt": batch.get("forcings_tgt")}
+        return state, ctx
+
+    def reobserve(self, ctx, inputs: Tensor):
+        """Restarts from observed (normalised dynamic) fields [B, C_dyn, H, W]."""
+        state, obs = self.initial_state({"inputs": inputs[:, None]})
+        ctx["resid"] = self.carried_residual(state, obs)
+        return state
+
+    def advance(self, state, ctx, k: int):
+        """Integrates lead k -> k + 1 (6 h). Returns the state and the data-grid
+        precipitation of the step (None without the water budget)."""
+        core, cc = self.core, self.cfg.column
         nsub = int(round(360.0 / core.cfg.dt_minutes))
         call_every = max(1, int(round(cc.call_minutes / core.cfg.dt_minutes)))
-        init = batch["init_time"].cpu().numpy().astype(np.int64)
-        static = ((batch["static"] - self.static_mean[:, None, None]) / self.static_std[:, None, None])
-        static_g = self._to_gauss(static) if self.column is not None else None
-        use_f = self.column is not None and cc.use_forcings
+        forc_g = None
+        if self.column is not None and cc.use_forcings:
+            calls = np.arange(0, nsub, call_every)
+            times = ctx["init"][:, None] + 21600 * k + (calls * core.cfg.dt_minutes * 60)[None]
+            forc_g = torch.stack([self._forcing_grid(t) for t in times])  # [B, n_calls, 5, H, W]
+        keys = list(state)
+
+        def six_hours(*flat):
+            st = dict(zip(keys, flat))
+            precip = 0.0
+            forcing = None
+            for j in range(nsub):
+                if self.column is not None and j % call_every == 0:
+                    fg = forc_g[:, j // call_every] if forc_g is not None else None
+                    forcing = self.column_forcing(st, ctx["static_g"], fg)
+                    if "precip" in forcing:
+                        precip = precip + forcing["precip"] * cc.call_minutes * 60.0 / 1000.0  # m
+                st = core.step(st, forcing)
+            p = precip if torch.is_tensor(precip) else torch.zeros_like(st["temp"].real[:, 0, :1, :1])
+            return tuple(st[key] for key in keys) + (p,)
+
+        flat = tuple(state[key] for key in keys)
+        if self.cfg.grad_checkpoint and torch.is_grad_enabled():
+            out = checkpoint(six_hours, *flat, use_reentrant=False)
+        else:
+            out = six_hours(*flat)
+        precip = out[-1]
+        precip_d = None
+        if precip.shape[-1] > 1:
+            precip_d = core.sh.to_grid(core.sh.to_spec(precip), data=True)
+        return dict(zip(keys, out[:-1])), precip_d
+
+    def predict(self, state, ctx, k: int, precip_d: Optional[Tensor] = None) -> Tensor:
+        """Normalised target-layout forecast [B, C, H, W] of lead k + 1."""
+        cc = self.cfg.column
+        phys = self.diagnose(state, precip_d) + ctx["resid"]
+        norm = (phys - self.mean[:, None, None]) / self.std[:, None, None]
+        if self.surface is not None:
+            fd = ctx["forcings_tgt"][:, k] if cc.use_forcings else None
+            corr = self.surface_correction(phys, ctx["static"], fd)
+            for j, c in enumerate(self.tgt["surface"]):
+                if c >= 0 and (j < 4 or not cc.budget):
+                    norm[:, c] = norm[:, c] + corr[:, j]
+        return norm
+
+    def forward_rollout(self, batch: Dict[str, Tensor], steps: int) -> Tensor:
+        """Normalised predictions [B, L, C, H, W] (differentiable)."""
+        state, ctx = self.begin(batch)
         preds = []
         for k in range(steps):
-            calls = [j for j in range(nsub) if j % call_every == 0]
-            forc_g = None
-            if use_f:
-                times = init[:, None] + 21600 * k + (np.asarray(calls) * core.cfg.dt_minutes * 60)[None]
-                forc_g = torch.stack([self._forcing_grid(t) for t in times])  # [B, n_calls, 5, H, W]
-
-            def six_hours(*flat, k=k, forc_g=forc_g):
-                st = dict(zip(keys, flat))
-                precip = 0.0
-                forcing = None
-                for j in range(nsub):
-                    if self.column is not None and j % call_every == 0:
-                        fg = forc_g[:, j // call_every] if forc_g is not None else None
-                        forcing = self.column_forcing(st, static_g, fg)
-                        if "precip" in forcing:
-                            precip = precip + forcing["precip"] * cc.call_minutes * 60.0 / 1000.0  # m
-                    st = core.step(st, forcing)
-                p = precip if torch.is_tensor(precip) else torch.zeros_like(st["temp"].real[:, 0, :1, :1])
-                return tuple(st[key] for key in keys) + (p,)
-
-            keys = list(state)
-            flat = tuple(state[key] for key in keys)
-            if self.cfg.grad_checkpoint and torch.is_grad_enabled():
-                out = checkpoint(six_hours, *flat, use_reentrant=False)
-            else:
-                out = six_hours(*flat)
-            state = dict(zip(keys, out[:-1]))
-            precip_g = out[-1]
-            if controller is not None:
-                inc = controller(k, state, {"batch": batch, "obs": obs})
-                if inc:
-                    state = {key: state[key] + inc.get(key, 0.0) for key in keys}
-            precip_d = None
-            if torch.is_tensor(precip_g) and precip_g.shape[-1] > 1:
-                precip_d = self.core.sh.to_grid(self.core.sh.to_spec(precip_g), data=True)
-            phys = self.diagnose(state, precip_d) + resid
-            norm = (phys - self.mean[:, None, None]) / self.std[:, None, None]
-            if self.surface is not None:
-                fd = None
-                if use_f:
-                    fd = batch["forcings_tgt"][:, k]
-                corr = self.surface_correction(phys, static, fd)
-                sk = self.tgt["surface"]
-                for j, c in enumerate(sk):
-                    if c >= 0 and (j < 4 or not cc.budget):
-                        norm[:, c] = norm[:, c] + corr[:, j]
-            preds.append(norm)
+            state, precip = self.advance(state, ctx, k)
+            preds.append(self.predict(state, ctx, k, precip))
         return torch.stack(preds, 1)
 
     @torch.no_grad()

@@ -1,0 +1,57 @@
+# Stage 9 extension: the physics-centred world model at 1 deg on the cluster
+# (Lustre hourly ERA5 coarsened 0.25 -> 1 deg on the fly, one 96 GB GPU).
+# Same code as configs/physics_wb2.yaml with a T119 core on a quadratic Gaussian
+# grid (180 x 360) and 10 min steps (advective limit at T119 with 100 m/s jets).
+# The archive has no vertical velocity (task graphcast_13_no_w: omega is
+# diagnosed, not verified) and no static fields: put geopotential_at_surface and
+# land_sea_mask next to it as configured in configs/era5_lustre_hourly.yaml.
+#   python scripts/train_physics.py --config configs/physics_era5_1deg.yaml --device cuda --resume
+#   python scripts/compare_graphcast.py --checkpoint runs/physics_1deg/checkpoint.pt \
+#       --graphcast gs://weatherbench2/datasets/graphcast/2018/date_range_2017-11-16_2019-02-01_12_hours_derived.zarr --coarsen 4
+experiment: physics_1deg
+output_dir: runs/physics_1deg
+
+data:
+  source: era5_hourly
+  era5_config: configs/era5_lustre_hourly.yaml
+  archive: {coarsen: 4}                     # 721 x 1440 -> 181 x 360
+  time_range: ["1979-01-01", "2019-01-15"]
+  train: {start: "1979-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 1024
+  stats_workers: 16
+  stats_path: runs/physics_1deg/stats.json
+
+task:
+  name: graphcast_13_no_w
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null
+
+model:
+  type: physics
+  carry_residual: true
+  grad_checkpoint: true
+  core: {trunc: 119, nlat: 180, nlon: 360, dt_minutes: 10.0, diffusion_order: 4, diffusion_hours: 3.0}
+  column: {enabled: true, hidden: 512, layers: 4, call_minutes: 60.0, budget: true, use_forcings: true}
+
+train:
+  batch_size: 4
+  num_workers: 16
+  steps: 20000
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 500
+  grad_clip: 1.0
+  log_every: 50
+  save_every: 250
+  rollout_schedule: [[0, 1], [4000, 2], [10000, 4], [16000, 8]]
+  stages:
+    - {name: physics, steps: 20000, rollout_steps: 8}
+
+eval:
+  lead_steps: 40
+  members: 1
+  batch_size: 2
+  init_hours: [0, 12]
+  climatology_zarr: gs://weatherbench2/datasets/era5-hourly-climatology/1990-2019_6h_1440x721.zarr

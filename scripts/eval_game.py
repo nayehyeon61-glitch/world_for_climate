@@ -10,6 +10,8 @@ model (no_control), the controller's actions at shuffled places
 (random_control) and the controller without its diagnostics (no_diag) play
 the same episodes, so changes are paired over initialisations. The unmasked
 6-72 h forecast of the same arms comes from scripts/eval_causes.py --controller.
+A physics checkpoint (stage 9) is played with its tendency controllers; no_diag
+then hides the state from the controller.
 """
 
 import argparse
@@ -22,7 +24,9 @@ import torch
 
 from climate_wm import pipeline
 from climate_wm.data.era5_lazy_loader import GraphCastWindowDataset
+from climate_wm.models import tendency_control
 from climate_wm.models.feature_control import load_controller
+from climate_wm.train.physics_game import play_physics
 from climate_wm.train.prediction_game import CONTROL_VARIANTS, GameConfig, evaluate_game
 
 
@@ -58,11 +62,15 @@ def main():
     for item in args.controllers:
         name, path = item.split("=", 1)
         saved = torch.load(path, map_location=args.device, weights_only=False)
-        ctrl = load_controller(model, test.lat, test.lon, saved["controller"], stats)
+        physics = cfg["model"].get("type") == "physics"
+        if physics:
+            ctrl = tendency_control.load_controller(model, saved["controller"])
+        else:
+            ctrl = load_controller(model, test.lat, test.lon, saved["controller"], stats)
         res = evaluate_game(model, ctrl, test, indices, args.kinds, gc.horizon, args.device,
                             region_fraction=gc.region_fraction,
                             variants=["no_control", *[v for v in args.variants if v != "no_control"]],
-                            obs_prob=gc.obs_prob, log=print)
+                            obs_prob=gc.obs_prob, log=print, play_fn=play_physics if physics else None)
         res.update(controller=path, history=saved.get("history", []))
         out["arms"][name] = res
         for kind, r in res["kinds"].items():

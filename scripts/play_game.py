@@ -4,6 +4,10 @@
         --config configs/game_wb2.yaml --data-dir DATA --mode rl --out runs/game_c1
     python scripts/play_game.py ... --mode grad --out runs/game_c1_grad   # the gradient control
 
+Stage 9 (N3): a physics checkpoint (model.type: physics) gets the tendency
+controller of models/tendency_control.py and the same game on the physics model
+(configs/physics_game_wb2.yaml).
+
 Only the controller learns (climate_wm.train.prediction_game); the world model
 checkpoint is not changed. Writes controller.pt and game_history.json.
 """
@@ -17,7 +21,9 @@ from torch.utils.data import DataLoader
 
 from climate_wm import pipeline
 from climate_wm.data.era5_lazy_loader import GraphCastWindowDataset
+from climate_wm.models import tendency_control
 from climate_wm.models.feature_control import ControlConfig, FeatureController, controller_state
+from climate_wm.train.physics_game import play_physics
 from climate_wm.train.prediction_game import GameConfig, train_controller
 
 
@@ -39,7 +45,9 @@ def main():
     cfg["control"] = dict(update.get("control", {}))
     cfg["output_dir"] = args.out
     pipeline.apply_overrides(cfg, args.set)
-    gc, cc = GameConfig(**cfg["game"]), ControlConfig(**cfg["control"])
+    physics = cfg["model"].get("type") == "physics"
+    gc = GameConfig(**cfg["game"])
+    cc = (tendency_control.TendencyControlConfig if physics else ControlConfig)(**cfg["control"])
     torch.manual_seed(gc.seed)
 
     layout = pipeline.build_layout(cfg)
@@ -49,9 +57,17 @@ def main():
           f"{data.times[data.indices[-1]]}), mode={gc.mode}")
     model = pipeline.build_model(cfg, layout, data).to(args.device)
     model.load_state_dict(state)
-    ctrl = FeatureController(model, data.lat, data.lon, cc, stats).to(args.device)
-    print(f"controller: {sum(p.numel() for p in ctrl.parameters()):,} parameters, "
-          f"{ctrl.num_shells} shells x {ctrl.num_patches} patches x {2 * cc.rank} actions")
+    if physics:
+        for p in model.parameters():
+            p.requires_grad_(False)
+        ctrl = tendency_control.TendencyController(model, cc).to(args.device)
+        ctrl.cost_weight = cc.control_cost
+        print(f"controller: {sum(p.numel() for p in ctrl.parameters()):,} parameters, "
+              f"{ctrl.n_action} actions (n <= {cc.max_degree}, {len(ctrl.groups)} layers)")
+    else:
+        ctrl = FeatureController(model, data.lat, data.lon, cc, stats).to(args.device)
+        print(f"controller: {sum(p.numel() for p in ctrl.parameters()):,} parameters, "
+              f"{ctrl.num_shells} shells x {ctrl.num_patches} patches x {2 * cc.rank} actions")
     loader = DataLoader(data, batch_size=gc.batch_size, shuffle=True, drop_last=True,
                         generator=torch.Generator().manual_seed(gc.seed))  # same windows in every arm
     os.makedirs(args.out, exist_ok=True)
@@ -64,10 +80,12 @@ def main():
         torch.save(state, progress_path + ".tmp")
         os.replace(progress_path + ".tmp", progress_path)
 
-    history = train_controller(model, ctrl, loader, gc, args.device, progress=progress, save=save)
+    history = train_controller(model, ctrl, loader, gc, args.device, progress=progress, save=save,
+                               play_fn=play_physics if physics else None)
     path = os.path.join(args.out, "controller.pt")
+    state_fn = tendency_control.controller_state if physics else controller_state
     torch.save({"config": cfg, "base_checkpoint": args.checkpoint,
-                "controller": controller_state(ctrl), "history": history}, path)
+                "controller": state_fn(ctrl), "history": history}, path)
     pipeline.save_json(os.path.join(args.out, "game_history.json"), history)
     print(f"saved {path}")
 

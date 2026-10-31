@@ -216,10 +216,12 @@ def reward_to_go_advantages(rewards: Tensor, members: int) -> Tensor:
 # ---------------------------------------------------------------- training
 def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: DataLoader,
                      cfg: GameConfig, device="cpu", log=print, progress: Optional[dict] = None,
-                     save: Optional[Callable[[dict], None]] = None, save_every: int = 10
-                     ) -> List[Dict[str, float]]:
+                     save: Optional[Callable[[dict], None]] = None, save_every: int = 10,
+                     play_fn: Optional[Callable] = None) -> List[Dict[str, float]]:
     """Trains the controller; `save` receives a resumable `progress` dict every
-    `save_every` updates (the same windows, masks and draws as an uninterrupted run)."""
+    `save_every` updates (the same windows, masks and draws as an uninterrupted run).
+    `play_fn` replaces `play` for another world model (stage 9: train/physics_game.py)."""
+    play = play_fn or globals()["play"]
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -308,10 +310,11 @@ CONTROL_VARIANTS = ("no_control", "random_control", "no_diag")
 def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, indices: Sequence[int],
                   kinds: Sequence[str], horizon: int, device="cpu", seed: int = 0,
                   region_fraction: float = 0.25, variants: Sequence[str] = CONTROL_VARIANTS,
-                  obs_prob: float = 0.0, log=None) -> Dict[str, object]:
+                  obs_prob: float = 0.0, log=None, play_fn: Optional[Callable] = None) -> Dict[str, object]:
     """Masked-game errors per kind and lead for the controller and its knock-outs,
     paired over initialisations (each init gets one fixed mask per kind and, with
     `obs_prob` > 0, one fixed sequence of re-observations)."""
+    play = play_fn or globals()["play"]
     model.eval()
     ctrl.explore = 0.0
     out: Dict[str, object] = {"lead_h": [6 * (k + 1) for k in range(horizon)], "obs_prob": obs_prob,
