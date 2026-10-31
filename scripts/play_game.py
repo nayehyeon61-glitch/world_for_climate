@@ -8,6 +8,10 @@ Stage 9 (N3): a physics checkpoint (model.type: physics) gets the tendency
 controller of models/tendency_control.py and the same game on the physics model
 (configs/physics_game_wb2.yaml).
 
+Stage 11: `control.kind: operator` gives a bank of SFNO operators with RL
+choosing which acts per latitude band (models/operator_control.py,
+configs/operator_game_wb2.yaml, --mode hybrid).
+
 Only the controller learns (climate_wm.train.prediction_game); the world model
 checkpoint is not changed. Writes controller.pt and game_history.json.
 """
@@ -21,7 +25,7 @@ from torch.utils.data import DataLoader
 
 from climate_wm import pipeline
 from climate_wm.data.era5_lazy_loader import GraphCastWindowDataset
-from climate_wm.models import tendency_control
+from climate_wm.models import operator_control, tendency_control
 from climate_wm.models.feature_control import ControlConfig, FeatureController, controller_state
 from climate_wm.train.physics_game import play_physics
 from climate_wm.train.prediction_game import GameConfig, train_controller
@@ -32,7 +36,7 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="frozen world model")
     parser.add_argument("--config", required=True, help="data splits + game + control sections")
     parser.add_argument("--data-dir", default=None)
-    parser.add_argument("--mode", choices=["rl", "grad"], default=None)
+    parser.add_argument("--mode", choices=["rl", "grad", "hybrid"], default=None)
     parser.add_argument("--out", required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume", action="store_true", help="continue from OUT/progress.pt")
@@ -47,7 +51,9 @@ def main():
     pipeline.apply_overrides(cfg, args.set)
     physics = cfg["model"].get("type") == "physics"
     gc = GameConfig(**cfg["game"])
-    cc = (tendency_control.TendencyControlConfig if physics else ControlConfig)(**cfg["control"])
+    operator = physics and cfg["control"].get("kind") == "operator"  # stage 11
+    cc = (operator_control.OperatorControlConfig if operator else
+          tendency_control.TendencyControlConfig if physics else ControlConfig)(**cfg["control"])
     torch.manual_seed(gc.seed)
 
     layout = pipeline.build_layout(cfg)
@@ -60,8 +66,13 @@ def main():
     if physics:
         for p in model.parameters():
             p.requires_grad_(False)
-        ctrl = tendency_control.TendencyController(model, cc, stats.diff_std).to(args.device)
+        kind = operator_control.OperatorBankController if operator else tendency_control.TendencyController
+        ctrl = kind(model, cc, stats.diff_std).to(args.device)
         ctrl.cost_weight = cc.control_cost
+        if operator:
+            print(f"operator bank: {cc.n_operators} SFNO x "
+                  f"{sum(p.numel() for p in ctrl.operators[0].parameters()):,} parameters, "
+                  f"{ctrl.n_bands} bands x {ctrl.n_options} options, selection {cc.selection}")
         print(f"controller: {sum(p.numel() for p in ctrl.parameters()):,} parameters, "
               f"{ctrl.n_action} actions (n <= {cc.max_degree}, {len(ctrl.groups)} layers); action unit "
               + ", ".join(f"{f} {list(map('{:.2g}'.format, u.tolist()))}" for f, u in zip(ctrl.layer_fields, ctrl.unit))

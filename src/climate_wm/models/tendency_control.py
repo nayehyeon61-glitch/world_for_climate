@@ -223,6 +223,9 @@ def controller_state(controller: TendencyController) -> dict:
 
 
 def load_controller(model, saved: dict) -> TendencyController:
+    if saved["cfg"].get("kind") == "operator":  # stage 11 (models/operator_control.py)
+        from .operator_control import load_operator_controller
+        return load_operator_controller(model, saved)
     ctrl = TendencyController(model, TendencyControlConfig(**saved["cfg"]))
     ctrl.load_state_dict(saved["state"])
     return ctrl.to(model.mean.device)

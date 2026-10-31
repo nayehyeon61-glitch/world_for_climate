@@ -21,6 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 io = ["dask", "netCDF4", "zarr"]
 dev = ["pytest>=7"]
+# stage 11 (models/operator_control.py): SFNO operators. torch-harmonics 0.9 pins torch < 2.15;
+# 0.7.4 is pure Python for the spherical harmonic transforms and works with newer torch
+operator = ["neuraloperator>=2.0", "torch-harmonics>=0.7.4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

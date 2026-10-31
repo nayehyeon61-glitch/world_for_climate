@@ -53,7 +53,7 @@ MASK_KINDS = ("variables", "shell", "region")
 
 @dataclasses.dataclass
 class GameConfig:
-    mode: str = "rl"              # rl | grad
+    mode: str = "rl"              # rl | grad | hybrid (stage 11: choices by RL, operators by gradient)
     steps: int = 150
     batch_size: int = 2
     lr: float = 1e-3
@@ -72,13 +72,14 @@ class GameConfig:
     masked_weight: float = 0.5
     cap: Optional[float] = None   # physics game: errors clipped here, a blown-up episode scores it
                                   # from then on (train/physics_game.play_physics)
+    hybrid_lambda: float = 0.5    # hybrid: weight of the RL loss (1 - it: the gradient loss)
     log_every: int = 10
     seed: int = 0
 
     def __post_init__(self):
         self.mask_kinds = tuple(self.mask_kinds)
-        if self.mode not in ("rl", "grad"):
-            raise ValueError("game mode must be rl or grad")
+        if self.mode not in ("rl", "grad", "hybrid"):
+            raise ValueError("game mode must be rl, grad or hybrid")
         unknown = set(self.mask_kinds) - set(MASK_KINDS)
         if unknown:
             raise ValueError(f"unknown mask kinds {sorted(unknown)}")
@@ -273,7 +274,7 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
         obs_gen = lambda: torch.Generator().manual_seed(obs_seed)  # the same draws in every run
         logged = cfg.log_every and (step % cfg.log_every == 0 or step == cfg.steps - 1)
         r0 = None
-        if cfg.mode == "grad" or logged:  # the uncontrolled score of the same episodes
+        if cfg.mode in ("grad", "hybrid") or logged:  # the uncontrolled score of the same episodes
             with torch.no_grad():
                 r0 = episode_return(*play(model, ctrl, batch, masks, cfg.horizon, control=False,
                                           obs_prob=cfg.obs_prob, gen=obs_gen(), nudge=cfg.nudge),
@@ -294,6 +295,25 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
             logs["return_spread"] = float(ret.std(1).mean() / ret.mean().abs())
             if r0 is not None:
                 logs["gain"] = float(((ret.mean(1) - r0) / r0.abs()).mean())
+        elif cfg.mode == "hybrid":
+            # stage 11: the sampled choices learn by REINFORCE, the operators by the exact
+            # gradient of the same episodes through the frozen model (models/operator_control.py)
+            record = []
+            ctrl.explore = cfg.explore
+            hidden, all_ = play(model, ctrl, batch, masks, cfg.horizon, cfg.members, obs_prob=cfg.obs_prob,
+                                gen=obs_gen(), record=record, nudge=cfg.nudge)
+            rewards = step_rewards(hidden.detach(), all_.detach(), cfg.masked_weight)
+            adv = reward_to_go_advantages(rewards, cfg.members)
+            loss_rl = -sum((adv[:, k] * ctrl.log_prob(f, a)).mean() for k, (f, a) in enumerate(record)) / len(record)
+            ret = episode_return(hidden, all_, cfg.masked_weight)  # [B * M], differentiable
+            ref = r0.repeat_interleave(cfg.members).abs()
+            loss_grad = -(ret / ref).mean()
+            loss = cfg.hybrid_lambda * loss_rl + (1 - cfg.hybrid_lambda) * loss_grad
+            loss.backward()
+            ret = ret.detach().view(b, cfg.members)
+            logs.update(loss_rl=float(loss_rl.detach()), loss_grad=float(loss_grad.detach()),
+                        return_spread=float(ret.std(1).mean() / ret.mean().abs()),
+                        gain=float(((ret.mean(1) - r0) / r0.abs()).mean()))
         else:
             ctrl.explore = 0.0
             ret = episode_return(*play(model, ctrl, batch, masks, cfg.horizon,
@@ -354,7 +374,7 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                               "kinds": {}}
     for kind in kinds:
         rows: Dict[str, List[Tensor]] = {}
-        labels, blowups = [], {}
+        labels, blowups, usage = [], {}, []
         for n, i in enumerate(indices):
             item = dataset[int(i)]
             batch = {k: v[None].to(device) for k, v in item.items()}
@@ -367,6 +387,9 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
             for name in ("control", *variants):
                 ctrl.random_actions = name == "random_control"
                 ctrl.zero_diagnostics = name == "no_diag"
+                if hasattr(ctrl, "fixed_choice"):  # stage 11: "option_j" always takes option j
+                    ctrl.fixed_choice = int(name.split("_")[1]) if name.startswith("option_") else None
+                    ctrl.usage = [] if name == "control" else None
                 torch.manual_seed(seed + n)
                 h, a = play(model, ctrl, batch, mask[None], horizon,
                             control=name != "no_control" and name not in NUDGE_VARIANTS,
@@ -376,13 +399,23 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                     blowups[name] = blowups.get(name, 0) + int((h >= cap).any())
                 rows.setdefault(f"{name}_hidden", []).append(h[0])
                 rows.setdefault(f"{name}_all", []).append(a[0])
+                if getattr(ctrl, "usage", None):
+                    usage.append(torch.stack(ctrl.usage))  # [K, R]: the option per step and band
+                    ctrl.usage = None
             ctrl.random_actions = ctrl.zero_diagnostics = False
+            if hasattr(ctrl, "fixed_choice"):
+                ctrl.fixed_choice = None
             if log is not None and (n + 1) % 10 == 0:
                 log(f"[game eval] {kind}: {n + 1}/{len(indices)}")
         per = {k: torch.stack(v).cpu().numpy() for k, v in rows.items()}  # [N, K]
         res = {"labels": labels, "mse": {k: v.mean(0).tolist() for k, v in per.items()}, "change": {}}
         if cap is not None:
             res["blowups"] = blowups
+        if usage:  # stage 11: share of each option per band, and the choice per init / step / band
+            u = torch.stack(usage).cpu()  # [N, K, R]
+            n_opt = ctrl.n_options
+            res["usage"] = {"share": [[float((u[:, :, r] == j).float().mean()) for j in range(n_opt)]
+                                      for r in range(u.shape[-1])], "choices": u.tolist()}
         base = {part: per[f"no_control_{part}"] for part in ("hidden", "all")}
         for name in ("control", *[v for v in variants if v != "no_control"]):
             for part in ("hidden", "all"):
