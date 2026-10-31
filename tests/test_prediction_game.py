@@ -133,7 +133,7 @@ def test_play_and_train(setup):
     for mode in ("rl", "grad"):
         c = _controller(model, data, stats)
         start = [p.detach().clone() for p in c.parameters()]
-        hist = game.train_controller(model, c, loader, game.GameConfig(mode=mode, steps=2, members=3,
+        hist = game.train_controller(model, c, loader, game.GameConfig(mode=mode, steps=2, members=3, obs_prob=0.5,
                                                                        horizon=2, log_every=1, lr=1e-2), log=print)
         assert len(hist) == 2 and np.isfinite(hist[-1]["loss"]) and "gain_mean_policy" in hist[-1]
         assert any(not torch.equal(a, b) for a, b in zip(start, c.parameters()))
@@ -145,7 +145,7 @@ def test_evaluation_and_cause_variants(setup):
     layout, data, stats, batch, model = setup
     ctrl = _controller(model, data, stats)
     _randomise(ctrl)
-    res = game.evaluate_game(model, ctrl, data, [0, 1, 2], ["none", "region"], horizon=2)
+    res = game.evaluate_game(model, ctrl, data, [0, 1, 2], ["none", "region"], horizon=2, obs_prob=0.5)
     for kind in ("none", "region"):
         r = res["kinds"][kind]
         assert len(r["labels"]) == 3 and len(r["mse"]["control_hidden"]) == 2
@@ -161,6 +161,15 @@ def test_evaluation_and_cause_variants(setup):
             assert np.abs(np.array(out["variant_change"][name]["mean"])).max() > 0
         assert ctrl.enabled and not ctrl.random_actions and not ctrl.zero_diagnostics
     assert "no_control" not in causes.available_variants(model)
+
+
+def test_reward_to_go():
+    r = torch.tensor([[1., 2., 3.], [0., 0., 0.], [3., 0., 0.], [0., 5., 0.]])  # 2 states x 2 members
+    adv = game.reward_to_go_advantages(r, members=2)
+    togo = torch.tensor([[6., 5., 3.], [0., 0., 0.], [3., 0., 0.], [5., 5., 0.]])
+    s = 1 / np.sqrt(2)  # (x - mean) / std of two values
+    expect = torch.sign(togo.view(2, 2, 3) - togo.view(2, 2, 3).mean(1, keepdim=True)).view(4, 3) * s
+    assert torch.allclose(adv, expect, atol=1e-5)  # last step of state 2: equal togo, advantage 0
 
 
 def test_resume_matches_an_uninterrupted_run(setup):

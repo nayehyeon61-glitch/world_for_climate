@@ -34,7 +34,9 @@ def _cell(ch, li):
 def game_table(game):
     text = ["## 1. Masked prediction game (held-out year)", "",
             f"{game['inits']} initialisations {game['period'][0][:10]} .. {game['period'][1][:10]}, one fixed mask "
-            "per initialisation and kind; GraphCast-weighted MSE change against the frozen model (no control), "
+            "per initialisation and kind (the masked truth is shown again at each step with chance "
+            f"{next(iter(game['arms'].values())).get('obs_prob', 0.0)}); "
+            "GraphCast-weighted MSE change against the frozen model (no control), "
             "mean and 90% bootstrap interval. `hidden` = the masked points, `all` = every point. "
             "Bold: the interval excludes 0.", ""]
     for name, arm in game["arms"].items():
@@ -89,7 +91,8 @@ def figure(game, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    kinds = list(next(iter(game["arms"].values()))["kinds"])
+    first = next(iter(game["arms"].values()))
+    kinds, final = list(first["kinds"]), first["lead_h"][-1]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     width = 0.8 / max(len(game["arms"]), 1)
     for i, (name, arm) in enumerate(game["arms"].items()):
@@ -105,7 +108,7 @@ def figure(game, path):
             axes[1].plot(*zip(*pts), color=c, marker="o", ms=3, label=name)
     axes[0].axhline(0, color="k", lw=0.8)
     axes[0].set_xticks(np.arange(len(kinds)), kinds)
-    axes[0].set_ylabel("24 h hidden-point MSE change vs frozen (%)")
+    axes[0].set_ylabel(f"{final} h hidden-point MSE change vs frozen (%)")
     axes[0].set_title("Held-out game score (negative = better)")
     axes[1].axhline(0, color="k", lw=0.8)
     axes[1].set_xlabel("controller update")

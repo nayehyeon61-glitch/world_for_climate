@@ -4,7 +4,8 @@
         --config configs/game_wb2.yaml --data-dir DATA \
         C1=runs/game_c1/controller.pt C1-grad=runs/game_c1_grad/controller.pt [--inits 31] [--out game_eval.json]
 
-Every initialisation gets one fixed mask per kind; the controller, the frozen
+Every initialisation gets one fixed mask per kind (and, with the game's
+obs_prob > 0, one fixed sequence of re-observations); the controller, the frozen
 model (no_control), the controller's actions at shuffled places
 (random_control) and the controller without its diagnostics (no_diag) play
 the same episodes, so changes are paired over initialisations. The unmasked
@@ -60,7 +61,8 @@ def main():
         ctrl = load_controller(model, test.lat, test.lon, saved["controller"], stats)
         res = evaluate_game(model, ctrl, test, indices, args.kinds, gc.horizon, args.device,
                             region_fraction=gc.region_fraction,
-                            variants=["no_control", *[v for v in args.variants if v != "no_control"]], log=print)
+                            variants=["no_control", *[v for v in args.variants if v != "no_control"]],
+                            obs_prob=gc.obs_prob, log=print)
         res.update(controller=path, history=saved.get("history", []))
         out["arms"][name] = res
         for kind, r in res["kinds"].items():

@@ -19,9 +19,10 @@ points and on all points:
 
 The world model never changes (World Models: V and M frozen, only C learns).
 
-    mode rl     M Gaussian action sequences per state, group-normalised
-                advantages (as in GRPO, train/rl_refine.py), policy gradient
-                on the controller's mean action
+    mode rl     M Gaussian action sequences per state; the action of step k
+                is scored by its reward-to-go sum_{j>=k} r_j, normalised
+                over the group (as in GRPO, train/rl_refine.py); policy
+                gradient on the controller's mean action
     mode grad   the control: the same controller and game, trained by the
                 exact gradient of R through the frozen model
 
@@ -60,7 +61,7 @@ class GameConfig:
     grad_clip: float = 1.0
     members: int = 4              # GRPO group size (rl)
     explore: float = 0.5          # std of the Gaussian policy (rl)
-    horizon: int = 4              # 6 h steps per episode
+    horizon: int = 4              # 6 h steps per episode (a sequence x_t -> x_t+1 -> ...)
     mask_kinds: Tuple[str, ...] = MASK_KINDS
     mask_rate: float = 1.0        # share of episodes with a mask (0: the no-mask game)
     region_fraction: float = 0.25
@@ -193,9 +194,23 @@ def play(model: ClimateWorldModel, ctrl: FeatureController, batch: Dict[str, Ten
     return torch.stack(hidden, 1), torch.stack(all_, 1)
 
 
+def step_rewards(hidden: Tensor, all_: Tensor, masked_weight: float) -> Tensor:
+    """r_k per episode and step [N, K] from per-step errors [N, K]."""
+    return -(masked_weight * hidden + (1 - masked_weight) * all_)
+
+
 def episode_return(hidden: Tensor, all_: Tensor, masked_weight: float) -> Tensor:
     """R per episode [N] from per-step errors [N, K]."""
-    return -(masked_weight * hidden + (1 - masked_weight) * all_).sum(1)
+    return step_rewards(hidden, all_, masked_weight).sum(1)
+
+
+def reward_to_go_advantages(rewards: Tensor, members: int) -> Tensor:
+    """Group-normalised reward-to-go per step [N, K] (N = B * members): the
+    action of step k only changes the rewards from step k on."""
+    togo = rewards.double().flip(1).cumsum(1).flip(1)
+    g = togo.view(-1, members, togo.shape[1])
+    adv = (g - g.mean(1, keepdim=True)) / (g.std(1, keepdim=True) + 1e-6)
+    return adv.view_as(togo).float()
 
 
 # ---------------------------------------------------------------- training
@@ -247,12 +262,12 @@ def train_controller(model: ClimateWorldModel, ctrl: FeatureController, loader: 
             record: list = []
             ctrl.explore = cfg.explore
             with torch.no_grad():
-                ret = episode_return(*play(model, ctrl, batch, masks, cfg.horizon, cfg.members,
-                                           obs_prob=cfg.obs_prob, gen=obs_gen(), record=record),
-                                     cfg.masked_weight).view(b, cfg.members)
-            g = ret.double()
-            adv = ((g - g.mean(1, keepdim=True)) / (g.std(1, keepdim=True) + 1e-6)).float().reshape(-1)
-            loss = -sum((adv * ctrl.log_prob(f, a)).mean() for f, a in record) / len(record)
+                rewards = step_rewards(*play(model, ctrl, batch, masks, cfg.horizon, cfg.members,
+                                             obs_prob=cfg.obs_prob, gen=obs_gen(), record=record),
+                                       cfg.masked_weight)  # [B * M, K]
+            ret = rewards.sum(1).view(b, cfg.members)
+            adv = reward_to_go_advantages(rewards, cfg.members)
+            loss = -sum((adv[:, k] * ctrl.log_prob(f, a)).mean() for k, (f, a) in enumerate(record)) / len(record)
             loss.backward()
             logs["return_spread"] = float(ret.std(1).mean() / ret.mean().abs())
             if r0 is not None:
@@ -293,12 +308,14 @@ CONTROL_VARIANTS = ("no_control", "random_control", "no_diag")
 def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, indices: Sequence[int],
                   kinds: Sequence[str], horizon: int, device="cpu", seed: int = 0,
                   region_fraction: float = 0.25, variants: Sequence[str] = CONTROL_VARIANTS,
-                  log=None) -> Dict[str, object]:
+                  obs_prob: float = 0.0, log=None) -> Dict[str, object]:
     """Masked-game errors per kind and lead for the controller and its knock-outs,
-    paired over initialisations (each init gets one fixed mask per kind)."""
+    paired over initialisations (each init gets one fixed mask per kind and, with
+    `obs_prob` > 0, one fixed sequence of re-observations)."""
     model.eval()
     ctrl.explore = 0.0
-    out: Dict[str, object] = {"lead_h": [6 * (k + 1) for k in range(horizon)], "kinds": {}}
+    out: Dict[str, object] = {"lead_h": [6 * (k + 1) for k in range(horizon)], "obs_prob": obs_prob,
+                              "kinds": {}}
     for kind in kinds:
         rows: Dict[str, List[Tensor]] = {}
         labels = []
@@ -315,7 +332,8 @@ def evaluate_game(model: ClimateWorldModel, ctrl: FeatureController, dataset, in
                 ctrl.random_actions = name == "random_control"
                 ctrl.zero_diagnostics = name == "no_diag"
                 torch.manual_seed(seed + n)
-                h, a = play(model, ctrl, batch, mask[None], horizon, control=name != "no_control")
+                h, a = play(model, ctrl, batch, mask[None], horizon, control=name != "no_control",
+                            obs_prob=obs_prob, gen=torch.Generator().manual_seed(seed + 7919 * n))
                 rows.setdefault(f"{name}_hidden", []).append(h[0])
                 rows.setdefault(f"{name}_all", []).append(a[0])
             ctrl.random_actions = ctrl.zero_diagnostics = False

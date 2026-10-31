@@ -21,17 +21,17 @@ eval:
 
 game:
   mode: rl              # rl | grad (the control: same controller, exact gradient)
-  steps: 150
+  steps: 100           # 100 x 6 steps = the compute of 150 x 4
   batch_size: 2
   lr: 1.0e-3
   warmup_steps: 10
   members: 4            # GRPO group size
   explore: 0.5          # policy std (action units)
-  horizon: 4            # 24 h episodes
+  horizon: 6            # 36 h sequences x_t -> x_t+1 -> ... (reward-to-go per step)
   mask_kinds: [variables, shell, region]
   mask_rate: 1.0        # 0: the no-mask game
   region_fraction: 0.25
-  obs_prob: 0.0         # observational dropout in time (re-observe the masked truth)
+  obs_prob: 0.5         # observational dropout in time: re-observe the masked truth with this chance
   masked_weight: 0.5
   log_every: 10
 

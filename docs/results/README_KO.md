@@ -10,7 +10,8 @@
 | 4 | 그래프 V-Net so(3) 피라미드: 정이십면체 계층으로 Lie 대수를 다운스케일하고 세계 모델이 거친 레벨에서 학습 | 완료: P·P−skip 2018 GraphCast 비교, 예측 1–3 판정(1 미지지, 2 부분, 3 P 미지지·P−skip 형식상 지지) | `stage4_pyramid/` |
 | 5 | 현실 정합 인과 Lie 세계 모델: 복합 군 (SO(3) × Vert) ⋉ Fib(이송 + 상승·하강 + 물리 가족), 물리 진단량을 GNN 입력으로, critic이 현실 정합성 판정 | G1 완료(P1 미지지), 원인 분석(자동부호화기 바닥 = skip dropout, P−nodrop으로 확인; denoiser 잡음), G2 학습 중, G3 보류 | `stage5_causal_lie/` |
 | 6 | 쉘 그래프 결합: 쉘 사이의 사슬(s±1) 연결을 학습된 쉘 그래프로 바꾸고, 같은 패치의 쉘 생성원도 그래프로 결합 | 구현 완료, 7단계 뒤 H1만 학습(H2 = Lie 생성원 결합은 보류, 10/31 결정), H0 = P−nodrop | `stage6_shell_graph/` |
-| 7 | 예측 게임과 GNN feature 제어: 학습된 물리 예측 모델을 고정하고, 마스킹된 데이터를 예측하는 게임에서 GNN feature를 조절하는 작은 제어기만 보상으로 학습한 뒤 전체를 시험 (Ha의 World Models) | 구현 완료, C1·C1-grad·C1-open 학습 대기(G2 뒤) | `stage7_prediction_game/` |
+| 7 | 예측 게임과 GNN feature 제어: 학습된 물리 예측 모델을 고정하고, 마스킹된 데이터를 예측하는 게임에서 GNN feature를 조절하는 작은 제어기만 보상으로 학습한 뒤 전체를 시험 (Ha의 World Models) | 구현 완료(36h 순차형 게임, reward-to-go), C1·C1-grad·C1-open 학습 대기(G2 뒤) | `stage7_prediction_game/` |
+| 8 | 동역학적 대기의 위상: 물리적 전이 비용(시간 포함, 준거리)으로 근방을 정의하고, 그 왕복 버전인 커뮤트 타임을 보존하는 임베딩(CTWM)을 학습해 새 위상인지 새 기하인지, 비용 근방이 예측에 좋은지 시험 | 설계·1차 코드(고정 latent 위 사후 학습), 1차는 7단계 학습 옆에서 실행(10/31 결정) | `stage8_topology/` |
 
 ---
 
@@ -250,13 +251,36 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **구현 (`models/feature_control.py`, `train/prediction_game.py`):**
 - 제어기(`FeatureController`, 8.9k 파라미터): 쉘 × 12개 패치마다 잠재 스칼라·벡터 크기 평균, 디코딩한 현재 상태의 물리 진단량(5단계 모듈의 7개 가족을 쉘별 평균), 마스크 비율, 쉘·패치 정체를 보고, 잠재 스칼라에 저차수 FiLM h ← h + 0.1·(h·Uγ + Uβ)(r = 4, U 고정 직교 기저)를 겁니다. 스칼라만 바꾸므로 SO(3) 등변성은 유지되고, 마지막 층이 0에서 시작해 학습 전에는 고정 모델과 똑같습니다. 세계 모델의 하위 모듈로 등록하지 않아 체크포인트는 바뀌지 않습니다(`controlled(model, ctrl)`).
-- 게임: 24h(4스텝) 판마다 변수 하나(모든 층) 또는 표면 묶음, 쉘 하나, 지구 면적 25%의 원형 지역 중 하나를 가리고 기후값(0)으로 채웁니다. 점수 = −Σ_k [0.5·가려진 점의 MSE + 0.5·전체 MSE](GraphCast 가중). 세계 모델은 denoiser를 끈 결정론 모드입니다. 시간 마스킹(확률적으로 실제 관측을 다시 보는 observational dropout)은 구현했지만 1차에서는 끕니다.
-- 학습: `rl` = 상태마다 행동 4개(가우스 정책, σ = 0.5)로 그룹 정규화 이점의 정책 기울기(2단계 GRPO 방식); `grad` = 같은 제어기를 고정 모델을 통한 정확한 기울기로 학습(대조군). 150회 갱신, 같은 창·같은 마스크 순서, 10회마다 이어 하기 저장.
+- 게임(순차형, 감자 10/31 15:09): 한 판은 x_t → x_{t+6h} → … → x_{t+36h}의 6스텝 시퀀스입니다. 판마다 변수 하나(모든 층) 또는 표면 묶음, 쉘 하나, 지구 면적 25%의 원형 지역 중 하나를 가리고 기후값(0)으로 채웁니다. 시퀀스 중간 각 스텝에서 확률 0.5로 실제 관측(가려진 채)을 다시 보여 주고, 나머지 스텝은 모델이 자기 예측으로 이어 갑니다(observational dropout). 스텝 보상 r_k = −[0.5·가려진 점의 MSE + 0.5·전체 MSE](GraphCast 가중). 세계 모델은 denoiser를 끈 결정론 모드입니다.
+- 학습: `rl` = 상태마다 행동 시퀀스 4개(가우스 정책, σ = 0.5). 스텝 k의 행동은 그 뒤 보상의 합(reward-to-go Σ_{j≥k} r_j)을 그룹 안에서 정규화한 이점으로 평가합니다(2단계 GRPO 방식의 순차 확장); `grad` = 같은 제어기를 고정 모델을 통한 정확한 기울기로 학습(대조군). 100회 갱신(6스텝 × 100 = 이전 4스텝 × 150과 같은 계산량), 같은 창·같은 마스크·재관측 순서, 10회마다 이어 하기 저장. 시험 게임도 같은 규칙(초기 시각마다 고정된 마스크와 재관측 순서)입니다.
 - 원인 분석: `eval_causes.py --controller --deterministic`에 `no_control`(고정 모델), `random_control`(같은 행동을 섞인 쉘·패치 위치에), `no_diag`(진단량 입력 0) knock-out을 추가했고, `eval_game.py`는 같은 knock-out을 마스킹 게임에서 잽니다.
 
 **팔:** 기본 모델 = P−nodrop(2015–17 학습, 고정). C0 = 행동 0, C1 = RL 제어기, C1-grad = 기울기 대조군, C1-open = 상태를 보지 않는 상수 행동, C1-random·C1-nodiag = C1의 평가 시 knock-out. 게임 학습 2018–19, 시험 2020(31개 초기 시각). 2차 후보: C1-nomask(마스킹 없는 게임), 입력 feature 게이트 행동.
 
-**예측(사전 등록):** Q1 C1이 2020 마스킹 게임에서 가려진 변수의 24h 오차를 C0보다 3% 이상 줄이고 90% 구간이 0을 포함하지 않는다. Q2 C1의 이득이 C1-random·C1-open보다 크다. Q3 마스킹 없는 보통 예보에서 6–72h 어느 리드에서도 0.5% 넘게 나빠지지 않는다. Q4 C1-nodiag가 이득의 절반 이상을 잃는다. Q5(기록) C1 대 C1-grad. Q1과 Q2가 모두 성립하면 지지로 판정합니다.
+**예측(사전 등록):** Q1 C1이 2020 마스킹 게임에서 가려진 변수의 24h 오차를 C0보다 3% 이상 줄이고(36h는 기록) 90% 구간이 0을 포함하지 않는다. Q2 C1의 이득이 C1-random·C1-open보다 크다. Q3 마스킹 없는 보통 예보에서 6–72h 어느 리드에서도 0.5% 넘게 나빠지지 않는다. Q4 C1-nodiag가 이득의 절반 이상을 잃는다. Q5(기록) C1 대 C1-grad. Q1과 Q2가 모두 성립하면 지지로 판정합니다.
+
+---
+
+## 8단계 — 동역학적 대기의 위상 (`stage8_topology/`)
+
+**가설 (감자, 10/31 15:04):** 세계 모델의 예측에는 정역학(상태가 어디에 있고 어디와 이어져 있는가)과 동역학(어떻게 움직이는가)이 모두 필요합니다. NEO 쪽이 인과적 동역학을 맡는다면 위상은 약합니다. 그래서 물리적 전이 비용 C_T(X,Y) = inf ∫ ½‖a‖²_G dt (Ẋ = F + Ba)로 근방을 정의해 동역학적 대기의 위상을 배웁니다. 첨부 논문: Learning Commute-Time-Preserving World Models for Planning (arXiv 2610.01373). 설계 문서: [8단계 설계: 동역학적 위상(전이 비용) 학습](https://claude.ai/artifact/Y8G5FeKMbF77Vc8voYJ9B5).
+
+**정리:**
+- 시간을 포함한 비용 C(X,Y) = inf_T [λT + C_T(X,Y)]는 경로 잇기로 삼각부등식을 만족하는 준거리이므로 전방 비용 공이 기저가 됩니다.
+- 국소 제어 가능하면 위상은 보통 위상과 같고, 바뀌는 것은 기하(비등방 공)입니다. 새 위상은 왕복 비용이 작은 상태들의 레짐에서만 생깁니다.
+- 왕복 비용의 확률적 대응이 커뮤트 타임이고(Freidlin–Wentzell, Eyring–Kramers), CTWM 손실 ‖φ(s′) − φ(s) − T(φ(s), a)‖² + β‖T‖² − (γ/2) log det Cov φ의 최적해는 거리² ∝ 커뮤트 타임, 방향별 분산 ∝ 1/λ인 Laplacian 임베딩입니다(가역 동역학 가정).
+
+**1차 구현 (`models/commute_time.py`, `eval/topology.py`, `scripts/eval_topology.py`):**
+- 상태: 고정 P−nodrop 인코더의 latent를 쉘 × 12 패치로 평균한 회전 불변량(스칼라 평균, 벡터 크기), 2015–17 조화 기후값을 뺀 편차.
+- 행동: 다음 시각의 패치별 대기 상단 입사 태양복사와 계절 위상(강제가 만드는 변화는 T가 설명).
+- 머리: 전역 ψ(16차원) 또는 패치 ψ(8차원, 가중치 공유). 2015–17의 6h 전이로 학습, 2018로 시험.
+- T1: k-means 64개 군집의 Markov 상태 모형에서 계산한 커뮤트 타임과 군집 중심 거리의 Spearman(latent·에너지 두 분할), 시간 간격에 따른 거리 증가.
+- T2: 기하 = 주방향 분산과 Laplacian 고유값의 log-log 기울기(이론 −1). 위상 = 같은 공분산의 가우스 구름보다 오래 사는 H0 성분 수, k-means 레짐 체류 시간, 북대서양·북태평양 패치.
+- T3: 유사 사례 예보(가까운 10개의 24·72·120h 뒤 평균)의 z500·t850·t2m RMSE, 블로킹·제트 위도 레짐별; ψ의 국소 속도·희귀도와 고정 모델 72h 오차의 상관.
+
+**팔:** ψ-CT(본 가설), ψ-iso(등방 정규화, 1/λ 척도 제거), ψ-shuffle(무작위 쌍, 음성 대조), raw z(고정 latent), 에너지 노름(건조 전에너지). 원인 분석: β ∈ {0, 0.1, 1}, 차원 8/16/32, 강제 행동 끔, 패치별 머리.
+
+**예측(사전 등록):** P1 ψ-CT의 커뮤트 타임 Spearman이 raw z·에너지 노름보다 0.1 이상 높다(구간이 0 제외), ψ-shuffle은 0.2 미만. P2 ψ-CT 분산 스펙트럼 기울기가 −1.3 ~ −0.7, ψ-iso는 범위 밖. P3(기록) 전역에서는 새 위상 없음, 북대서양·북태평양 패치에서 H0 성분·체류 시간이 raw z보다 30% 이상이면 레짐을 위상적 내용으로 기록. P4 ψ-CT 유사 사례 72h z500 RMSE가 raw z보다 3% 이상 낮고, ψ 속도와 고정 모델 72h 오차의 Spearman ≥ 0.3. P1과 P4가 모두 성립하면 지지, 2차(인코더에 CTWM 보조 손실 + 방향을 담는 준거리 머리)로 진행합니다.
 
 ---
 
@@ -293,6 +317,11 @@ python scripts/eval_pyramid.py --checkpoint runs/wb2_pyramid/checkpoint.pt --dat
 python scripts/report_pyramid.py S=runs/independent/compare_graphcast.json P=runs/wb2_pyramid/compare_graphcast.json \
     "P-skip=runs/wb2_pyramid_noskip/compare_graphcast.json" --pyramid P=runs/wb2_pyramid/pyramid_eval.json \
     "P-skip=runs/wb2_pyramid_noskip/pyramid_eval.json" --out-dir docs/results/stage4_pyramid
+# 8단계 1차 (고정 P−nodrop latent; DATA = 2015-01 .. 2019-01-15 ERA5)
+python scripts/eval_topology.py encode --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt \
+    --config configs/topology_wb2.yaml --data-dir DATA --out runs/topology
+python scripts/eval_topology.py analyse --config configs/topology_wb2.yaml --out runs/topology
+python scripts/report_topology.py --topology runs/topology/topology.json --out-dir docs/results/stage8_topology
 # 7단계 (기본 = P−nodrop 고정; DATA2020 = 2017-12 .. 2021-01 ERA5)
 python scripts/play_game.py --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt --config configs/game_wb2.yaml \
     --data-dir DATA2020 --mode rl --out runs/game_c1        # C1-grad: --mode grad, C1-open: --set control.use_state=false
