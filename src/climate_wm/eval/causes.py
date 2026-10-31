@@ -1,0 +1,168 @@
+"""Cause analysis of the forecast error: ablations that need no retraining.
+
+Error decomposition. At every lead k the forecast error of the decoded
+rollout splits exactly into what the autoencoder cannot represent and what
+the latent dynamics get wrong:
+
+    total = D(Z_k) - X_k
+          = [D(E(X_k)) - X_k]  +  [D(Z_k) - D(E(X_k))]
+               rec (floor)          dyn (rollout in latent space)
+
+with Z_k the rolled-out latent and E(X_k) the encoded truth. The RMSE of
+`rec` is the best any transition could reach with this autoencoder, so a
+model that loses at short leads with rec close to total has an autoencoder
+problem, and one whose dyn grows fastest has a dynamics problem.
+
+Eval-time ablations. The same rollout (same initial states, same denoiser
+noise) with one part switched off:
+
+    no_denoiser   the stochastic residual skipped (Zbar only: the pure group
+                  action plus the composite terms), i.e. how much skill the
+                  transport itself carries
+    composite     every fibre family and the vertical shift set to the
+                  identity (stage 5 arms), i.e. the arm without its new terms
+    shift, radiation, mixing, surface, condensation
+                  one part of the composite group set to the identity
+
+Each variant is compared with the full model per initialisation, so the
+reported change carries a paired bootstrap interval.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Callable, Dict, Iterator, List, Optional, Sequence
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from ..geometry.composite_group import FIB_FAMILIES
+from ..models.world_model import ClimateWorldModel
+from ..train.losses import normalized_latitude_weights
+from .graphcast_metrics import rmse_per_init
+
+COMPOSITE_PARTS = ("composite", "shift") + FIB_FAMILIES
+
+
+def available_variants(model: ClimateWorldModel) -> List[str]:
+    """Ablations that apply to this model."""
+    out = ["no_denoiser"] if model.denoiser is not None else []
+    lie = model.lie
+    if lie is not None and getattr(lie, "composite", None) is not None:
+        out.append("composite")
+        if lie.shift is not None:
+            out.append("shift")
+        out += [f for f in FIB_FAMILIES if f in lie.composite.families]
+    return out
+
+
+@contextlib.contextmanager
+def knocked_out(model: ClimateWorldModel, parts: Sequence[str]) -> Iterator[None]:
+    """Sets parts of the composite group to the identity; restores them on exit.
+
+    A family's coefficients are scaled by its gain (`fibre_gain`), so a zero
+    gain removes the family exactly; a zeroed shift head gives w = 0.
+    """
+    parts = set(parts) & set(COMPOSITE_PARTS)
+    if not parts:
+        yield
+        return
+    lie = model.lie
+    if lie is None or getattr(lie, "composite", None) is None:
+        raise ValueError(f"knock-out {sorted(parts)} needs a composite transition")
+    if "composite" in parts:
+        parts |= {"shift", *FIB_FAMILIES}
+    saved = {"gain": lie.fibre_gain.detach().clone()}
+    if lie.shift is not None:
+        saved["shift"] = [p.detach().clone() for p in lie.shift.parameters()]
+    with torch.no_grad():
+        for f in parts & set(FIB_FAMILIES):
+            lie.fibre_gain[FIB_FAMILIES.index(f)] = 0.0
+        if "shift" in parts and lie.shift is not None:
+            for p in lie.shift.parameters():
+                p.zero_()
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            lie.fibre_gain.copy_(saved["gain"])
+            if lie.shift is not None:
+                for p, v in zip(lie.shift.parameters(), saved["shift"]):
+                    p.copy_(v)
+
+
+def latent_rollout(model: ClimateWorldModel, batch: Dict[str, Tensor], steps: int,
+                   sample: bool = True) -> List:
+    """Rolled-out latents Z_1 .. Z_steps (one member)."""
+    history = model.encode_history(batch)
+    out = []
+    for k in range(steps):
+        z = model.step(history, batch["forcings_tgt"][:, k], sample=sample).z
+        out.append(z)
+        history = list(history[1:]) + [z]
+    return out
+
+
+def _batches(dataset, indices: Sequence[int], batch_size: int, device):
+    indices = list(indices)
+    for i in range(0, len(indices), batch_size):
+        chunk = [dataset[int(j)] for j in indices[i:i + batch_size]]
+        yield {k: torch.utils.data.default_collate([c[k] for c in chunk]).to(device)
+               for k in chunk[0]}
+
+
+def _bootstrap(diff: np.ndarray, n: int = 2000, seed: int = 0) -> tuple:
+    """Mean and 90% interval of the mean of `diff` over its first axis."""
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(diff), (n, len(diff)))
+    means = diff[idx].mean(1)
+    return diff.mean(0), np.percentile(means, 5, axis=0), np.percentile(means, 95, axis=0)
+
+
+@torch.no_grad()
+def error_decomposition(model: ClimateWorldModel, dataset, indices: Sequence[int], stats,
+                        lead_steps: int, variants: Sequence[str] = (), device="cpu",
+                        batch_size: int = 2, seed: int = 0,
+                        log: Optional[Callable[[str], None]] = None) -> Dict[str, object]:
+    """Per-variable, per-lead RMSE of total / rec / dyn and of each ablated variant."""
+    model.eval()
+    layout = model.layout
+    lat_w = torch.tensor(normalized_latitude_weights(dataset.lat), dtype=torch.float32)
+    phys = lambda x: stats.unnormalize(x.float().cpu(), layout.targets)
+    rows: Dict[str, List[np.ndarray]] = {}
+    add = lambda k, v: rows.setdefault(k, []).append(v)
+    done = 0
+    for n_b, batch in enumerate(_batches(dataset, indices, batch_size, device)):
+        target = phys(batch["targets"][:, :lead_steps])  # [B, L, C, H, W]
+        rec = torch.stack([phys(model.decode(model.encode_target(batch, k)))
+                           for k in range(lead_steps)], 1)
+        runs = {}
+        for name in ("full", *variants):
+            torch.manual_seed(seed + n_b)  # the same denoiser noise for every variant
+            with knocked_out(model, [name]):
+                zs = latent_rollout(model, batch, lead_steps, sample=name != "no_denoiser")
+            runs[name] = torch.stack([phys(model.decode(z)) for z in zs], 1)
+        err = lambda a, b: rmse_per_init(a, b, lat_w).numpy()  # [B, L, C]
+        add("rec", err(rec, target))
+        add("dyn", err(runs["full"], rec))
+        for name, pred in runs.items():
+            add(name, err(pred, target))
+        done += target.shape[0]
+        if log is not None:
+            log(f"[causes] {done}/{len(indices)} initialisations")
+    per_init = {k: np.concatenate(v, 0) for k, v in rows.items()}  # [N, L, C]
+    full = per_init["full"]
+    out = {"lead_h": [6 * (k + 1) for k in range(lead_steps)],
+           "variables": [c.key for c in layout.targets],
+           "inits": len(full),
+           "rmse": {k: v.mean(0).tolist() for k, v in per_init.items()}}
+    # share of the squared error the autoencoder alone explains (mean over inits)
+    out["rec_share"] = (np.square(per_init["rec"]).mean(0) / np.square(full).mean(0).clip(1e-30)).tolist()
+    changes = {}
+    for name in variants:
+        rel = (per_init[name] - full) / full.mean(0).clip(1e-30)  # per init, relative to the mean
+        mean, lo, hi = _bootstrap(rel, seed=seed)
+        changes[name] = {"mean": mean.tolist(), "lo": lo.tolist(), "hi": hi.tolist()}
+    out["variant_change"] = changes  # (variant - full) / full RMSE, paired over inits
+    return out
