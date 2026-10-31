@@ -61,7 +61,7 @@ def test_physics_causes_evaluation(setup, tmp_path):
     s = res["interventions"]["sun_off+no_heating"]
     p = s["pair"]
     assert p["a"] == "sun_off" and len(p["interaction_all"]["mean"]) == 2
-    assert set(p["eta"]) == {"thermodynamics", "motion", "water"}
+    assert set(p["eta"]) == {"thermodynamics", "momentum", "hydrostatic", "water"}
     r = res["interventions"]["sun_off"]["response"]
     assert np.isfinite(r["thermodynamics"]["mean"]).all() and r["thermodynamics"]["mean"][0] > 0
     assert "t2m_day_K" in r and len(r["t2m_corr_energy"]["mean"]) == 2

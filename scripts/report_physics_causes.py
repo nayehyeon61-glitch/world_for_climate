@@ -32,7 +32,8 @@ EXPECT = {
     "E6": "invariance: >= 80% sign agreement 2018 vs 2020 on the significant per-variable changes at 24 and "
           "72 h, and rank correlation of the 72 h effect sizes >= 0.8",
 }
-GROUPS = ("thermodynamics", "motion", "water")
+GROUPS = ("thermodynamics", "momentum", "hydrostatic", "water")
+SHORT_G = {"thermodynamics": "T", "momentum": "u", "hydrostatic": "Φ", "water": "q"}
 SHORT = {"geopotential@500": "z500", "temperature@850": "t850", "specific_humidity@700": "q700",
          "u_component_of_wind@850": "u850", "2m_temperature": "t2m", "mean_sea_level_pressure": "msl",
          "10m_u_component_of_wind": "u10", "total_precipitation_6hr": "tp"}
@@ -115,14 +116,27 @@ def variable_table(res, hours=72):
     return lines
 
 
+def arrival(res, b, frac=0.5):
+    """First lead (h) at which a response reaches `frac` of its 72 h value."""
+    m = b["mean"]
+    end = m[_li(res, 72)]
+    if end is None or not np.isfinite(end) or end <= 0:
+        return None
+    for l, v in enumerate(m):
+        if v is not None and np.isfinite(v) and v >= frac * end:
+            return res["leads_h"][l]
+    return None
+
+
 def propagation_table(res):
-    lines = ["| intervention | " + " | ".join(f"{g} 6/24/72 h" for g in GROUPS) + " | first to respond |",
-             "|---|" + "---|" * (len(GROUPS) + 1)]
+    lines = ["| intervention | " + " | ".join(f"{g} 6/24/72 h" for g in GROUPS)
+             + " | arrival (h, half of 72 h): " + " / ".join(SHORT_G[g] for g in GROUPS) + " | order |",
+             "|---|" + "---|" * (len(GROUPS) + 2)]
     grow, total = 0, 0
     for name, s in res["interventions"].items():
         if name == "full" or "+" in name:
             continue
-        cells, first = [], {}
+        cells, arr = [], {}
         for g in GROUPS:
             b = s["response"][g]
             vals = [b["mean"][_li(res, h)] for h in (6, 24, 72)]
@@ -130,9 +144,11 @@ def propagation_table(res):
             if all(v is not None and np.isfinite(v) for v in (vals[0], vals[2])):
                 total += 1
                 grow += vals[2] > vals[0]
-            first[g] = vals[0] if vals[0] is not None and np.isfinite(vals[0]) else -1
-        lead = max(first, key=first.get) if max(first.values()) > 0 else "–"
-        lines.append(f"| `{name}` | " + " | ".join(cells) + f" | {lead} |")
+            arr[g] = arrival(res, b)
+        known = sorted((a, SHORT_G[g]) for g, a in arr.items() if a is not None)
+        order = " → ".join(" = ".join(x for t, x in known if t == a) for a in sorted({t for t, _ in known}))
+        lines.append(f"| `{name}` | " + " | ".join(cells) + " | "
+                     + " / ".join("–" if arr[g] is None else str(arr[g]) for g in GROUPS) + f" | {order or '–'} |")
     return lines, (grow / total if total else float("nan"))
 
 
@@ -150,8 +166,8 @@ def sun_table(res):
 
 def pair_table(res):
     pl = res["pair_leads_h"]
-    lines = ["| pair (A + B) | interaction, all-MSE 6/24/72 h | eta T / motion / water at 72 h | "
-             "rho(A given B) T / motion / water at 72 h | rho(B given A) at 72 h |", "|---|---|---|---|---|"]
+    lines = ["| pair (A + B) | interaction, all-MSE 6/24/72 h | eta T / u / Φ / q at 72 h | "
+             "rho(A given B) T / u / Φ / q at 72 h | rho(B given A) at 72 h |", "|---|---|---|---|---|"]
     for name, s in res["interventions"].items():
         p = s.get("pair")
         if not p:

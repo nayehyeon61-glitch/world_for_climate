@@ -29,9 +29,10 @@ The graph has loops, so single cuts are not the whole story:
     which is zero for independent paths, and the share of A's effect left once
     B is cut,
       rho(A | B) = |forecast_AB - forecast_B| / |D_A|   (B mediates A: rho -> 0);
-  propagation: the response |D_X| per variable group (GROUPS) at every lead,
-    so the order in which an intervention reaches the groups can be read
-    against the arrows;
+  propagation: the response |D_X| per block of the equations (GROUPS:
+    thermodynamics, momentum, hydrostatic balance, water) at every lead, so
+    the order in which an intervention reaches the blocks can be read against
+    the arrows;
   invariance: the same tests on two years (scripts/report_physics_causes.py).
 Skill: RMSE of the headline variables and the channel-mean normalised MSE per
 lead, paired with the intact model (bootstrap 95%). A blow-up (non-finite, or
@@ -133,17 +134,24 @@ MISSING = {"surface <-> water (precipitation, evaporation)":
            "and nothing stores surface water or heat"}
 
 
+GROUPS = ("thermodynamics", "momentum", "hydrostatic", "water")
+
+
 def groups(layout) -> Dict[str, List[int]]:
-    """Target channels per node of the diagram."""
-    out: Dict[str, List[int]] = {"thermodynamics": [], "motion": [], "water": []}
+    """Target channels per block of the equations (GROUPS): T; winds and omega;
+    geopotential and sea-level pressure (hydrostatic balance and mass); q and
+    precipitation."""
+    out: Dict[str, List[int]] = {g: [] for g in GROUPS}
     for j, c in enumerate(layout.targets):
         k = c.key
         if k.startswith("temperature@") or k == "2m_temperature":
             out["thermodynamics"].append(j)
         elif k.startswith("specific_humidity@") or k == "total_precipitation_6hr":
             out["water"].append(j)
-        else:  # winds, geopotential, vertical velocity, sea-level pressure
-            out["motion"].append(j)
+        elif k.startswith("geopotential@") or k == "mean_sea_level_pressure":
+            out["hydrostatic"].append(j)
+        else:  # u, v, vertical velocity, 10 m winds
+            out["momentum"].append(j)
     return out
 
 
