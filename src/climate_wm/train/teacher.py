@@ -104,8 +104,11 @@ class EpisodeSet:
                  for k in TEND_KEYS]
         return np.concatenate(parts, 1).astype(np.float32)
 
-    def tendency_std(self, n: int = 24, seed: int = 0) -> np.ndarray:
-        """Per channel (key, level) std of the targets [4 L] from n random frames."""
+    def tendency_std(self, n: int = 24, seed: int = 0, floor: float = 0.05) -> np.ndarray:
+        """Per channel (key, level) std of the targets [4 L] from n random frames, floored at
+        `floor` x the largest std of the same part: SPEEDY has no friction above the boundary
+        layer and almost no moistening at 50 hPa, and a near-zero std there would blow the
+        normalised error of any non-zero model tendency up by 1e6 or more."""
         if self._std is None:
             rng = np.random.default_rng(seed)
             frames = []
@@ -114,7 +117,9 @@ class EpisodeSet:
                 times = self.ds[e].time.values
                 frames.append(self.tendency(e, [times[int(rng.integers(2, len(times)))]]))
             x = np.concatenate(frames, 0)
-            self._std = np.maximum(x.std((0, 2, 3)), 1e-12).astype(np.float32)
+            std = x.std((0, 2, 3)).reshape(len(TEND_KEYS), -1)
+            std = np.maximum(std, floor * std.max(1, keepdims=True))
+            self._std = np.maximum(std.reshape(-1), 1e-12).astype(np.float32)
         return self._std
 
     def batch(self, e: int, j: int, steps: int, device="cpu") -> Dict[str, torch.Tensor]:
