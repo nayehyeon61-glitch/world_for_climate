@@ -8,6 +8,12 @@
     python scripts/train_speedy_game.py train --init runs/stage14/adapt/checkpoint.pt --arm lp ...
     # S1/S4 response evaluation on the 1984 branch points
     python scripts/train_speedy_game.py eval --init runs/stage14/lp/checkpoint.pt ... --out runs/stage14/lp/response.json
+
+Memory model (감자 18:07 KST 11/01, "fill the memory more, then the RL structure"): adapt runs/stage13_E2 with
+scripts/train_energy_corrector.py --config configs/speedy_memory_adapt.yaml, then
+    python scripts/train_speedy_game.py fill --init runs/stage14/M_adapt/checkpoint.pt --snapshots SNAPS.pt ...
+(one continuous re-observed pass through the nature run 1982-84, memory snapshot at every 5-day branch point)
+and give --snapshots SNAPS.pt to train / eval: every window starts from the filled memory.
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ from climate_wm import pipeline
 from climate_wm.sim.intervention_game import (GameConfig, SpeedyWorld, response_eval, test_actions,
                                               train_actions, train_game)
 from climate_wm.train.memory_filter import expand_state_dict
+from compare_memory import ContinuousFill
 
 
 def build(args, device):
@@ -56,7 +63,9 @@ def build(args, device):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=["train", "eval"])
+    ap.add_argument("mode", choices=["train", "eval", "fill"])
+    ap.add_argument("--snapshots", default=None, help="memory snapshots (fill writes them; train/eval read them)")
+    ap.add_argument("--cold", action="store_true", help="eval: ignore the snapshots (empty memory; knock-out)")
     ap.add_argument("--init", required=True)
     ap.add_argument("--speedy", required=True)
     ap.add_argument("--data", required=True, help="nature-run root (nature.zarr, restarts/, static.nc)")
@@ -77,6 +86,20 @@ def main() -> None:
     args.work = args.work or os.path.join(args.data, "work")
     os.makedirs(args.out, exist_ok=True)
     cfg, model, stats, world = build(args, args.device)
+    snaps = None
+    if args.mode == "fill":
+        model.eval()
+        start = "1982-01-01T12:00"
+        wanted = [int(np.datetime64(t).astype("datetime64[s]").astype(np.int64))
+                  for t in world.branch_points("1982-01-02", "1985-01-01", 0)]
+        fill = ContinuousFill(model, world.nature, world.layout, stats, start, wanted, chunk=120,
+                              device=args.device, path=args.snapshots + ".pass", log=print)
+        torch.save({"snaps": fill.snaps, "resets": fill.resets, "checkpoint": args.init}, args.snapshots)
+        print(f"saved {len(fill.snaps)} snapshots ({fill.resets} memory resets) to {args.snapshots}")
+        return
+    if args.snapshots and not (args.mode == "eval" and args.cold):
+        snaps = torch.load(args.snapshots, map_location="cpu", weights_only=False)["snaps"]
+        print(f"memory snapshots: {len(snaps)} from {args.snapshots}")
 
     if args.mode == "train":
         gc = GameConfig(arm=args.arm, updates=args.updates, lr=args.lr, seed=args.seed)
@@ -93,7 +116,7 @@ def main() -> None:
         def save(progress):
             pipeline.save_checkpoint(ckpt, cfg, model, stats, {"game": progress["history"]}, progress)
 
-        hist = train_game(model, world, gc, args.device, resume, save)
+        hist = train_game(model, world, gc, args.device, resume, save, snaps=snaps)
         pipeline.save_checkpoint(ckpt, cfg, model, stats, {"game": hist})
         with open(os.path.join(args.out, "game_history.json"), "w") as f:
             json.dump({"config": dataclasses.asdict(gc), "history": hist,
@@ -105,11 +128,14 @@ def main() -> None:
         acts = test_actions()
         if args.eval_subset == "warm":   # held-out sites +2 K, solar +2 %, CO2 x1.25
             acts = [a for a in acts if a.name.endswith("+") or a.name in ("solar1.02", "co2x1.25")]
-        res = response_eval(model, world, [points[i] for i in idx], acts, args.eval_steps, args.device)
+        res = response_eval(model, world, [points[i] for i in idx], acts, args.eval_steps, args.device,
+                            snaps=snaps)
         res["checkpoint"] = args.init
-        with open(os.path.join(args.out, "response.json"), "w") as f:
+        res["memory"] = "cold" if args.cold else ("filled" if snaps is not None else "none")
+        name = "response_cold.json" if args.cold else "response.json"
+        with open(os.path.join(args.out, name), "w") as f:
             json.dump(res, f)
-        print(f"saved {os.path.join(args.out, 'response.json')}")
+        print(f"saved {os.path.join(args.out, name)}")
 
 
 if __name__ == "__main__":

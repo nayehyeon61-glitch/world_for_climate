@@ -168,10 +168,25 @@ class SpeedyWorld:
         return batch
 
 
-def rollout_error(model, batch, steps: int, cap: float = 10.0) -> Tuple[torch.Tensor, bool]:
+def begin_filled(model, batch, snaps: Optional[Dict[int, torch.Tensor]] = None):
+    """model.begin, and for a memory model the memory snapshot of the
+    initialisation (one continuous fill pass through the nature run before it;
+    scripts/compare_memory.ContinuousFill) absorbed with the initial state, as
+    compare_memory.FilledStart. Without snapshots the memory starts empty."""
+    state, ctx = model.begin(batch)
+    if snaps is not None and getattr(model, "memory", None) is not None:
+        t = int(batch["init_time"][0])
+        state["mem"] = snaps[t].to(batch["inputs"].device)
+        snap = batch["inputs"][:, -1]
+        state = model.posterior(state, ctx, snap, snap, torch.zeros_like(snap))
+    return state, ctx
+
+
+def rollout_error(model, batch, steps: int, cap: float = 10.0,
+                  snaps: Optional[Dict[int, torch.Tensor]] = None) -> Tuple[torch.Tensor, bool]:
     """GraphCast-weighted error over `steps` (differentiable); blown = non-finite or > cap."""
     attach_loss(model)
-    state, ctx = model.begin(batch)
+    state, ctx = begin_filled(model, batch, snaps)
     losses = []
     tmask = torch.zeros_like(batch["targets"][:, 0])
     for k in range(steps):
@@ -253,9 +268,13 @@ def random_world(rng: np.random.Generator) -> Action:
 
 def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
                state: Optional[dict] = None, save: Optional[Callable[[dict], None]] = None,
-               log: Callable[[str], None] = print) -> dict:
+               log: Callable[[str], None] = print,
+               snaps: Optional[Dict[int, torch.Tensor]] = None) -> dict:
     """Runs `cfg.updates` updates of the world model (and the experimenter for
-    arm lp); `state` resumes (history, optimizer, experimenter, rng)."""
+    arm lp); `state` resumes (history, optimizer, experimenter, rng).
+    With memory snapshots (memory model filled through the nature run) every
+    window starts at the branch point with its filled memory, and the
+    learning-progress probe is the same window after the update."""
     acts = train_actions()
     rng = np.random.default_rng(cfg.seed)
     points = world.branch_points(cfg.train_start, cfg.train_end, cfg.branch_days)
@@ -290,18 +309,23 @@ def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
             a = exp.sample(rng)
             act = acts[a]
         ds = world.branch(t0, act, cfg.branch_days)
-        start_day = int(rng.integers(2))
+        start_day = 0 if snaps is not None else int(rng.integers(2))
         batch = world.window(ds, t0 + dt.timedelta(days=start_day), cfg.train_steps, act, device)
         probe = None
         before = after = float("nan")
         if cfg.arm == "lp":
-            probe = world.window(ds, t0 + dt.timedelta(days=cfg.probe_day), cfg.train_steps, act, device)
-            with torch.no_grad():
-                e, blown_p = rollout_error(model, probe, cfg.train_steps)
-                before = float(e) if e is not None and not blown_p else 10.0
+            if snaps is not None:   # the probe is the training window itself: its loss is the "before"
+                probe = batch
+            else:
+                probe = world.window(ds, t0 + dt.timedelta(days=cfg.probe_day), cfg.train_steps, act, device)
+                with torch.no_grad():
+                    e, blown_p = rollout_error(model, probe, cfg.train_steps)
+                    before = float(e) if e is not None and not blown_p else 10.0
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss, blown = rollout_error(model, batch, cfg.train_steps)
+        loss, blown = rollout_error(model, batch, cfg.train_steps, snaps=snaps)
+        if cfg.arm == "lp" and snaps is not None:
+            before = float(loss) if loss is not None and not blown else 10.0
         if loss is not None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
@@ -310,7 +334,7 @@ def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
         reward = float("nan")
         if cfg.arm == "lp":
             with torch.no_grad():
-                e, blown_p = rollout_error(model, probe, cfg.train_steps)
+                e, blown_p = rollout_error(model, probe, cfg.train_steps, snaps=snaps)
                 after = float(e) if e is not None and not blown_p else 10.0
             reward = (before - after) / max(before, 1e-6)
             exp.update(a, reward)
@@ -330,9 +354,19 @@ def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
     return hist
 
 
+def _free_run(model, batch, steps: int, snaps=None) -> np.ndarray:
+    state, ctx = begin_filled(model, batch, snaps)
+    preds = []
+    for k in range(steps):
+        state, precip = model.advance(state, ctx, k)
+        preds.append(model.predict(state, ctx, k, precip))
+    return torch.stack(preds, 1).cpu().numpy()[0]
+
+
 @torch.no_grad()
 def response_eval(model, world: SpeedyWorld, points: Sequence[dt.datetime], actions: Sequence[Action],
-                  steps: int, device="cpu", log: Callable[[str], None] = print) -> dict:
+                  steps: int, device="cpu", log: Callable[[str], None] = print,
+                  snaps: Optional[Dict[int, torch.Tensor]] = None) -> dict:
     """S1/S4: per (branch point, action) the true response (branch - nature) and
     the model's (forecast with the action - forecast without), physical units,
     leads 1..steps. Returns per-pair RMSE of the response error, pattern
@@ -348,12 +382,12 @@ def response_eval(model, world: SpeedyWorld, points: Sequence[dt.datetime], acti
     for t0 in points:
         nat = world.branch(t0, null, int(math.ceil(steps / 4)) + 1)
         b0 = world.window(nat, t0, steps, null, device)
-        p0 = model.forward_rollout(b0, steps).cpu().numpy()[0]  # normalised [L, C, H, W]
+        p0 = _free_run(model, b0, steps, snaps)                    # normalised [L, C, H, W]
         truth0 = b0["targets"].cpu().numpy()[0]
         for act in actions:
             ds = world.branch(t0, act, int(math.ceil(steps / 4)) + 1)
             b = world.window(ds, t0, steps, act, device)
-            pa = model.forward_rollout(b, steps).cpu().numpy()[0]
+            pa = _free_run(model, b, steps, snaps)
             truth = b["targets"].cpu().numpy()[0]
             r_true = (truth - truth0) * std
             r_pred = (pa - p0) * std

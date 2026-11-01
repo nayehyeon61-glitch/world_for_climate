@@ -77,3 +77,25 @@ def test_game_arms_run_and_response_eval():
     res = response_eval(model, world, world.branch_points(None, None, 1)[:1], test_actions()[:2], steps,
                         log=lambda s: None)
     assert len(res["rows"]) == 2 and "rmse" in res["rows"][0][res["keys"][0]]
+
+
+def test_memory_snapshots_start_the_game_and_the_response_eval():
+    layout, stats, data = _tiny()
+    world = StubWorld(layout, stats, data)
+    steps = min(2, data[0]["targets"].shape[0])
+    model = _with_action(layout, stats, data, memory={"channels": 4, "hidden": 8})
+    torch.manual_seed(2)
+    for p in model.memory.parameters():  # an untrained kernel does nothing
+        p.data.normal_(0, 0.3)
+    batch = world.window(None, None, steps, train_actions()[0])
+    state, _ = model.begin(batch)
+    snaps = {int(batch["init_time"][0]): torch.randn_like(state["mem"])}
+    hist = train_game(model, world, GameConfig(arm="lp", updates=2, train_steps=steps), log=lambda s: None,
+                      snaps=snaps)
+    assert len(hist["update"]) == 2 and np.isfinite(hist["reward"]).all()
+    model.eval()
+    pts, acts = world.branch_points(None, None, 1)[:1], test_actions()[:1]
+    filled = response_eval(model, world, pts, acts, steps, log=lambda s: None, snaps=snaps)
+    empty = response_eval(model, world, pts, acts, steps, log=lambda s: None)
+    k = filled["keys"][0]
+    assert filled["rows"][0][k]["rmse"] != empty["rows"][0][k]["rmse"]  # the filled memory acts on the response
