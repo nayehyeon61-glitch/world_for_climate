@@ -8,6 +8,11 @@
     python scripts/train_sequential_game.py eval --init runs/stage14_2/policy/checkpoint.pt ... \
         --out runs/stage14_2/policy
 
+On the cluster (GPU, 96 GB): the student runs on the GPU with --device cuda; SPEEDY stays on the
+CPU (~1 s per 2-day member), so the per-decision cost is the student's 40 steps. Suggested scale:
+--device cuda --threads 8 --members 8 --episodes 200 (800 decisions; the container runs 20 episodes
+with 4 members).
+
 Resumable at episode boundaries (checkpoint.pt carries the progress). `--preflight` runs one
 decision and exits (chains run it before the real job: a broken pipeline stops in minutes).
 """
