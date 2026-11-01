@@ -601,7 +601,15 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 - C3 GraphCast: 24·72시간 RMSE 비. 1.5배 이하면 GraphCast급인데, 이 단계의 어떤 모델도 거기 이르리라 기대하지 않습니다.
 - C4 ClimODE (간접): 2018년 24시간에서 콜드 기억 모델의 RMSE가 ClimODE 공개값보다 4개 변수(z500·t850·t2m·u10) 중 3개 이상에서 낮음.
 
-**결과:** 실행 중 (콜드 2020 → 웜 2020 → 2018; 11/01 ~14:00 KST).
+**결과 (11/01 12:15 KST, `stage10_memory/compare.md`; 이득은 + = 개선):**
+- **콜드스타트 2020 (빈 기억, 31개 초기 시각):** 기억 모델이 N1보다 2–3배 나쁩니다. z500 24h 601 대 N1 258 대 GraphCast 35 m²/s²; 72h 2241 / 682 / 116; t2m 72h 14.2 대 4.6 K; 120h 전에 NaN. 재관측 확률 0.5의 36h 게임으로 함께 학습한 칼럼이 필터가 되어 자유 예보를 잃었습니다(10단계의 2020 이득 +37%는 재관측 게임 안의 값).
+- **웜스타트(10일 채움):** 콜드 오차의 50–65%를 되찾지만 N1 뒤입니다. z500 24h 301(N1의 1.16배), 72h 766(1.12배), 120h 1703(1.54배); t2m 72h 6.23(1.36배); u10 24h 2.17(1.04배); 폭주 3/31. 콜드 대비 24h 이득 +35% 중 커널 자체가 +27%, 스핀업만(warm_no_memory)이 +11%; 72h부터 커널 이득 +43%이고 커널 없이는 콜드처럼 발산(z500 72h 2178).
+- **2018년(ClimODE 간접 비교, 기억 모델에는 학습 연도):** 24h에서 콜드 기억 모델은 5개 변수 모두 ClimODE 위(z500 592 대 193; N1 254, GraphCast 34; t850 3.38 / 1.55 / 1.85; t2m 5.10 / 1.40 / 2.42). N1은 u10·v10에서 ClimODE 근처(2.06 / 2.01, 2.16 / 2.04), z500 1.3배, t850 1.2배, t2m 1.7배.
+- **관측 공급(캡 25% 숨김, 나머지는 6h마다 재관측, 10일 채움 뒤 120h):** 기억 모델의 사후분포가 31/31 폭주(캡 위 6h z500 115 대 N1+너징 92, −25%); N1+너징 1/31; GraphCast 자유예보가 캡에서 N1+너징보다 6h에 8–14배 좋음. 빈 기억에서 36h 게임은 1/31만 폭주했으니, 채워진 기억 + 지속되는 캡이 판독/혁신 되먹임을 만들어 미세조정된 칼럼을 넘어뜨립니다(13단계 체인 8이 E1 바운드 아래서 재시험).
+- **채움 길이(10일 / 30일 / 2년 연속):** 30일은 10일보다 z500 24h +2.0%, 120h +7.5%; 2년 연속 채움은 30일보다 24h −3.6%(z500 −10.7%, t850 −4.7%), 120h +5.5%(z500 +6.8%, t2m +7.5%) — 짧은 리드는 나빠지고 긴 리드는 좋아집니다. 폭주 3/31 모두.
+- **판정:** C1 형식상 기각(스핀업 통제군이 1% 밖), 커널 효과는 분명. C2 이득이 120h까지 1% 위. C3 GraphCast 대비 N1 24h 6.2배·72h 5.6배, 웜 기억 7.1배·6.6배. C4 기각(0/5). C5·C6 기각(폭주). 10.2의 L1 포화 기각(아래).
+- **원인 분석:** (1) 빈 기억은 분포 밖이고(스핀업만으로 +11%), (2) 미세조정된 칼럼이 N1에서 멀어졌습니다(리드가 길수록 격차 ↑; 13단계: 칼럼 최대 플럭스가 N1의 3배). (3) 기억은 자유 예보를 N1 위로 올리지 못합니다 — 게임 학습이 "관측을 쓰는 법"을 가르쳤지 "관측 없이 가는 법"을 가르치지 않았습니다. (4) 2년 채움이 30일과 다르므로 커널의 실효 시간 규모는 명목 τ(≤10일)보다 깁니다(비선형 갱신).
+- **방향:** 10.2 L0(연속 필터 학습만)가 N1급 자유 예보를 되찾는지가 핵심(L2); 13단계 E1/E2 바운드로 관측 공급 폭주를 막고(체인 8·9); 12단계처럼 캡을 예보 + 판독으로 채우는 평가로 옮김; 2년 기억의 긴 리드 이득(+5–7%)은 10.2 L(느린 채널)로 가져감.
 
 ### 10.2 2년의 기억: 느린 채널과 연속 필터 학습 (`stage10_memory/long.md`)
 
@@ -626,7 +634,7 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **시간:** 학습 L·L0 각 ~2h(A줄, 11단계 뒤 ~23:00부터), 채움·평가 ~1.5h → 11/02 아침 보고. 싼 시험은 11/01 ~13:30.
 
-**결과:** 실행 대기.
+**싼 시험 결과 (11/01 12:05 KST, 체인 4, `stage10_memory/compare.md` "Fill length"):** **L1 기각.** 현재 커널(τ ≤ 10일)에서도 2년 연속 채움은 30일 스핀업과 다릅니다 — 24h는 −3.6%(z500 −10.7%, t850 −4.7%, msl −2.1%), 120h는 +5.5%(z500 +6.8%, t850 +7.1%, t2m +7.5%, u850 +2.0%); 72h는 거의 같음(+0.7% ~ +5.7%). 30일 대 10일은 24h +0.4~2.0%, 120h +3.7~7.5%. 해석: 갱신이 비선형(게이트·혁신 흡수)이라 기억의 실효 시간 규모가 명목 τ보다 길어 2년 동안 쌓인 상태가 30일과 다르고, 그 상태는 긴 리드(2–5일)의 예보를 돕지만 첫날의 예보는 해칩니다(채워진 상태가 학습 분포(36h 게임, 빈 기억에서 출발) 밖). 10.2의 L(느린 채널 + 연속 학습)은 바로 이 긴 리드 이득을 학습으로 가져오고, L0는 첫날의 손해를 없애는지(L2) 봅니다. L3·L4는 학습 뒤(11/02 아침).
 
 ---
 
@@ -755,7 +763,9 @@ python scripts/compare_memory.py --checkpoint runs/stage10_Dnoactor/checkpoint.p
 python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/compare_graphcast_2020.json \
     n1=runs/physics_n1/compare_graphcast_2020.json --warm2020 runs/stage10_Dnoactor/compare_memory_2020.json \
     --cold2018 memory=runs/stage10_Dnoactor/compare_graphcast_2018.json n1=runs/physics_n1/compare_graphcast.json \
-    n0=runs/physics_n0/compare_graphcast.json --out docs/results/stage10_memory/compare.md
+    n0=runs/physics_n0/compare_graphcast.json --obs2020 runs/stage10_Dnoactor/compare_obs_2020.json \
+    --fill2020 warm30=runs/stage10_Dnoactor/compare_memory30_2020.json fill=runs/stage10_Dnoactor/compare_fill_2020.json \
+    --out docs/results/stage10_memory/compare.md
 # 13단계 E2 / E3 (보정자 학습; PYTHONPATH 에 neuraloperator; E3: --set corrector.neutral=false corrector.soft_weight=1.0, 바운드 없이)
 python scripts/train_energy_corrector.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/energy_corrector_wb2.yaml \
     --data-dir DATA2020 --out runs/stage13_E2 --set model.column.energy_max_flux=500 model.column.energy_no_work=true

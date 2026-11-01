@@ -189,6 +189,43 @@ Hidden cap of 25% of the sphere per initialisation (mean hidden weight 0.25); RM
 | tp6 | 120 h | 0.0009066 | 0.001423 | 0.002398 | 2.64x | 1.68x |
 
 
+## Fill length: 10 days, 30 days, two years (2020)
+
+Per variable: RMSE of the free run after a 10-day spin-up, a 30-day spin-up and a continuous fill from 2018-01-01 (memory carried through two years); gains against the 10-day spin-up, + = better.
+
+| variable | lead | 10 d | 30 d | 2 y | gain 30 d | gain 2 y | 2 y vs 30 d |
+|---|---|---|---|---|---|---|---|
+| z500 | 24 h | 301 | 294 | 326 | +2.0% | -8.4% | -10.7% |
+| z500 | 72 h | 766 | 733 | 728 | +4.3% | +4.9% | +0.7% |
+| z500 | 120 h | 1703 | 1576 | 1469 | +7.5% | +13.7% | +6.8% |
+| t850 | 24 h | 2.035 | 2.028 | 2.123 | +0.4% | -4.3% | -4.7% |
+| t850 | 72 h | 4.054 | 3.998 | 3.884 | +1.4% | +4.2% | +2.9% |
+| t850 | 120 h | 6.9 | 6.642 | 6.173 | +3.7% | +10.5% | +7.1% |
+| q700 | 24 h | 0.0008877 | 0.0008865 | 0.0008908 | +0.1% | -0.4% | -0.5% |
+| q700 | 72 h | 0.001827 | 0.001822 | 0.00182 | +0.3% | +0.4% | +0.1% |
+| q700 | 120 h | 0.002463 | 0.00246 | 0.002428 | +0.1% | +1.4% | +1.3% |
+| u850 | 24 h | 2.902 | 2.905 | 2.913 | -0.1% | -0.4% | -0.3% |
+| u850 | 72 h | 4.732 | 4.728 | 4.716 | +0.1% | +0.3% | +0.3% |
+| u850 | 120 h | 6.452 | 6.385 | 6.258 | +1.0% | +3.0% | +2.0% |
+| t2m | 24 h | 3.001 | 2.989 | 2.945 | +0.4% | +1.9% | +1.5% |
+| t2m | 72 h | 6.231 | 6.112 | 5.765 | +1.9% | +7.5% | +5.7% |
+| t2m | 120 h | 11 | 10.56 | 9.772 | +4.0% | +11.2% | +7.5% |
+| msl | 24 h | 358 | 356 | 364 | +0.5% | -1.5% | -2.1% |
+| msl | 72 h | 708 | 692 | 692 | +2.3% | +2.2% | -0.1% |
+| msl | 120 h | 1326 | 1241 | 1184 | +6.4% | +10.7% | +4.6% |
+| u10 | 24 h | 2.17 | 2.17 | 2.178 | -0.0% | -0.4% | -0.4% |
+| u10 | 72 h | 3.419 | 3.419 | 3.417 | -0.0% | +0.1% | +0.1% |
+| u10 | 120 h | 4.271 | 4.265 | 4.234 | +0.1% | +0.9% | +0.7% |
+| v10 | 24 h | 2.297 | 2.297 | 2.305 | +0.0% | -0.3% | -0.3% |
+| v10 | 72 h | 3.588 | 3.583 | 3.583 | +0.2% | +0.2% | -0.0% |
+| v10 | 120 h | 4.534 | 4.516 | 4.456 | +0.4% | +1.7% | +1.3% |
+| tp6 | 24 h | 0.001129 | 0.001131 | 0.001134 | -0.2% | -0.4% | -0.2% |
+| tp6 | 72 h | 0.001332 | 0.00133 | 0.001334 | +0.1% | -0.2% | -0.3% |
+| tp6 | 120 h | 0.001468 | 0.001462 | 0.001451 | +0.4% | +1.2% | +0.7% |
+
+Mean gain of the two-year fill over the 30-day spin-up (z500, t850, t2m, u10): 24 h -3.6%, 72 h +2.3%, 120 h +5.5%; blow-ups {'30 d': 3, '2 y': 3}
+
+
 ## Decision rules
 
 - **C1** memory helps the forecast itself: the warm start lowers the cold start's RMSE by >= 3% at 24 h (mean over z500, t850, t2m, u10) while warm_no_memory stays within 1% of the cold start  
@@ -203,3 +240,5 @@ Hidden cap of 25% of the sphere per initialisation (mean hidden weight 0.25); RM
   → not supported (the memory model blew up before 24 h on most initialisations; 6 h ratio 1.14x; blow-ups {'warm': 31, 'nudging': 1})
 - **C6** crossing: the first lead at which the observation-fed memory model beats GraphCast's free forecast on the cap (mean ratio < 1), if any within 120 h  
   → no crossing within the forecast (memory / GraphCast on the cap: 6 h 10.02x; blow-ups {'warm': 31, 'nudging': 1})
+- **L1** saturation (10.2 cheap test): the two-year continuous fill and the 30-day spin-up differ by <= 1% at 24 h and 120 h (mean over z500, t850, t2m, u10) with the stage 10 kernel (tau <= 10 days)  
+  → not supported (two-year fill vs 30 days: 24 h -3.6%, 120 h +5.5%, + = the longer fill is better; the memory state after two years is not the state after 30 days, so the kernel's effective time scale is longer than its nominal tau)

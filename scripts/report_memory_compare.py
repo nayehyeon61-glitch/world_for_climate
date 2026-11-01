@@ -58,6 +58,8 @@ RULES = {
           "stage 10 P1 in physical units)",
     "C6": "crossing: the first lead at which the observation-fed memory model beats GraphCast's free forecast on "
           "the cap (mean ratio < 1), if any within 120 h",
+    "L1": "saturation (10.2 cheap test): the two-year continuous fill and the 30-day spin-up differ by <= 1% at "
+          "24 h and 120 h (mean over z500, t850, t2m, u10) with the stage 10 kernel (tau <= 10 days)",
 }
 
 
@@ -202,8 +204,36 @@ def observed_section(gc, nudging, memory, summ):
     return "\n".join(lines), {h: float(np.mean(v)) for h, v in vs_gc.items()}, {h: float(np.mean(v)) for h, v in vs_nudge.items()}, cross
 
 
-def verdicts(gains, knock_gain_24, ratios, below, obs=None, obs_blowups=None):
+def fill_section(warm10, warm30, fill, blowups):
+    """Fill length: 10-day spin-up, 30-day spin-up, continuous two-year fill (gain + = better)."""
+    lines = ["Per variable: RMSE of the free run after a 10-day spin-up, a 30-day spin-up and a continuous fill from "
+             "2018-01-01 (memory carried through two years); gains against the 10-day spin-up, + = better.", "",
+             "| variable | lead | 10 d | 30 d | 2 y | gain 30 d | gain 2 y | 2 y vs 30 d |", "|---|---|---|---|---|---|---|---|"]
+    diff = {}
+    for var in VARS:
+        for h in (24, 72, 120):
+            a, b, c = rmse(warm10, var, h), rmse(warm30, var, h), rmse(fill, var, h)
+            if not all(np.isfinite(x) for x in (a, b, c)):
+                continue
+            lines.append(f"| {SHORT[var]} | {h} h | {_f(a)} | {_f(b)} | {_f(c)} | {_pct((a - b) / a)} | {_pct((a - c) / a)} | "
+                         f"{_pct((b - c) / b)} |")
+            if var in HEADLINE:
+                diff.setdefault(h, []).append((b - c) / b)
+    gain = {h: float(np.mean(v)) for h, v in diff.items()}
+    lines += ["", "Mean gain of the two-year fill over the 30-day spin-up (z500, t850, t2m, u10): " +
+              ", ".join(f"{h} h {_pct(g)}" for h, g in gain.items()) +
+              (f"; blow-ups {blowups}" if blowups else "")]
+    return "\n".join(lines), gain
+
+
+def verdicts(gains, knock_gain_24, ratios, below, obs=None, obs_blowups=None, fill_gain=None):
     out = {}
+    if fill_gain and 24 in fill_gain and 120 in fill_gain:
+        ok = abs(fill_gain[24]) <= 0.01 and abs(fill_gain[120]) <= 0.01
+        out["L1"] = (f"{'supported' if ok else 'not supported'} (two-year fill vs 30 days: 24 h {_pct(fill_gain[24])}, "
+                     f"120 h {_pct(fill_gain[120])}, + = the longer fill is better" +
+                     ("" if ok else "; the memory state after two years is not the state after 30 days, so the kernel's "
+                                    "effective time scale is longer than its nominal tau") + ")")
     if obs:
         vs_gc, vs_nudge, cross = obs
         blow = f"; blow-ups {obs_blowups}" if obs_blowups else ""
@@ -240,6 +270,7 @@ def main():
     parser.add_argument("--cold2018", nargs="*", default=[], help="memory=... n1=... n0=...")
     parser.add_argument("--warm2018", default=None)
     parser.add_argument("--obs2020", default=None, help="OUT of compare_memory.py --obs-kind region (warm + nudging)")
+    parser.add_argument("--fill2020", nargs="*", default=[], help="warm30=OUT(--spinup 120) fill=OUT(--fill continuous)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     cold20 = {k: load(v) for k, v in (s.split("=", 1) for s in args.cold2020)}
@@ -318,7 +349,21 @@ def main():
             md += [text, ""]
             obs = (vs_gc, vs_nudge, cross)
             obs_blowups = {k: v.get("blowups") for k, v in osumm.get("variants", {}).items() if "blowups" in v}
-    v = verdicts(gains, knock24, ratios, below, obs, obs_blowups if obs else None)
+    fill_gain = None
+    if args.fill2020 and w20:
+        paths = dict(s.split("=", 1) for s in args.fill2020)
+        w30, fl = warm(paths.get("warm30"), "warm"), warm(paths.get("fill"), "fill")
+        if w30 and fl:
+            blow = {}
+            for name, path in (("30 d", paths["warm30"]), ("2 y", paths["fill"])):
+                sp = path.replace(".json", "_summary.json")
+                if os.path.exists(sp):
+                    with open(sp) as f:
+                        blow[name] = next(iter(json.load(f)["variants"].values())).get("blowups")
+            md += ["", "## Fill length: 10 days, 30 days, two years (2020)", ""]
+            text, fill_gain = fill_section(w20["model"], w30["model"], fl["model"], blow)
+            md += [text, ""]
+    v = verdicts(gains, knock24, ratios, below, obs, obs_blowups if obs else None, fill_gain)
     md += ["", "## Decision rules", ""]
     md += [f"- **{k}** {RULES[k]}  \n  → {v.get(k, 'pending')}" for k in RULES]
     if notes:
