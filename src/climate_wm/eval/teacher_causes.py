@@ -16,6 +16,12 @@ Per cut, block of the equations (physics_causes.groups) and lead:
   ratio  rms model response / rms SPEEDY response (1 = right amplitude)
   gain   1 - err(cut model vs cut truth) / err(uncut model vs cut truth): + when
          applying the cut moves the forecast towards the cut world
+
+With `members` > 0 SPEEDY's response is the mean over that many perturbed restarts
+(each member runs control and cut from the same perturbed state, episodes.PERTURBATION),
+so the target is the forced response rather than forced response + chaotic divergence;
+`snr` = rms of that mean / rms of its standard error says how much of it is signal. The
+model's response is still the one from the unperturbed nature state.
 """
 from __future__ import annotations
 
@@ -26,7 +32,8 @@ import numpy as np
 import torch
 
 from ..sim.intervention_game import Action
-from ..sim.speedy import Intervention
+from ..sim.episodes import PERTURBATION
+from ..sim.speedy import Intervention, Perturbation
 from . import physics_causes as pc
 
 # name -> (SPEEDY intervention, matching model knock-outs; empty = the forcings carry the cut)
@@ -81,27 +88,50 @@ def _mse(a: torch.Tensor, b: torch.Tensor, chans: Sequence[int], lat_w: torch.Te
     return float((d * w).sum() / w.sum())
 
 
+def _snr(mean: torch.Tensor, members: Optional[torch.Tensor], chans: Sequence[int], lat_w: torch.Tensor) -> float:
+    """rms of the ensemble-mean response / rms of its standard error, over `chans` [M, C, H, W]."""
+    if members is None or members.shape[0] < 2:
+        return float("nan")
+    se = members[:, list(chans)].double().std(0) / members.shape[0] ** 0.5
+    w = lat_w.double()[None, :, None].expand_as(se)
+    num = (w * mean[list(chans)].double() ** 2).sum()
+    den = (w * se ** 2).sum()
+    return float(torch.sqrt(num / den)) if den > 0 else float("nan")
+
+
 def score_init(base, models: Dict[str, object], world, t0: dt.datetime, steps: int, days: int,
                groups: Dict[str, List[int]], lat_w: torch.Tensor, device="cpu",
-               cuts: Dict[str, Tuple[Intervention, Tuple[str, ...]]] = CUTS) -> dict:
-    """One initialisation: SPEEDY control and cut branches, model control and cut forecasts."""
+               cuts: Dict[str, Tuple[Intervention, Tuple[str, ...]]] = CUTS, members: int = 0,
+               seed: int = 0) -> dict:
+    """One initialisation: SPEEDY control and cut branches (the mean over `members` perturbed
+    restarts when > 0), model control and cut forecasts."""
     null = Action("control", Intervention())
     ctrl = world.window(world.branch(t0, null, days), t0, steps, null, device)
     p0 = pc.rollout(base, ctrl, steps)[0]
     truth0 = ctrl["targets"][0].float()
-    row = {"init": t0.isoformat(), "cuts": {}}
+    perts = [Perturbation(seed=5000 + 97 * seed + i, **PERTURBATION) for i in range(members)]
+    ctrl_m = [world.window(world.branch(t0, null, days, tag=f"ens{i}_control", perturbation=pt), t0, steps,
+                           null, device)["targets"][0].float() for i, pt in enumerate(perts)]
+    row = {"init": t0.isoformat(), "members": members, "cuts": {}}
     for name, (iv_s, _) in cuts.items():
         act = Action(name, iv_s)
         b = world.window(world.branch(t0, act, days, tag=f"cut_{name}"), t0, steps, act, device)
         p1 = pc.rollout(models[name], b, steps)[0]
         truth1 = b["targets"][0].float()
+        d_ens = None
+        if members:
+            d_ens = torch.stack([world.window(world.branch(t0, act, days, tag=f"ens{i}_{name}", perturbation=pt),
+                                              t0, steps, act, device)["targets"][0].float() - ctrl_m[i]
+                                 for i, pt in enumerate(perts)])  # [M, L, C, H, W]
         out = {}
         for k in LEADS:
             if k > steps:
                 continue
             j = k - 1
             for g, chans in groups.items():
-                m = response_metrics(truth1[j] - truth0[j], p1[j] - p0[j], chans, lat_w)
+                d_true = d_ens[:, j].mean(0) if d_ens is not None else truth1[j] - truth0[j]
+                m = response_metrics(d_true, p1[j] - p0[j], chans, lat_w)
+                m["snr"] = _snr(d_true, d_ens[:, j] if d_ens is not None else None, chans, lat_w)
                 e_cut, e_blind = _mse(p1[j], truth1[j], chans, lat_w), _mse(p0[j], truth1[j], chans, lat_w)
                 m["gain"] = (1.0 - e_cut / e_blind) if np.isfinite(e_cut) and e_blind > 0 else float("nan")
                 m["model_err"] = _mse(p0[j], truth0[j], chans, lat_w)
@@ -135,7 +165,7 @@ def summarize(rows: Sequence[dict], groups: Sequence[str], cuts: Sequence[str]) 
 
 def evaluate_teacher_causes(model_cfg: dict, state: dict, layout, lat, lon, world, points: Sequence[dt.datetime],
                             steps: int = 20, days: int = 5, device="cpu",
-                            cuts: Dict[str, Tuple[Intervention, Tuple[str, ...]]] = CUTS,
+                            cuts: Dict[str, Tuple[Intervention, Tuple[str, ...]]] = CUTS, members: int = 0,
                             done: Optional[List[dict]] = None, save: Optional[Callable[[List[dict]], None]] = None,
                             log: Callable[[str], None] = print) -> dict:
     base = pc.build(model_cfg, state, layout, lat, lon, None, device)
@@ -149,7 +179,8 @@ def evaluate_teacher_causes(model_cfg: dict, state: dict, layout, lat, lon, worl
     lat_w = lat_weights(lat).to(device)
     rows = list(done or [])
     for t0 in points[len(rows):]:
-        rows.append(score_init(base, models, world, t0, steps, days, groups, lat_w, device, cuts))
+        rows.append(score_init(base, models, world, t0, steps, days, groups, lat_w, device, cuts, members,
+                               seed=len(rows)))
         r = rows[-1]["cuts"]
         log(f"[causes15] {t0:%Y-%m-%d} " + " ".join(
             f"{c} T sign {r[c].get('thermodynamics@12', {}).get('sign', float('nan')):.2f}" for c in cuts))

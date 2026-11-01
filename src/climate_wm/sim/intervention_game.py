@@ -28,7 +28,7 @@ import xarray as xr
 from ..data.era5_lazy_loader import GraphCastWindowDataset, standardize
 from ..train.physics_game import _finite, attach_loss
 from ..train.prediction_game import errors
-from .speedy import Intervention, SpeedyRunner, read_native, read_static, to_dataset, to_wb2
+from .speedy import Intervention, Perturbation, SpeedyRunner, read_native, read_static, to_dataset, to_wb2
 
 # 24 open-ocean patch centres (lon E, lat N): tropical and subtropical Pacific,
 # Atlantic and Indian oceans, and the Southern Ocean
@@ -131,16 +131,19 @@ class SpeedyWorld:
             if self.sea[j, k] < 0.9:
                 raise ValueError(f"site {i} ({lon}, {lat}) is not open sea ({self.sea[j, k]:.2f})")
 
-    def branch(self, t0: dt.datetime, action: Action, days: int, tag: str = "branch") -> xr.Dataset:
-        """Nature frames t0 - 6 h and t0 followed by the (intervened) branch to t0 + days."""
+    def branch(self, t0: dt.datetime, action: Action, days: int, tag: str = "branch",
+               perturbation: Optional[Perturbation] = None) -> xr.Dataset:
+        """Nature frames t0 - 6 h and t0 followed by the (intervened) branch to t0 + days.
+        With `perturbation` (stage 15.4 ensembles, the speedy15 binary) the branch starts from
+        the perturbed restart, also for the null action; the two input frames stay the nature's."""
         six = np.timedelta64(6, "h")
         start = np.datetime64(t0) - six
         end = np.datetime64(t0 + dt.timedelta(days=days))
-        if action.intervention.is_null():
+        if action.intervention.is_null() and perturbation is None:
             return self.nature.sel(time=slice(start, end))
         run = self.runner.run(tag, t0, t0 + dt.timedelta(days=days),
                               restart_in=str(self.root / "restarts" / f"{t0:%Y%m%d}.bin"),
-                              restart_out=False, intervention=action.intervention)
+                              restart_out=False, intervention=action.intervention, perturbation=perturbation)
         times = self.runner.output_times(run, t0)
         arrays = to_wb2(read_native(run, times), self.static_native)
         ds = standardize(to_dataset(arrays, times), hours=None)

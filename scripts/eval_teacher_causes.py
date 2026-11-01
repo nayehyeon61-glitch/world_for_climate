@@ -4,7 +4,8 @@
         --data DATA/speedy_wb2 --work WORK --out runs/stage15/N1T/causes15.json [--inits 12 --days 5]
 
 Initialisations: the nature-run restarts of the test year 1984, evenly spaced. The
-cuts need the speedy15 binary (physics tendency scales). Resumable (OUT.progress).
+cuts and the perturbed ensemble (--members, default 4) need the speedy15 binary.
+Resumable (OUT.progress).
 """
 import argparse
 import datetime as dt
@@ -32,6 +33,8 @@ def main() -> None:
     ap.add_argument("--start", default="1984-01-01")
     ap.add_argument("--end", default="1984-12-31")
     ap.add_argument("--cuts", nargs="+", default=list(CUTS))
+    ap.add_argument("--members", type=int, default=4,
+                    help="perturbed SPEEDY restarts whose mean response is the target (0 = the single branch)")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
@@ -56,7 +59,8 @@ def main() -> None:
 
     res = evaluate_teacher_causes(cfg["model"], model.state_dict(), model.layout, model.lat, model.lon, world,
                                   points, args.steps, args.days, args.device,
-                                  {c: CUTS[c] for c in args.cuts}, done, save)
+                                  cuts={c: CUTS[c] for c in args.cuts}, members=args.members, done=done, save=save)
+    res["members"] = args.members
     res["checkpoint"] = args.init
     with open(args.out, "w") as f:
         json.dump(res, f)
