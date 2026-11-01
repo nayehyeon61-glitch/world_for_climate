@@ -6,6 +6,9 @@
     python scripts/train_teacher.py train ... --out runs/stage15/N1S --lambda-tend 0
     # T1 on the held-out episodes: state error per lead, tendency pattern correlation
     python scripts/train_teacher.py eval --init runs/stage15/N1T/checkpoint.pt ... --out runs/stage15/N1T
+    # F1 control: a fresh pure SFNO stepper on the same episodes (state loss only; needs neuraloperator)
+    python scripts/train_teacher.py train --model f1 --init runs/physics_n1/checkpoint.pt ... \
+        --out runs/stage15/F1 --lambda-tend 0 --lr 1e-3
 
 The model gets the stage 14 action channels (CO2 / solar of group C) and
 SPEEDY's daily-mean insolation. Resumable (OUT/progress.pt).
@@ -28,7 +31,13 @@ def build(args, device):
     cfg = dict(cfg)
     model_cfg = dict(cfg["model"])
     model_cfg["action_channels"] = 3
-    model_cfg["solar"] = "daily_mean"
+    if getattr(args, "model", "physics") == "f1" and model_cfg.get("type") != "stepper":
+        # stage 15 control F1: a fresh pure SFNO stepper; --init only gives the data layout and stats
+        model_cfg = {"type": "stepper", "hidden": args.f1_hidden, "layers": args.f1_layers,
+                     "modes": args.f1_modes, "action_channels": 3}
+        state = None
+    if model_cfg.get("type") != "stepper":
+        model_cfg["solar"] = "daily_mean"
     cfg["model"] = model_cfg
     data = dict(cfg["data"])
     data.update(source="zarr", path=os.path.join(args.nature, "nature.zarr"), load_into_memory=False,
@@ -43,8 +52,14 @@ def build(args, device):
     nature = pipeline.open_dataset(cfg)
     train_ds, _, _ = pipeline.build_datasets(cfg, layout, nature, stats)
     model = pipeline.build_model(cfg, layout, train_ds).to(device)
-    grown = expand_state_dict(model, state)
-    print(f"loaded {args.init}; widened: {grown}")
+    if state is None:
+        print(f"fresh {model_cfg['type']} model, {sum(p.numel() for p in model.parameters())} parameters")
+    elif model_cfg.get("type") == "stepper":
+        model.load_state_dict(state, strict=False)
+        print(f"loaded {args.init}")
+    else:
+        grown = expand_state_dict(model, state)
+        print(f"loaded {args.init}; widened: {grown}")
     return cfg, model, stats, layout
 
 
@@ -64,11 +79,19 @@ def main() -> None:
     ap.add_argument("--eval-stride", type=int, default=16)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--model", choices=["physics", "f1"], default="physics",
+                    help="f1: train a fresh pure SFNO stepper (control) instead of fine-tuning --init")
+    ap.add_argument("--f1-hidden", type=int, default=64)
+    ap.add_argument("--f1-layers", type=int, default=4)
+    ap.add_argument("--f1-modes", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=None)
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     os.makedirs(args.out, exist_ok=True)
     cfg, model, stats, layout = build(args, args.device)
     tc = dict(lambda_tend=args.lambda_tend, seed=args.seed)
+    if args.lr is not None:
+        tc["lr"] = args.lr
     if args.tend_keys:
         tc["tend_keys"] = args.tend_keys
     if args.groups:

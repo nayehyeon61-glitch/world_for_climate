@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 import _path  # noqa: F401
-from climate_wm.sim.episodes import dir_size, plan_episodes, write_episode
+from climate_wm.sim.episodes import dir_size, is_complete, plan_episodes, write_episode
 from climate_wm.sim.speedy import SpeedyRunner
 
 
@@ -49,8 +49,10 @@ def main() -> None:
             continue
         tic = time.time()
         write_episode(runner, s, args.nature, str(out))
-        done_days = sum(e.days for e in specs if (out / f"{e.name}.zarr" / "zarr.json").exists())
-        size = dir_size(out) / 1e9
+        # complete episodes only; the SPEEDY work directory (_work, raw netCDF of a killed run) is not stored data
+        done = [e for e in specs if is_complete(out / f"{e.name}.zarr")]
+        done_days = sum(e.days for e in done)
+        size = sum(dir_size(out / f"{e.name}.zarr") for e in done) / 1e9
         projected = size / done_days * total_days
         print(f"[episodes] {s.name} ({s.group}, {s.split}, {s.start:%Y-%m-%d}, {s.days} d) "
               f"{time.time() - tic:.0f} s, {size:.2f} GB so far, projected {projected:.2f} GB", flush=True)

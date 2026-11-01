@@ -48,11 +48,18 @@ class Intervention:
     drag_factor: float = 1.0
     # SST patches: (lon deg E, lat deg N, e-folding radius deg, amplitude K)
     patches: Tuple[Tuple[float, float, float, float], ...] = ()
+    # Stage 15.4 cuts (speedy15 binary only): scale the total physics tendency of T, q and (u, v)
+    heat_scale: float = 1.0
+    moist_scale: float = 1.0
+    mom_scale: float = 1.0
 
     def namelist(self) -> str:
         lines = [f"solar_factor = {self.solar_factor}", f"co2_factor = {self.co2_factor}",
                  f"conv_factor = {self.conv_factor}", f"drag_factor = {self.drag_factor}",
                  f"n_patch = {len(self.patches)}"]
+        for k in ("heat_scale", "moist_scale", "mom_scale"):  # only when set: the stage 14 binary lacks them
+            if getattr(self, k) != 1.0:
+                lines.append(f"{k} = {getattr(self, k)}")
         for i, (lon, lat, rad, amp) in enumerate(self.patches, 1):
             lines += [f"patch_lon({i}) = {lon}", f"patch_lat({i}) = {lat}",
                       f"patch_radius({i}) = {rad}", f"patch_amp({i}) = {amp}"]

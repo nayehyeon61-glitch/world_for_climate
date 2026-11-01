@@ -1,6 +1,9 @@
 #!/bin/bash
 # Stage 14/15: build the patched SPEEDY (speedy.f90) used as the simulator environment and teacher
 # (&control tend_out = .true. also writes the per-process physics tendencies, yyyymmddhhmm_tend.nc).
+# Stage 15.4: &control heat_scale / moist_scale / mom_scale (default 1) scale the total physics tendency of
+# T, q and (u, v) for the ground-truth causal cuts (eval/teacher_causes.py); with the defaults the state output is bit-identical
+# to the stage 14 build (checked over 2 days; two diagnostic values differ in the last bit).
 #   bash scripts/setup_speedy.sh DEST      (DEST/bin/speedy, DEST/data/bc/t30 afterwards)
 # Needs gfortran and the NetCDF Fortran library (Ubuntu: apt-get install gfortran libnetcdff-dev).
 set -e

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from climate_wm.train.teacher import TEND_KEYS, TeacherConfig, evaluate_teacher, teacher_rollout, train_teacher
@@ -62,3 +63,34 @@ def test_state_only_arm_ignores_the_teacher():
 def dataclasses_replace(cfg, **kw):
     import dataclasses
     return dataclasses.replace(cfg, **kw)
+
+
+def test_f1_stepper_trains_without_tendencies_and_reloads():
+    pytest.importorskip("neuralop")
+    from climate_wm.models.neural_stepper import NeuralStepper, StepperConfig
+    layout, stats, data = _tiny()
+    torch.manual_seed(0)
+    f1 = NeuralStepper(StepperConfig(hidden=8, layers=2, modes=4), layout, data.lat)
+    f1.set_normalization(stats)
+    eps = StubEpisodes(data, len(layout.task.pressure_levels))
+    steps = min(2, data[0]["targets"].shape[0])
+    std = torch.from_numpy(eps.tendency_std())
+    cfg = TeacherConfig(curriculum=((steps, 15),), lambda_tend=0.0, lr=3e-3, log_every=100)
+    with torch.no_grad():
+        ls0, lt0, blown = teacher_rollout(f1, eps.batch(0, 0, steps), steps, std, cfg)
+        # starts as persistence of the last input
+        state, ctx = f1.begin(eps.batch(0, 0, steps))
+        assert torch.equal(f1.advance(state, ctx, 0)[0]["x"], state["x"])
+    assert not blown and float(lt0) == 0.0
+    hist = train_teacher(f1, eps, cfg, log=lambda s: None)
+    with torch.no_grad():
+        ls1, _, _ = teacher_rollout(f1, eps.batch(0, 0, steps), steps, std, cfg)
+    assert float(ls1) < float(ls0) and len(hist["state"]) == 15
+    ev = evaluate_teacher(f1, eps, steps, 1, std, log=lambda s: None)
+    assert ev["windows"] == 1 and ev["blown"] == 0 and np.isnan(ev["corr_mean"]["Q"]).all()
+    g = NeuralStepper(StepperConfig(hidden=8, layers=2, modes=4), layout, data.lat)
+    res = g.load_state_dict(f1.state_dict(), strict=False)
+    assert not [k for k in res.missing_keys if not k.endswith("_metadata")]
+    with torch.no_grad():
+        assert torch.allclose(g.forward_rollout(eps.batch(0, 0, steps), steps),
+                              f1.forward_rollout(eps.batch(0, 0, steps), steps))

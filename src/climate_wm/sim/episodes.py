@@ -111,8 +111,7 @@ def write_episode(runner: SpeedyRunner, spec: EpisodeSpec, nature_root: str, out
     import zarr
     root = Path(nature_root)
     out = Path(out_dir) / f"{spec.name}.zarr"
-    if out.exists() and (out / "zarr.json").exists() and json.loads((out / "zarr.json").read_text()).get(
-            "attributes", {}).get("complete"):
+    if is_complete(out):
         return out
     if out.exists():
         shutil.rmtree(out)
@@ -155,3 +154,9 @@ def episode_tendencies(ds) -> Dict[str, "object"]:
 
 def dir_size(path: Path) -> int:
     return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+
+
+def is_complete(path: Path) -> bool:
+    """Whether OUT/<name>.zarr was written to the end (write_episode sets the attribute last)."""
+    meta = Path(path) / "zarr.json"
+    return meta.exists() and bool(json.loads(meta.read_text()).get("attributes", {}).get("complete"))

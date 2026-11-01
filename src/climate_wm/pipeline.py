@@ -128,7 +128,10 @@ def build_datasets(cfg: dict, layout: gm.ChannelLayout, ds,
 
 
 def build_model(cfg: dict, layout: gm.ChannelLayout, dataset) -> ClimateWorldModel:
-    if cfg["model"].get("type") == "physics":  # stage 9: primitive-equation core
+    if cfg["model"].get("type") == "stepper":  # stage 15 control F1: pure SFNO stepper
+        from .models.neural_stepper import NeuralStepper, StepperConfig
+        model = NeuralStepper(StepperConfig.from_dict(cfg["model"]), layout, dataset.lat)
+    elif cfg["model"].get("type") == "physics":  # stage 9: primitive-equation core
         from .models.physics_world_model import PhysicsModelConfig, PhysicsWorldModel
         model = PhysicsWorldModel(PhysicsModelConfig.from_dict(cfg["model"]), layout,
                                   dataset.lat, dataset.lon)

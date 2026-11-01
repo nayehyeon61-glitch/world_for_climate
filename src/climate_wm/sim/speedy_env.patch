@@ -51,10 +51,10 @@ index e05d49f..8c19517 100755
  end module
 diff --git a/source/env_control.f90 b/source/env_control.f90
 new file mode 100644
-index 0000000..a46dcfd
+index 0000000..54155ec
 --- /dev/null
 +++ b/source/env_control.f90
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,388 @@
 +!> Environment control for the climate world-model experiments (stage 14).
 +!  Restart files, interventions (solar factor, CO2 absorptivity, SST patches,
 +!  convection relaxation time, surface drag) and extra surface output
@@ -71,6 +71,7 @@ index 0000000..a46dcfd
 +    public save_surface, accumulate_step, output_surface, write_static
 +    public save_tendencies, output_tendencies
 +    public restart_in, restart_out, static_out
++    public heat_scale, moist_scale, mom_scale
 +
 +    integer, parameter :: max_patch = 8
 +
@@ -81,6 +82,9 @@ index 0000000..a46dcfd
 +    real(p) :: co2_factor = 1.0             !! Multiplies the CO2-band absorptivity
 +    real(p) :: conv_factor = 1.0            !! Multiplies the convective relaxation time
 +    real(p) :: drag_factor = 1.0            !! Multiplies the surface drag coefficients
++    real(p) :: heat_scale = 1.0             !! Stage 15.4 cut: multiplies the physics temperature tendency
++    real(p) :: moist_scale = 1.0            !! Stage 15.4 cut: multiplies the physics humidity tendency
++    real(p) :: mom_scale = 1.0              !! Stage 15.4 cut: multiplies the physics wind tendency
 +    integer :: n_patch = 0                  !! Number of SST anomaly patches
 +    real(p) :: patch_lon(max_patch) = 0.0   !! Patch centre longitude (degrees east)
 +    real(p) :: patch_lat(max_patch) = 0.0   !! Patch centre latitude (degrees north)
@@ -96,6 +100,12 @@ index 0000000..a46dcfd
 +    integer, parameter :: n_tend = 10
 +    real(p) :: tend_acc(ix,il,kx,n_tend) = 0.0  !! Sums of the per-process tendencies since the last output
 +    integer :: n_tend_acc = 0                !! Number of physics calls in tend_acc
++    ! Stage 15 episode group B: spatially correlated perturbation of the restart state
++    integer :: perturb_seed = 0             !! 0 = no perturbation
++    real(p) :: perturb_t = 0.0              !! rms temperature perturbation (K)
++    real(p) :: perturb_vor = 0.0            !! rms vorticity perturbation (1/s)
++    real(p) :: perturb_ps = 0.0             !! rms log surface pressure perturbation
++    real(p) :: perturb_scale = 8.0          !! e-folding total wavenumber of the perturbation spectrum
 +
 +contains
 +    !> Reads the &control namelist and applies the parameter interventions.
@@ -104,7 +114,8 @@ index 0000000..a46dcfd
 +        use convection, only: trcnv
 +        use surface_fluxes, only: cdl, cds
 +        namelist /control/ restart_in, restart_out, static_out, solar_factor, co2_factor, &
-+            & conv_factor, drag_factor, n_patch, patch_lon, patch_lat, patch_radius, patch_amp, tend_out
++            & conv_factor, drag_factor, n_patch, patch_lon, patch_lat, patch_radius, patch_amp, tend_out, &
++            & perturb_seed, perturb_t, perturb_vor, perturb_ps, perturb_scale, heat_scale, moist_scale, mom_scale
 +        logical :: exists
 +
 +        inquire(file="namelist.nml", exist=exists)
@@ -363,8 +374,65 @@ index 0000000..a46dcfd
 +        read (21) stl_lm, stl_am
 +        read (21) sst_om, sst_am, sstan_am, sice_om, sice_am, tice_om, tice_am, ssti_om, sstan3
 +        close(21)
++        call perturb_state
 +        ! the restart holds the SST without the patches of this run
 +        call apply_sst_patch
++    end subroutine
++
++    !> Adds a smooth random perturbation (red spectrum exp(-l(l+1)/(L(L+1))), L = perturb_scale,
++    !  no global mean, two vertical patterns blended along sigma) to t, vor and log ps,
++    !  both leapfrog time levels.
++    subroutine perturb_state
++        use prognostics, only: vor, t, ps
++        use spectral, only: grid_to_spec, spec_to_grid, el2
++        use physical_constants, only: rearth
++        real(p) :: w(mx,nx), a, b
++        complex(p) :: pat(mx,nx,2)
++        integer :: k, nseed, i
++        integer, allocatable :: seeds(:)
++        if (perturb_seed == 0) return
++        call random_seed(size=nseed)
++        allocate(seeds(nseed))
++        seeds = (/ (perturb_seed*7919 + 104729*i, i = 1, nseed) /)
++        call random_seed(put=seeds)
++        w = exp(-el2*rearth**2/(perturb_scale*(perturb_scale + 1.0)))
++        ! temperature
++        call patterns(pat)
++        do k = 1, kx
++            a = cos(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            b = sin(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            t(:,:,k,1) = t(:,:,k,1) + perturb_t*(a*pat(:,:,1) + b*pat(:,:,2))
++            t(:,:,k,2) = t(:,:,k,2) + perturb_t*(a*pat(:,:,1) + b*pat(:,:,2))
++        end do
++        ! vorticity
++        call patterns(pat)
++        do k = 1, kx
++            a = cos(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            b = sin(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            vor(:,:,k,1) = vor(:,:,k,1) + perturb_vor*(a*pat(:,:,1) + b*pat(:,:,2))
++            vor(:,:,k,2) = vor(:,:,k,2) + perturb_vor*(a*pat(:,:,1) + b*pat(:,:,2))
++        end do
++        ! log surface pressure
++        call patterns(pat)
++        ps(:,:,1) = ps(:,:,1) + perturb_ps*pat(:,:,1)
++        ps(:,:,2) = ps(:,:,2) + perturb_ps*pat(:,:,1)
++        write (*,'(A,I8,3ES10.2)') 'control: perturbed state, seed and rms t vor ps = ', perturb_seed, &
++            & perturb_t, perturb_vor, perturb_ps
++    contains
++        !> Two independent filtered random fields with unit grid rms and zero mean, in spectral space.
++        subroutine patterns(out)
++            complex(p), intent(out) :: out(mx,nx,2)
++            real(p) :: g(ix,il), rms
++            integer :: j
++            do j = 1, 2
++                call random_number(g)
++                out(:,:,j) = grid_to_spec(g - 0.5)*w
++                out(1,1,j) = (0.0, 0.0)
++                g = spec_to_grid(out(:,:,j), 1)
++                rms = sqrt(sum(g**2)/size(g))
++                out(:,:,j) = out(:,:,j)/max(rms, 1.0e-12)
++            end do
++        end subroutine
 +    end subroutine
 +
 +    subroutine check(status)
@@ -474,14 +542,14 @@ index 7595d3e..b7989cc 100755
      public fmask_l
      public land_coupling_flag
 diff --git a/source/physics.f90 b/source/physics.f90
-index ac8113b..f37ed73 100755
+index ac8113b..350ceea 100755
 --- a/source/physics.f90
 +++ b/source/physics.f90
 @@ -41,6 +41,7 @@ contains
      !> Compute physical parametrization tendencies for u, v, t, q and add them
      !  to the dynamical grid-point tendencies
      subroutine get_physical_tendencies(vor, div, t, q, phi, psl, utend, vtend, ttend, qtend)
-+        use env_control, only: save_surface, save_tendencies
++        use env_control, only: save_surface, save_tendencies, heat_scale, moist_scale, mom_scale
          use auxiliaries, only: precnv, precls, cbmf, tsr, ssrd, ssr, slrd, slr, olr, slru, ustr, &
              & vstr, shf, evap, hfluxn
          use physical_constants, only: sigh, grdsig, grdscp, cp
@@ -496,6 +564,17 @@ index ac8113b..f37ed73 100755
          integer :: iptop(ix,il), icltop(ix,il,2), icnv(ix,il), i, j, k
          real(p) :: sppt_pattern(ix,il,kx)
  
+@@ -134,8 +136,8 @@ contains
+         ! Large-scale condensation
+         call get_large_scale_condensation_tendencies(psg, qg, qsat, iptop, precls, tt_lsc, qt_lsc)
+ 
+-        ttend = ttend + tt_cnv + tt_lsc
+-        qtend = qtend + qt_cnv + qt_lsc
++        ttend = ttend + heat_scale*tt_cnv + heat_scale*tt_lsc
++        qtend = qtend + moist_scale*qt_cnv + moist_scale*qt_lsc
+ 
+         ! =========================================================================
+         ! Radiation (shortwave and longwave) and surface fluxes
 @@ -169,6 +171,8 @@ contains
          call get_surface_fluxes(psg, ug, vg, tg, qg, rh, phig, phis0, fmask_l, sst_am, &
                  & ssrd, slrd, ustr, vstr, shf, evap, slru, hfluxn, ts, tskin, u0, v0, t0, .true.)
@@ -505,15 +584,34 @@ index ac8113b..f37ed73 100755
          ! Recompute sea fluxes in case of anomaly coupling
          if (sea_coupling_flag > 0) then
             call get_surface_fluxes(psg, ug, vg, tg, qg, rh, phig, phis0, fmask_l, ssti_om, &
-@@ -199,6 +203,8 @@ contains
+@@ -183,7 +187,7 @@ contains
+             tt_rlw(:,:,k) = tt_rlw(:,:,k)*rps*grdscp(k)
+         end do
+ 
+-        ttend = ttend + tt_rsw + tt_rlw
++        ttend = ttend + heat_scale*tt_rsw + heat_scale*tt_rlw
+ 
+         ! =========================================================================
+         ! Planetary boundary later interactions with lower troposphere
+@@ -199,10 +203,14 @@ contains
          tt_pbl(:,:,kx) = tt_pbl(:,:,kx)  + shf(:,:,3)*rps*grdscp(kx)
          qt_pbl(:,:,kx) = qt_pbl(:,:,kx) + evap(:,:,3)*rps*grdsig(kx)
  
+-        utend = utend + ut_pbl
+-        vtend = vtend + vt_pbl
+-        ttend = ttend + tt_pbl
+-        qtend = qtend + qt_pbl
 +        call save_tendencies(tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, qt_lsc, qt_pbl, ut_pbl, vt_pbl)
 +
-         utend = utend + ut_pbl
-         vtend = vtend + vt_pbl
-         ttend = ttend + tt_pbl
++        ! Stage 15.4 cuts (the saved tendencies above are the unscaled process tendencies;
++        ! a scale of 1 keeps the original summation order, so default runs stay bit-identical)
++        utend = utend + mom_scale*ut_pbl
++        vtend = vtend + mom_scale*vt_pbl
++        ttend = ttend + heat_scale*tt_pbl
++        qtend = qtend + moist_scale*qt_pbl
+ 
+         ! Add SPPT noise
+         if (sppt_on) then
 diff --git a/source/sea_model.f90 b/source/sea_model.f90
 index 117890c..f9638fa 100755
 --- a/source/sea_model.f90

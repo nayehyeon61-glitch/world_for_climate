@@ -163,7 +163,8 @@ def teacher_rollout(model, batch, steps: int, std: torch.Tensor, cfg: TeacherCon
             state, precip = model.advance(state, ctx, k)
             pred = model.predict(state, ctx, k, precip)
             _, e = errors(model, pred, batch["targets"][:, k], tmask)
-            te = tendency_error(model, model.last_tendency, batch["tendency"][:, k], std, cfg.tend_keys)
+            te = (tendency_error(model, model.last_tendency, batch["tendency"][:, k], std, cfg.tend_keys)
+                  if model.last_tendency is not None else e.new_zeros(()))  # F1: no column
             if not (torch.isfinite(e).all() and torch.isfinite(te) and _finite(state).all()) \
                     or float(e.detach()) > cfg.cap:
                 return ((torch.stack(ls).mean() if ls else None), (torch.stack(lt).mean() if lt else None), True)
@@ -242,10 +243,13 @@ def evaluate_teacher(model, data, steps: int, stride: int, std: torch.Tensor, de
             pred = model.predict(state, ctx, k, precip)
             _, err = errors(model, pred, batch["targets"][:, k], tmask)
             row["state"].append(float(err))
-            p = to_data_grid(model, model.last_tendency)[0]
             t = batch["tendency"][0, k]
             n_lev = t.shape[0] // len(TEND_KEYS)
             cors = []
+            if model.last_tendency is None:  # F1 (no column): no tendency to score
+                row["corr"].append([float("nan")] * len(TEND_KEYS))
+                continue
+            p = to_data_grid(model, model.last_tendency)[0]
             for i in range(len(TEND_KEYS)):
                 a, b = p[i * n_lev:(i + 1) * n_lev].flatten(), t[i * n_lev:(i + 1) * n_lev].flatten()
                 a, b = a - a.mean(), b - b.mean()
