@@ -44,13 +44,12 @@ def main() -> None:
     (out / "episodes.json").write_text(json.dumps([s.to_json() for s in specs], indent=1))
     runner = SpeedyRunner(args.speedy, str(out / "_work"), tendencies=True)
     total_days = sum(s.days for s in specs)
-    done_days = 0
     for s in specs:
         if args.only and s.name not in args.only:
             continue
         tic = time.time()
-        path = write_episode(runner, s, args.nature, str(out))
-        done_days += s.days
+        write_episode(runner, s, args.nature, str(out))
+        done_days = sum(e.days for e in specs if (out / f"{e.name}.zarr" / "zarr.json").exists())
         size = dir_size(out) / 1e9
         projected = size / done_days * total_days
         print(f"[episodes] {s.name} ({s.group}, {s.split}, {s.start:%Y-%m-%d}, {s.days} d) "

@@ -174,6 +174,10 @@ class PhysicsWorldModel(nn.Module):
         # (the global-mean profile; no land; no sun) while the other outputs see the state
         self.column_paths: Dict[str, Tuple[str, ...]] = {}
         self.energy_track: Optional[list] = None      # set to a list: per column call, [B, 6] energy terms
+        # stage 15: with track_tendency, advance() keeps the mean column forcing of the step,
+        # cat(Q, S, F_u, F_v) [B, 4 L, H, W] on the core grid, in last_tendency (differentiable)
+        self.track_tendency = False
+        self.last_tendency: Optional[Tensor] = None
                                                        # (eval/energy.py; stage 13)
 
     # ------------------------------------------------------------ set-up
@@ -547,10 +551,13 @@ class PhysicsWorldModel(nn.Module):
                                   for b, t in enumerate(times)])  # [B, n_calls, 5, H, W]
         keys = list(state)
 
+        track = self.track_tendency and self.column is not None
+
         def six_hours(*flat):
             st = dict(zip(keys, flat))
             precip = 0.0
             forcing = None
+            acc, ncall = 0.0, 0
             for j in range(nsub):
                 if self.column is not None and j % call_every == 0:
                     fg = forc_g[:, j // call_every] if forc_g is not None else None
@@ -559,15 +566,20 @@ class PhysicsWorldModel(nn.Module):
                         st["mem"] = forcing.pop("mem")
                     if "precip" in forcing:
                         precip = precip + forcing["precip"] * cc.call_minutes * 60.0 / 1000.0  # m
+                    if track:
+                        acc = acc + torch.cat([forcing[n] for n in ("Q", "S", "F_u", "F_v")], 1)
+                        ncall += 1
                 st = core.step(st, forcing)
             p = precip if torch.is_tensor(precip) else torch.zeros_like(st["temp"].real[:, 0, :1, :1])
-            return tuple(st[key] for key in keys) + (p,)
+            return tuple(st[key] for key in keys) + (p,) + ((acc / max(ncall, 1),) if track else ())
 
         flat = tuple(state[key] for key in keys)
         if self.cfg.grad_checkpoint and torch.is_grad_enabled():
             out = checkpoint(six_hours, *flat, use_reentrant=False)
         else:
             out = six_hours(*flat)
+        if track:
+            self.last_tendency, out = out[-1], out[:-1]
         precip = out[-1]
         precip_d = None
         if precip.shape[-1] > 1:
