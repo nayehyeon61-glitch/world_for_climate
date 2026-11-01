@@ -62,7 +62,7 @@ def main() -> None:
     ap.add_argument("--data", required=True, help="nature-run root (nature.zarr, restarts/, static.nc)")
     ap.add_argument("--work", default=None, help="SPEEDY branch run directories (default DATA/work)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--arm", default="lp", choices=["lp", "random", "nature", "adapt"])
+    ap.add_argument("--arm", default="lp", choices=["lp", "random", "nature", "adapt", "randomized"])
     ap.add_argument("--updates", type=int, default=150)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=0)

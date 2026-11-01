@@ -186,7 +186,8 @@ def rollout_error(model, batch, steps: int, cap: float = 10.0) -> Tuple[torch.Te
 
 @dataclasses.dataclass
 class GameConfig:
-    arm: str = "lp"                 # lp | random | nature (adapt = nature from the ERA5 model)
+    arm: str = "lp"                 # lp | random | nature (adapt = nature from the ERA5 model) |
+                                    # randomized (board 3: random SPEEDY parameters per branch)
     updates: int = 150
     branch_days: int = 6            # SPEEDY branch length per update
     train_steps: int = 8            # 48 h training window starting at day 0 or 1
@@ -235,6 +236,21 @@ class Experimenter:
         return float(-(p * np.log(p + 1e-12)).sum())
 
 
+# board 3 ranges (log-uniform for the factors that scale a time or a coefficient)
+RANDOMIZE = {"conv_factor": (0.5, 2.0), "drag_factor": (0.5, 2.0), "co2_factor": (0.8, 1.25),
+             "solar_factor": (0.98, 1.02)}
+
+
+def random_world(rng: np.random.Generator) -> Action:
+    """Board 3: a SPEEDY world with random convection time, surface drag, CO2 and
+    solar constant (the model sees solar and CO2 through its action channels;
+    convection and drag are hidden and must be inferred from the trajectory)."""
+    kw = {}
+    for k, (lo, hi) in RANDOMIZE.items():
+        kw[k] = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+    return Action("world " + " ".join(f"{k.split('_')[0]}={v:.2f}" for k, v in kw.items()), Intervention(**kw))
+
+
 def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
                state: Optional[dict] = None, save: Optional[Callable[[dict], None]] = None,
                log: Callable[[str], None] = print) -> dict:
@@ -265,6 +281,8 @@ def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
         t0 = points[int(rng.integers(len(points)))]
         if cfg.arm in ("nature", "adapt"):
             a, act = -1, null
+        elif cfg.arm == "randomized":
+            a, act = -1, random_world(rng)
         elif cfg.arm == "random":
             a = int(rng.integers(len(acts)))
             act = acts[a]
