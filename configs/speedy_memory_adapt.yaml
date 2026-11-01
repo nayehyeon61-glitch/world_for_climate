@@ -9,7 +9,7 @@ data:
   path: "{data_dir}/nature.zarr"
   time_range: ["1982-01-01", "1985-01-01"]
   load_into_memory: false
-  train: {start: "1982-01-01T06:00", end: "1983-12-31T18:00"}
+  train: {start: "1982-01-01T12:00", end: "1983-12-31T18:00"}   # first init with two input frames (nature starts 06:00)
   val: {start: "1984-01-01", end: "1984-12-31T12:00"}
 eval:
   climatology_zarr: null
