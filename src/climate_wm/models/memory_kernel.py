@@ -44,6 +44,9 @@ class MemoryConfig:
     spread: bool = True                # learned horizontal diffusion of m
     innovation: bool = True            # absorb the innovation at re-observations (G)
     readout: bool = True               # hidden points restart from forecast + R(m)
+    readout_max: Optional[float] = None  # stage 13 R1: soft bound |R(m)| <= readout_max (normalised units,
+                                         # readout_max * tanh(R / readout_max)); the readout fed back into
+                                         # a persistently hidden region blew the observed runs up (31/31)
     # stage 10.2: slow channels (months to years) with fixed timescales and a fixed input
     # projection b = tanh(W x) (W frozen): running means of the column state that only
     # the readers C and R learn to use. They take no innovation and no control.
@@ -181,4 +184,7 @@ class MemoryKernel(nn.Module):
         """Correction [B, C_dyn, H, W] (normalised units, Gaussian grid) of the hidden points."""
         if not self.cfg.readout or self.knock & {"readout", "memory"}:
             return None
-        return self.read(self._readable(m).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        r = self.read(self._readable(m).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        if self.cfg.readout_max is not None:
+            r = self.cfg.readout_max * torch.tanh(r / self.cfg.readout_max)
+        return r

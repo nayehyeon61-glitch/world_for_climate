@@ -226,6 +226,24 @@ def fill_section(warm10, warm30, fill, blowups):
     return "\n".join(lines), gain
 
 
+def observed_extra_section(nudging, extras):
+    """Further variants of the observed protocol against N1 + nudging on the cap
+    (extras: [(label, table, blowups)]); a lead whose ratio exceeds 100 is blown."""
+    leads = (6, 24, 72, 120)
+    lines = ["Further variants of the same protocol (RMSE on the cap as a ratio to N1 + nudging; blown = the "
+             "mean is dominated by blown-up samples):", "",
+             "| variant | blow-ups | " + " | ".join(f"{SHORT[v]} {h} h" for v in HEADLINE for h in leads) + " |",
+             "|---|---|" + "---|" * (len(HEADLINE) * len(leads))]
+    for label, table, blow in extras:
+        cells = []
+        for v in HEADLINE:
+            for h in leads:
+                m, n = rmse(table, v, h), rmse(nudging, v, h)
+                cells.append("blown" if not np.isfinite(m) or (n > 0 and m / n > 100) else f"{m / n:.2f}x")
+        lines.append(f"| {label} | {blow if blow is not None else '-'} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def verdicts(gains, knock_gain_24, ratios, below, obs=None, obs_blowups=None, fill_gain=None):
     out = {}
     if fill_gain and 24 in fill_gain and 120 in fill_gain:
@@ -271,6 +289,9 @@ def main():
     parser.add_argument("--warm2018", default=None)
     parser.add_argument("--obs2020", default=None, help="OUT of compare_memory.py --obs-kind region (warm + nudging)")
     parser.add_argument("--fill2020", nargs="*", default=[], help="warm30=OUT(--spinup 120) fill=OUT(--fill continuous)")
+    parser.add_argument("--obs-extra", nargs="*", default=[], metavar="LABEL=OUT:VARIANT",
+                        help="further observed-protocol runs (e.g. E1=...compare_obs_energy_2020.json:warm "
+                             "no_readout=...compare_obs_knock_2020.json:warm_no_readout)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     cold20 = {k: load(v) for k, v in (s.split("=", 1) for s in args.cold2020)}
@@ -349,6 +370,20 @@ def main():
             md += [text, ""]
             obs = (vs_gc, vs_nudge, cross)
             obs_blowups = {k: v.get("blowups") for k, v in osumm.get("variants", {}).items() if "blowups" in v}
+            extras = []
+            for item in args.obs_extra:
+                label, rest = item.split("=", 1)
+                base_out, variant = rest.rsplit(":", 1)
+                table = warm(base_out, variant)
+                blow = None
+                sp = base_out.replace(".json", "_summary.json")
+                if os.path.exists(sp):
+                    with open(sp) as f:
+                        blow = json.load(f).get("variants", {}).get(variant, {}).get("blowups")
+                if table:
+                    extras.append((label, table["model"], blow))
+            if extras:
+                md += [observed_extra_section(on["model"], extras), ""]
     fill_gain = None
     if args.fill2020 and w20:
         paths = dict(s.split("=", 1) for s in args.fill2020)

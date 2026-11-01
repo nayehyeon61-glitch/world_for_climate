@@ -242,3 +242,26 @@ def test_memory_climate_evaluation(setup, tmp_path):
     again = evaluate_memory_climate(model, ctrl, base, long, [0, 1], ["none", "region"], clim, long.stats,
                                     progress_path=str(tmp_path / "p.pt"), **kw)
     assert again["kinds"]["none"]["mse"] == res["kinds"]["none"]["mse"]
+
+
+def test_readout_bound_is_soft_and_tight(setup):
+    layout, data, base, model = setup
+    batch = {k: v[None] for k, v in data[0].items()}
+    state, ctx = model.begin(batch)
+    state, _ = model.advance(state, ctx, 0)
+    with torch.no_grad():
+        model.memory.read[-1].weight.normal_(0, 5.0)
+        model.memory.read[-1].bias.normal_(0, 5.0)
+    m = state["mem"] + 1.0
+    free = model.memory.readout(m)
+    assert free.abs().max() > 1.0
+    model.memory.cfg.readout_max = 0.5
+    try:
+        bound = model.memory.readout(m)
+        assert bound.abs().max() <= 0.5 and bound.abs().max() > 0.25
+        assert torch.allclose(torch.sign(bound), torch.sign(free))  # a monotone squash, not a clip to zero
+    finally:
+        model.memory.cfg.readout_max = None
+        with torch.no_grad():
+            model.memory.read[-1].weight.zero_()
+            model.memory.read[-1].bias.zero_()

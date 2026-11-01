@@ -188,6 +188,14 @@ Hidden cap of 25% of the sphere per initialisation (mean hidden weight 0.25); RM
 | tp6 | 72 h | 0.000719 | 0.001289 | 0.002412 | 3.35x | 1.87x |
 | tp6 | 120 h | 0.0009066 | 0.001423 | 0.002398 | 2.64x | 1.68x |
 
+Further variants of the same protocol (RMSE on the cap as a ratio to N1 + nudging; blown = the mean is dominated by blown-up samples):
+
+| variant | blow-ups | z500 6 h | z500 24 h | z500 72 h | z500 120 h | t850 6 h | t850 24 h | t850 72 h | t850 120 h | t2m 6 h | t2m 24 h | t2m 72 h | t2m 120 h | u10 6 h | u10 24 h | u10 72 h | u10 120 h |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| E1 bound | 31 | 1.27x | 6.93x | blown | blown | 1.03x | 8.98x | blown | blown | 1.23x | 7.54x | blown | blown | 1.04x | 2.28x | blown | blown |
+| no readout | 3 | 1.25x | 1.09x | 0.96x | 0.97x | 1.04x | 1.09x | 1.01x | 1.01x | 1.24x | 1.78x | 1.89x | 1.86x | 1.04x | 1.05x | 1.05x | 1.04x |
+| no kernel | 2 | 1.28x | 1.71x | 2.21x | 2.77x | 1.20x | 1.48x | 1.78x | 2.25x | 1.41x | 2.44x | 2.88x | 2.74x | 1.05x | 1.07x | 1.09x | 1.08x |
+
 
 ## Fill length: 10 days, 30 days, two years (2020)
 
