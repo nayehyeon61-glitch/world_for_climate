@@ -265,3 +265,40 @@ def test_readout_bound_is_soft_and_tight(setup):
         with torch.no_grad():
             model.memory.read[-1].weight.zero_()
             model.memory.read[-1].bias.zero_()
+
+
+def test_age_gated_readout_decays_on_persistently_hidden_points(setup):
+    layout, data, base, model = setup
+    batch = {k: v[None] for k, v in data[0].items()}
+    state, ctx = model.begin(batch)
+    state, _ = model.advance(state, ctx, 0)
+    pred = model.predict(state, ctx, 0)
+    t2d = layout.target_to_dynamic
+    mask = torch.zeros(1, len(layout.dynamic), *pred.shape[-2:])
+    mask[..., :4] = 1
+    fc, truth = pred[:, t2d], batch["targets"][:, 0][:, t2d]
+    with torch.no_grad():
+        model.memory.read[-1].weight.normal_(0, 0.5)
+    model.memory.knock = {"innovation"}  # m stays put, so the readout is the same at both calls
+    model.memory.cfg.readout_decay_steps = 1.0
+    try:
+        state["mem"] = state["mem"] + 1.0
+        first = model.posterior(state, ctx, fc, truth, mask)
+        assert torch.equal(first["age"], mask)
+        second = model.posterior(first, ctx, fc, truth, mask)
+        assert torch.equal(second["age"], 2 * mask)
+        plain = model.reobserve(dict(ctx), truth * (1 - mask) + fc * mask)
+        d1 = first["temp"] - plain["temp"]
+        d2 = second["temp"] - plain["temp"]
+        assert d1.abs().max() > 0
+        scaled = d1 * float(torch.exp(torch.tensor(-1.0)))
+        assert (d2 - scaled).abs().sum() < 1e-3 * d1.abs().sum()  # the second hidden step gets e^-1 of the readout
+        third = model.posterior(second, ctx, fc, truth, 1 - mask)  # observed now: the age resets
+        assert torch.equal(third["age"], 1 - mask)
+        nxt, _ = model.advance(third, ctx, 1)
+        assert "age" in nxt and torch.equal(nxt["age"], third["age"])  # carried through the core step
+    finally:
+        model.memory.cfg.readout_decay_steps = None
+        model.memory.knock = set()
+        with torch.no_grad():
+            model.memory.read[-1].weight.zero_()

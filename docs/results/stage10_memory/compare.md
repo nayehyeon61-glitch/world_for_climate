@@ -195,6 +195,9 @@ Further variants of the same protocol (RMSE on the cap as a ratio to N1 + nudgin
 | E1 bound | 31 | 1.27x | 6.93x | blown | blown | 1.03x | 8.98x | blown | blown | 1.23x | 7.54x | blown | blown | 1.04x | 2.28x | blown | blown |
 | no readout | 3 | 1.25x | 1.09x | 0.96x | 0.97x | 1.04x | 1.09x | 1.01x | 1.01x | 1.24x | 1.78x | 1.89x | 1.86x | 1.04x | 1.05x | 1.05x | 1.04x |
 | no kernel | 2 | 1.28x | 1.71x | 2.21x | 2.77x | 1.20x | 1.48x | 1.78x | 2.25x | 1.41x | 2.44x | 2.88x | 2.74x | 1.05x | 1.07x | 1.09x | 1.08x |
+| readout max 0.5 | 31 | 1.25x | 4.51x | blown | blown | 1.04x | 6.37x | blown | blown | 1.24x | 6.24x | blown | blown | 1.04x | 2.21x | blown | blown |
+| readout max 1 | 31 | 1.25x | 6.26x | 3.83x | 2.89x | 1.04x | 8.18x | 5.10x | 4.23x | 1.24x | 7.38x | 3.95x | 2.83x | 1.04x | 2.36x | 1.70x | 1.53x |
+| readout max 2 | 31 | 1.25x | blown | blown | blown | 1.04x | blown | blown | blown | 1.24x | blown | blown | blown | 1.04x | blown | blown | blown |
 
 
 ## Fill length: 10 days, 30 days, two years (2020)

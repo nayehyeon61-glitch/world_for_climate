@@ -47,6 +47,9 @@ class MemoryConfig:
     readout_max: Optional[float] = None  # stage 13 R1: soft bound |R(m)| <= readout_max (normalised units,
                                          # readout_max * tanh(R / readout_max)); the readout fed back into
                                          # a persistently hidden region blew the observed runs up (31/31)
+    readout_decay_steps: Optional[float] = None  # stage 13 R2: a point hidden for a steps gets the readout
+                                         # times exp(-(a - 1) / this) (the first hidden step gets it fully):
+                                         # R was learned as a one-step correction, not an increment to integrate
     # stage 10.2: slow channels (months to years) with fixed timescales and a fixed input
     # projection b = tanh(W x) (W frozen): running means of the column state that only
     # the readers C and R learn to use. They take no innovation and no control.

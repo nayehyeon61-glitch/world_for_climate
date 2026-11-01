@@ -478,17 +478,25 @@ class PhysicsWorldModel(nn.Module):
         absorbs the innovation. Without memory this is nudging with strength 1."""
         seen = 1 - mask
         hidden = forecast
-        mem = None
+        mem, age = None, None
         if self.memory is not None:
             g = self._to_gauss
             mem = self.memory.absorb(state["mem"], g(forecast), g(seen * (truth - forecast)), g(seen))
             r = self.memory.readout(mem)
+            decay = self.memory.cfg.readout_decay_steps
+            if decay is not None:  # stage 13 R2: steps each point has been hidden (0 = observed now)
+                age = (state.get("age", torch.zeros_like(mask)) + 1) * mask
             if r is not None:
                 sh = self.core.sh
-                hidden = forecast + sh.to_grid(sh.to_spec(r), data=True)
+                r = sh.to_grid(sh.to_spec(r), data=True)
+                if age is not None:
+                    r = r * torch.exp(-(age - 1).clamp_min(0) / decay)
+                hidden = forecast + r
         fresh = self.reobserve(ctx, seen * truth + mask * hidden)
         if mem is not None:
             fresh["mem"] = mem
+        if age is not None:
+            fresh["age"] = age
         return fresh
 
     def advance(self, state, ctx, k: int):

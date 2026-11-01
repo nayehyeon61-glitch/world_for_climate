@@ -736,7 +736,8 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 - **원인 분석:** 폭주는 한 종류가 아닙니다. (1) 기억 모델의 콜드·영역 폭주 = 학습된 칼럼의 국소 에너지 주입(바운드로 제거되고 오차까지 좋아짐 → 예보에 필요 없는 에너지를 넣고 있었음). (2) `no_moistening` = 물 수지 자체가 빠진 것이라 에너지 바운드와 무관. (3) N1 영역 캡 = 캡 경계의 국소 역학(일 항이 29배로 커지지만 운동량 투영으로는 안 잡힘 → 코어 쪽 문제, 캡을 평균값으로 채우는 평가 설계의 몫).
 - **관측 공급 시험을 바운드 아래서 (체인 8, 12:29):** 10.1의 캡 25% 숨김·나머지 재관측 설정에서 기억 모델은 바운드를 걸어도 **31/31 폭주**합니다. 바운드는 폭주를 늦출 뿐이어서 24h는 유한하지만 N1+너징의 7–9배(z500 1632 대 235, t850 16.3 대 1.81)이고 72h에는 발산합니다. 6h 캡 오차는 거의 같음(z500 117 대 115). 이 폭주는 칼럼의 에너지 유입이 아니라 사후분포의 판독 되먹임(숨긴 캡 = 예보 + R(m), 혁신은 관측점에서만 흡수)에서 오는 것으로 보입니다. 확인을 위해 같은 설정에서 판독만 끈 것(`warm_no_readout`)과 커널을 끈 것(`warm_no_memory`)을 돌립니다(체인 10, ~13:30). (이 실행의 N1+너징에는 바운드가 걸리지 않았음: 기준 모델 설정 전파 버그, 03ef37b에서 수정.)
 - **원인 확정 (체인 10, 13:18, `compare_obs_knock_2020_*`; compare.md "Further variants"):** 같은 관측 공급 설정에서 기억의 판독만 끄면 폭주 31 → 3/31, 커널을 다 끄면 2/31. 판독 없는 기억 모델은 캡 위에서 N1+너징과 같고(z500 24h 1.09배) 72h부터 조금 낫습니다(0.96–0.97배, 커널의 경향이 칼럼 표류를 보상). 커널을 끄면 1.5–2.8배 나쁨. → 관측 공급 폭주의 원인은 **판독 되먹임**(숨긴 캡 = 예보 + R(m), 혁신은 관측점에서만 흡수 → R이 자라 칼럼을 넘어뜨림)이지 칼럼 에너지가 아닙니다. 10단계 학습에서는 숨긴 점이 36시간 안에 재관측되어 R이 오래 자유로 달린 적이 없습니다.
-- **R1 판독 바운드 (`memory.readout_max`, 소프트 r_max·tanh(R/r_max), 평가 시 `--set model.memory.readout_max=1.0`; 체인 11, ~14:40):** E1과 같은 "학습 없는 투영"을 판독에 겁니다. 규칙 R1: r_max ∈ {0.5, 1, 2} 중 하나에서 폭주 ≤ 3/31이고 캡 위 24h 오차가 판독 없는 것보다 낮으면(판독이 유용하되 묶임) 지지. 그 뒤 학습 쪽 처방: 10.2 연속 필터 학습에 지속 캡(창 내내 숨김)을 넣어 R이 오래 달리는 법을 배우게 함.
+- **R1 판독 바운드 (`memory.readout_max`, 소프트 r_max·tanh(R/r_max); 체인 11, 14:36 완료): 기각.** r_max 0.5 / 1 / 2 모두 31/31 폭주(6h는 판독 없는 것과 같고 24h부터 발산; r_max 1에서는 유한하지만 z500 24h 1473 = 너징의 6.3배). 크기가 문제가 아닙니다. 기제: R(m)은 36시간 게임에서 "한 걸음 뒤 재관측되는" 점의 1회 보정으로 학습됐는데, 지속 캡에서는 6시간마다 같은 부호의 증분으로 **적분**되어(20걸음 × 0.5σ = 10σ) 캡 경계에 모순된 장을 쌓습니다. 규칙 R1(어느 r_max에서 폭주 ≤ 3/31)은 성립하지 않았습니다.
+- **R2 나이 게이트 판독 (`memory.readout_decay_steps`; 체인 12, ~15:40):** 각 점이 숨겨진 걸음 수 a를 상태에 싣고(관측되면 0) 판독을 exp(−(a−1)/τ_R)로 줄입니다 — 처음 숨겨진 걸음은 온전히, 그 뒤는 사라짐. τ_R = 1, 3 을 같은 관측 공급 설정에서 봅니다. 규칙 R2: 폭주 ≤ 3/31이고 캡 위 24h 오차가 판독 없는 것(1.09배 너징)보다 낮으면 지지(판독이 "한 번 쓰고 끝"으로 유용). 학습 쪽 처방(R3, 제안): 10.2 연속 필터 학습에 지속 캡을 넣어 R이 오래 달리는 법을 배우게 함.
 - **방향:** ① E2(SFNO 에너지 중립 보정자)를 구현해 "어디서 에너지를 빼는가"를 배우게 하고 B2로 E1과 비교. ② 바운드를 10.2 연속 필터 학습에 기본으로 넣어(학습 중 flux500) 칼럼이 바운드에 기대지 않게 함. ③ 영역 캡 폭주는 에너지가 아니라 경계 처리이므로 12단계처럼 캡을 예보값 + 기억 판독으로 채우는 쪽으로 평가를 옮김. ④ 관측 공급 비교(31/31 폭주)를 바운드 아래서 다시 봄(체인 8).
 
 ---
@@ -777,6 +778,7 @@ python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/
 python scripts/compare_memory.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --data-dir DATA2020 --init-stride 6 --lead-steps 20 \
     --spinup 40 --obs-kind region --variants warm_no_readout warm_no_memory --out runs/stage10_Dnoactor/compare_obs_knock_2020.json
 python scripts/compare_memory.py ... --obs-kind region --variants warm --set model.memory.readout_max=1.0 --out runs/stage10_Dnoactor/compare_obs_rmax1.0_2020.json
+python scripts/compare_memory.py ... --obs-kind region --variants warm --set model.memory.readout_decay_steps=1.0 --out runs/stage10_Dnoactor/compare_obs_rdecay1.0_2020.json
 # 13단계 E2 / E3 (보정자 학습; PYTHONPATH 에 neuraloperator; E3: --set corrector.neutral=false corrector.soft_weight=1.0, 바운드 없이)
 python scripts/train_energy_corrector.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/energy_corrector_wb2.yaml \
     --data-dir DATA2020 --out runs/stage13_E2 --set model.column.energy_max_flux=500 model.column.energy_no_work=true
