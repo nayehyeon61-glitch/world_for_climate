@@ -35,9 +35,10 @@ from torch.utils.checkpoint import checkpoint
 from ..data import forcings as forcing_lib
 from ..data.graphcast_mapping import ChannelLayout
 from .memory_kernel import MemoryConfig, MemoryKernel
-from .primitive_core import EPS_V, R_DRY, CoreConfig, PrimitiveCore
+from .primitive_core import CP, EPS_V, R_DRY, CoreConfig, PrimitiveCore
 
 GRAV = 9.80665
+L_V = 2.501e6  # J/kg, latent heat of vaporisation
 LEVEL_VARS = {"temp": "temperature", "z": "geopotential", "u": "u_component_of_wind",
               "v": "v_component_of_wind", "omega": "vertical_velocity",
               "q": "specific_humidity"}
@@ -66,6 +67,9 @@ class ColumnConfig:
     call_minutes: float = 60.0
     budget: bool = True
     use_forcings: bool = True
+    # stage 13 (E1): hard bounds on the column's energy input, applied after the budget
+    energy_max_flux: Optional[float] = None   # W/m^2: |c_p int Q dp/g + L_v int S dp/g| <= this
+    energy_no_work: bool = False              # the momentum forcing may not do work on the wind
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "ColumnConfig":
@@ -154,6 +158,8 @@ class PhysicsWorldModel(nn.Module):
         # path cuts: PATH_OUTPUTS group (or "all") -> PATH_INPUTS it sees at their reference
         # (the global-mean profile; no land; no sun) while the other outputs see the state
         self.column_paths: Dict[str, Tuple[str, ...]] = {}
+        self.energy_track: Optional[list] = None      # set to a list: per column call, [B, 6] energy terms
+                                                       # (eval/energy.py; stage 13)
 
     # ------------------------------------------------------------ set-up
     def _indices(self, channels) -> Dict[str, object]:
@@ -310,11 +316,52 @@ class PhysicsWorldModel(nn.Module):
             evap = torch.nn.functional.softplus(y[:, 4 * n + 1]) * SCALES["E"] / DAY  # kg/m^2/s
             sink = (out["S"] * self.dp_layer[None, :, None, None]).sum(1) / GRAV
             out["precip"] = torch.relu(evap - sink)  # kg/m^2/s
+        if self.cfg.column.energy_max_flux is not None or self.cfg.column.energy_no_work \
+                or self.energy_track is not None:
+            out = self.energy_bound(out, u, v)
         for name in self.column_knock:  # after the budget: precipitation is still diagnosed
             for key in COLUMN_KNOCKS[name]:
                 out[key] = torch.zeros_like(out[key])
         if mem is not None:
             out["mem"] = mem
+        return out
+
+    def energy_bound(self, out: Dict[str, Tensor], u: Tensor, v: Tensor) -> Dict[str, Tensor]:
+        """Stage 13 E1: hard bounds on the column's energy input (감자 10:28 KST 11/01:
+        the blow-ups come from the learned column, which has no energy budget).
+        (i) The moist static energy input of a column, c_p int Q dp/g + L_v int S dp/g
+            (W/m^2; the net of radiation and surface fluxes a real column can supply),
+            is clamped to +-energy_max_flux; the excess heating is removed uniformly per
+            unit mass, so the vertical structure of Q is kept.
+        (ii) With energy_no_work the momentum forcing cannot do work on the wind: where
+            int (F . u) dp > 0 the component of F along u is removed (friction may only
+            dissipate).
+        With `energy_track` set, the terms are recorded per call: global means of the
+        heating, moistening and work fluxes, the largest |flux| and work of any column,
+        and the fraction of columns clamped ([B, 6])."""
+        cc = self.cfg.column
+        dp = self.dp_layer[None, :, None, None]
+        mass = self.dp_layer.sum() / GRAV  # kg/m^2
+        heat = (CP * out["Q"] * dp).sum(1) / GRAV      # [B, H, W] W/m^2
+        moist = (L_V * out["S"] * dp).sum(1) / GRAV
+        flux = heat + moist
+        clamped = torch.zeros_like(flux)
+        if cc.energy_max_flux is not None:
+            bound = float(cc.energy_max_flux)
+            excess = flux - flux.clamp(-bound, bound)
+            clamped = (excess != 0).float()
+            out["Q"] = out["Q"] - (excess / (CP * mass))[:, None]
+        work = ((out["F_u"] * u + out["F_v"] * v) * dp).sum(1) / GRAV  # [B, H, W] W/m^2
+        if cc.energy_no_work:
+            ke2 = ((u * u + v * v) * dp).sum(1) / GRAV
+            lam = torch.relu(work) / ke2.clamp_min(1e-6)
+            out["F_u"] = out["F_u"] - lam[:, None] * u
+            out["F_v"] = out["F_v"] - lam[:, None] * v
+        if self.energy_track is not None:
+            w = torch.sqrt(1 - self.sinlat_g ** 2)[None, :, None]
+            gm = lambda x: (x * w).sum((1, 2)) / (w.sum() * x.shape[-1])
+            self.energy_track.append(torch.stack([gm(heat), gm(moist), gm(work), flux.abs().amax((1, 2)),
+                                                  work.amax((1, 2)), clamped.mean((1, 2))], 1).detach().cpu())
         return out
 
     def _hold_inputs(self, x: Tensor, inputs: Sequence[str]) -> Tensor:

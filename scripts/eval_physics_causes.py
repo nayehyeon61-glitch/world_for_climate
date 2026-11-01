@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                        help="model overrides, e.g. model.column.energy_max_flux=500 (stage 13)")
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -42,6 +44,7 @@ def main():
     y = args.year
     cfg = pipeline.merge_config(cfg, {"data": {"path": os.path.join(args.data_dir, "era5.zarr"),
                                                "time_range": [f"{y - 1}-12-31", f"{y + 1}-01-15"]}})
+    pipeline.apply_overrides(cfg, args.set)
     layout = pipeline.build_layout(cfg)
     ds = pipeline.open_dataset(cfg)
     data = GraphCastWindowDataset(ds, layout, stats, args.steps, start=f"{y}-01-01", end=f"{y}-12-31T12:00")

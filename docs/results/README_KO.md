@@ -691,6 +691,32 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 
 ---
 
+## 13단계 — 에너지 제약으로 폭주 제어 (`stage13_energy/`)
+
+**가설 (감자, 11/01 10:28):** "폭주를 어느 정도 제어하는 게 필요할 것 같네요. neural operator를 통한 energy constraint를 적용해 보면 어떨까요?" 지금까지의 폭주는 모두 학습된 칼럼에서 왔습니다. N0(칼럼 없음)는 안정하고, 영역 마스크(평균값으로 채운 캡)·빈 기억·수분원 S 절단에서 폭주하며, 9단계 인과 시험에서 칼럼 가열이 z500을 해쳤습니다. 칼럼에는 운동량 제약(칼럼 평균 0 + 마찰)과 물 수지(E − P)는 있지만 가열 Q에는 에너지 예산이 없어 열을 만들어낼 수 있습니다.
+
+**E1 물리 투영 (`physics_world_model.energy_bound`, 설정 `model.column.energy_max_flux`, `energy_no_work`; 학습 없이 기존 체크포인트에 적용):**
+- (i) 칼럼의 습윤 정적 에너지 유입 c_p∫Q dp/g + L_v∫S dp/g(W/m²; 실제 칼럼이 복사·지표 플럭스로 공급할 수 있는 순 에너지)을 ±energy_max_flux로 자릅니다. 초과분은 단위 질량당 균일하게 빼서 Q의 연직 구조는 유지합니다. 기본 500 W/m²(복사 순플럭스 + 현열 + 잠열 증발의 상한 규모), 절제로 250·1000.
+- (ii) `energy_no_work`: 운동량 강제가 바람에 양의 일을 하지 못합니다. ∫F·u dp > 0인 칼럼에서 F의 u 방향 성분을 제거합니다(마찰은 소산만).
+- 수분 ∫S dp/g = E − P는 이미 있습니다. Beucler 등(2021, PRL)의 hard constraint 방식이고, Brenowitz 등(2020)이 보인 "학습된 칼럼 + 역학의 불안정"을 겨냥합니다.
+- 진단(`eval/energy.py`, `scripts/diagnose_energy.py`): 칼럼 호출마다 가열·수분·일 플럭스의 전구 평균, 칼럼 최대 |플럭스|·일, 잘린 칼럼 비율을 기록하고, 폭주 직전 4걸음의 항을 유한하게 남은 실행의 같은 리드와 비교해 어느 항이 주입하는지 읽습니다.
+
+**E2 신경 연산자 에너지 제약(제안, E1 결과 뒤 구현):** 11단계 SFNO가 상태와 칼럼 경향을 읽어 보정장을 내되, 출력은 E1과 같은 투영(에너지 중립)을 통과하도록 매개변수화하고 2018–19 자유예보 손실로 학습합니다. E1이 "어디서 에너지를 빼는가"(균일)를 고정하는 데 비해 E2는 그것을 배웁니다. **E3** 소프트 벌칙(손실에 에너지 유입 항)은 hard 대 soft의 통제군입니다.
+
+**실행(체인 7, 1스레드):** ① D-noactor 2020 콜드 10개 초기 시각 × 출발 2종(완전 스냅샷, 영역 캡 숨김) × 설정 5종(없음·500·250·일 금지·500+일 금지) × 120h. ② N1에 같은 것(안정한 모델에서 제약의 비용). ③ 10단계 영역 게임(31개, D-noactor full·nudging)에 500+일 금지. ④ 9단계 `no_moistening`(N1, 2020, 8/8 폭주)에 500+일 금지.
+
+**판정 규칙 (사전 등록):**
+- B1 E1(500 + 일 금지)이 영역 출발·콜드 기억·S 절단의 폭주를 80% 이상 없애고, N1 콜드의 24h 오차 변화가 +3% 이내.
+- B2 (E2 뒤) E2가 같은 폭주 수에서 72h 오차를 E1보다 3% 이상 개선.
+- B3 (E3 뒤) soft가 hard보다 폭주가 많음.
+- B4 원인: 폭주 직전 4걸음에서 가열·수분·일 가운데 한 항의 전구 평균 또는 칼럼 최대가 유한 실행의 2배 이상(주입 항의 식별).
+
+**시간 (KST):** E1 구현·테스트 ~1h(11/01 11:45 완료), 체인 7 ~1h(체인 5 뒤 ~12:00부터) → 13:30 1차 보고. E2 구현 2h + 학습 2h(레인) → 11/02.
+
+**결과:** 실행 대기.
+
+---
+
 ## 재현
 
 ```bash
@@ -719,6 +745,14 @@ python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/
     n1=runs/physics_n1/compare_graphcast_2020.json --warm2020 runs/stage10_Dnoactor/compare_memory_2020.json \
     --cold2018 memory=runs/stage10_Dnoactor/compare_graphcast_2018.json n1=runs/physics_n1/compare_graphcast.json \
     n0=runs/physics_n0/compare_graphcast.json --out docs/results/stage10_memory/compare.md
+# 13단계 E1 (학습 없음; 설정은 --set model.column.energy_max_flux=500 model.column.energy_no_work=true 로 어느 평가에나)
+python scripts/diagnose_energy.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/dreamer_wb2.yaml \
+    --data-dir DATA2020 --inits 10 --steps 20 --kinds none region --out runs/stage10_Dnoactor/energy_2020.json
+python scripts/eval_dreamer.py ... --kinds region --variants full nudging --set model.column.energy_max_flux=500 \
+    model.column.energy_no_work=true --out runs/stage10_Dnoactor/eval_2020_energy.json
+python scripts/report_energy.py --energy memory=runs/stage10_Dnoactor/energy_2020.json n1=runs/physics_n1/energy_2020.json \
+    --game runs/stage10_Dnoactor/eval_2020.json runs/stage10_Dnoactor/eval_2020_energy.json \
+    --causes runs/physics_n1/causes_2020.json runs/physics_n1/causes_2020_energy.json --out docs/results/stage13_energy/energy.md
 # 12단계 (얼린 D-noactor 위; DATA2020)
 python scripts/train_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/active_obs_wb2.yaml \
     --data-dir DATA2020 --out runs/stage12_P            # P-nomem: --set policy.use_memory=false
