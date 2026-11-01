@@ -603,6 +603,31 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **결과:** 실행 중 (콜드 2020 → 웜 2020 → 2018; 11/01 ~14:00 KST).
 
+### 10.2 2년의 기억: 느린 채널과 연속 필터 학습 (`stage10_memory/long.md`)
+
+**요청 (감자, 11/01 09:18–09:21):** "기억을 더 채울 수는 없나요? 한 2년 정도의 기억을 채우면?" 결정: 싼 시험과 10.2를 둘 다.
+
+**왜 지금 커널로는 안 되는가:** 10단계 커널의 시간 척도는 `tau_hours: [3, 240]`로 10일이 상한입니다. 채워진 비율은 1 − e^{−T/τ}이므로 가장 긴 채널은 10일 스핀업에 63%, 30일에 95%, 2년에 100%인데 30일과 같습니다. 한 달 넘은 것은 잊는 커널이라 "2년의 기억"은 (1) 년 단위 τ를 가진 채널과 (2) 그것을 쓸 수 있게 하는 학습이 있어야 뜻이 있습니다. 36시간 에피소드에서는 τ = 2년인 채널이 거의 움직이지 않아 배울 신호가 없습니다.
+
+**콜드스타트가 드러낸 것 (09:30):** §10.1의 2020년 콜드스타트에서 D-noactor의 자유 예보가 N1보다 2–3배 나쁘고 120h 전에 발산했습니다. 재관측 확률 0.5의 게임으로 함께 학습한 칼럼이 필터가 되어 자유 예보를 잃은 것으로 보입니다(웜스타트 결과로 확정). 10.2의 학습은 이 문제를 함께 겨냥합니다.
+
+**설계 (`models/memory_kernel.py` 느린 채널, `train/memory_filter.py`, `scripts/train_memory_filter.py`, `configs/memory_filter_wb2.yaml`, `scripts/compare_memory.py --fill continuous`):**
+- 느린 채널: 16개 적응 채널 뒤에 4개를 더합니다. τ는 1개월–2년 로그 간격으로 고정, 입력은 b = tanh(Wx)에서 W가 고정 무작위 투영(칼럼 특징의 이동평균), 혁신 흡수도 제어도 받지 않습니다. 배우는 것은 읽는 쪽(경향 C, 판독 R)뿐입니다. D-noactor 체크포인트에서 시작하며 새 입력 열은 0이라 출발점은 D-noactor와 같습니다(테스트로 확인).
+- 연속 필터 학습: 2018–19를 72시간 창(처음 24시간은 매 걸음 참값 재관측 = 채움, 뒤 48시간은 자유)으로 끊김 없이 이어 달립니다. 기억은 창 사이에서 detach(절단 역전파)하고, 손실은 모든 걸음의 GraphCast 가중 예보 오차입니다. 자유 구간이 "채워진 기억에서의 예보"를, 채움 구간이 한 걸음 필터를 가르칩니다. 창 끝에서는 재관측 없이 기억만 넘겨 이득 G가 시험 때처럼 한 걸음 혁신만 봅니다. 1 에포크(243창), 학습률 칼럼 1e-4·기억 1e-3, 발산 걸음에서 창을 끊고 기억을 0으로.
+- 채움: 2018-01-01부터 2020년 각 초기 시각까지 한 번 연속 통과(30일 창, 기억만 이어 감)하고 초기 시각마다 m을 저장한 뒤 자유 예측합니다. 120시간은 §10.1의 GraphCast 틀, 28일은 지속성·기후값과 비교(초기 시각 31개, 12일 간격).
+- 팔: L(느린 채널 + 연속 학습), L0(연속 학습만: 학습 변경의 효과), D-noactor(통제: 채움만). 평가 끄기 `long`(느린 채널을 0으로).
+- 싼 시험(현재 커널, 체인 4): warm30(30일 스핀업)과 fill(2018-01-01부터 2년)을 warm(10일)과 비교.
+
+**판정 규칙 (사전 등록):**
+- L1 포화: 현재 커널에서 fill(2년)과 warm30의 24h·120h RMSE 차가 1% 이내(예상: 성립. 그러면 2년은 커널이 바뀌어야 뜻이 있음).
+- L2 필터 → 세계 모델: L0의 채움 자유 예보 24h RMSE가 N1 콜드 이하(연속 학습이 게임이 잃은 자유 예보를 되찾음).
+- L3 느린 기억: L의 채움 예보가 L0보다 120h 또는 2–4주에서 3% 이상 낮고, `long` 끄기가 그 이득의 절반 이상을 없앰.
+- L4 2년 의존(L3 성립 시): 2019-11-01부터 채운 것(2개월)과 2018-01-01부터 채운 것의 차가 2% 이상이면 2개월보다 오래된 기억이 작용.
+
+**시간:** 학습 L·L0 각 ~2h(A줄, 11단계 뒤 ~23:00부터), 채움·평가 ~1.5h → 11/02 아침 보고. 싼 시험은 11/01 ~13:30.
+
+**결과:** 실행 대기.
+
 ---
 
 ## 11단계 — 신경 연산자 묶음과 강화학습 선택 (`stage11_operator_bank/`)
@@ -667,6 +692,13 @@ python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/
     n1=runs/physics_n1/compare_graphcast_2020.json --warm2020 runs/stage10_Dnoactor/compare_memory_2020.json \
     --cold2018 memory=runs/stage10_Dnoactor/compare_graphcast_2018.json n1=runs/physics_n1/compare_graphcast.json \
     n0=runs/physics_n0/compare_graphcast.json --out docs/results/stage10_memory/compare.md
+# 10.2 (L: memory.long_channels=4, L0: 0); 채움은 2018-01-01부터 연속 통과, 28일은 --graphcast none
+python scripts/train_memory_filter.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/memory_filter_wb2.yaml \
+    --data-dir DATA2020 --out runs/stage10_2_L --set memory.long_channels=4
+python scripts/compare_memory.py --checkpoint runs/stage10_2_L/checkpoint.pt --data-dir DATA2020 --init-stride 6 --lead-steps 20 \
+    --fill continuous --fill-start 2018-01-01 --out runs/stage10_2_L/compare_fill_2020.json
+python scripts/compare_memory.py --checkpoint runs/stage10_2_L/checkpoint.pt --data-dir DATA2020 --graphcast none --init-stride 24 \
+    --lead-steps 112 --fill continuous --fill-start 2018-01-01 --out runs/stage10_2_L/compare_fill28_2020.json --set "data.val.end='2020-11-30'"
 # 1단계
 python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA              # chain
 python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA \
