@@ -118,3 +118,9 @@ class NeuralStepper(nn.Module):
             state, _ = self.advance(state, ctx, k)
             preds.append(self.predict(state, ctx, k))
         return torch.stack(preds, 1)
+
+    def rollout(self, batch: Dict[str, Tensor], steps: int, members: int = 1, **_) -> Tensor:
+        """Normalised predictions [M, B, L, C, H, W] (deterministic: members are copies), as the
+        physics model's, for pipeline.evaluate / compare_graphcast."""
+        pred = self.forward_rollout(batch, steps)
+        return pred[None].expand(members, *pred.shape)

@@ -94,6 +94,8 @@ def test_f1_stepper_trains_without_tendencies_and_reloads():
     with torch.no_grad():
         assert torch.allclose(g.forward_rollout(eps.batch(0, 0, steps), steps),
                               f1.forward_rollout(eps.batch(0, 0, steps), steps))
+        ens = f1.rollout(eps.batch(0, 0, steps), steps, members=2)   # the evaluate / compare_graphcast interface
+        assert ens.shape[:3] == (2, 1, steps) and torch.equal(ens[0], ens[1])
 
 
 def test_first_update_aborts_on_an_exploding_normalised_loss():
