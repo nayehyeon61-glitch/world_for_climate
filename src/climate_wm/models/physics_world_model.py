@@ -391,7 +391,7 @@ class PhysicsWorldModel(nn.Module):
                "forcings_tgt": batch.get("forcings_tgt")}
         if self.memory is not None:
             sh = self.core.sh
-            state["mem"] = static.new_zeros(static.shape[0], self.memory.cfg.channels, sh.nlat, sh.nlon)
+            state["mem"] = static.new_zeros(static.shape[0], self.memory.channels, sh.nlat, sh.nlon)
         return state, ctx
 
     def reobserve(self, ctx, inputs: Tensor):

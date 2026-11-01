@@ -151,7 +151,10 @@ class MemoryController(TendencyController):
         like = sh.to_spec(state["mem"])
         grid = lambda x, unit: sh.to_grid(self._from_low(x * unit, like, self.mem_coords))
         memory.control_tau = grid(a[:, 1], self.cfg.mem_tau_unit)  # held for this step's updates
-        return dict(state, mem=state["mem"] + grid(a[:, 0], self.cfg.mem_write_unit))
+        write = grid(a[:, 0], self.cfg.mem_write_unit)
+        if write.shape[1] < state["mem"].shape[1]:  # the slow channels (10.2) take no control
+            write = torch.cat([write, torch.zeros_like(state["mem"][:, write.shape[1]:])], 1)
+        return dict(state, mem=state["mem"] + write)
 
     def observation_features(self, obs: Tensor, mask: Tensor) -> Tensor:
         """Masked observation (normalised dynamic fields [N, C_dyn, H, W], 1 = hidden) -> [N, obs_dim] (age 0)."""
@@ -174,7 +177,7 @@ class MemoryController(TendencyController):
         parts = [x, obs]
         if self.mem_channels:
             sh = self.model_ref[0].core.sh
-            mem = self._low(sh.to_spec(state["mem"])).flatten(1)
+            mem = self._low(sh.to_spec(state["mem"][:, :self.mem_channels])).flatten(1)
             if not self.cfg.use_state or self.zero_diagnostics:
                 mem = torch.zeros_like(mem)
             parts.append(mem)
@@ -695,7 +698,7 @@ def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset,
                                                        "hi": np.percentile(means, 97.5, 0).tolist()}
         out["kinds"][kind] = res
     if tau_track:
-        k = model.memory.cfg.channels
+        k = model.memory.channels
         z = torch.stack(tau_track)
         z = z[torch.isfinite(z).all(1)].mean(0)  # [H + 3 + 3K] averaged over the finite updates
         # (a blown-up episode's updates are NaN and would have hidden every timescale)

@@ -286,7 +286,9 @@ def main():
     parser.add_argument("--cap", type=float, default=10.0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", required=True, help="OUT_<variant>.json per variant, OUT_summary.json")
-    parser.add_argument("--graphcast", default=None, help="GraphCast forecast zarr (default DATA/graphcast.zarr)")
+    parser.add_argument("--graphcast", default=None,
+                        help="GraphCast forecast zarr (default DATA/graphcast.zarr); 'none' scores without it, on "
+                             "every initialisation of the split (a 28-day free run, say, outruns its forecasts)")
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--coarsen", type=int, default=1)
@@ -309,8 +311,8 @@ def main():
     if getattr(model, "memory", None) is None:
         parser.error("the checkpoint has no memory kernel (stage 10)")
     clim = pipeline.build_climatology(cfg, train_ds)
-    gc = GraphCastForecasts(args.graphcast or os.path.join(args.data_dir, "graphcast.zarr"),
-                            layout.targets, coarsen=args.coarsen)
+    gc = None if args.graphcast == "none" else GraphCastForecasts(
+        args.graphcast or os.path.join(args.data_dir, "graphcast.zarr"), layout.targets, coarsen=args.coarsen)
     lead = cfg["eval"]["lead_steps"]
     val = cfg["data"].get("val", {})
     shift = lambda s: str(np.datetime64(s) - np.timedelta64(6 * args.spinup, "h")) if s else None
@@ -319,7 +321,8 @@ def main():
     data = SpinUpWindows(val_ds, long_ds, args.spinup)
     if len(data) < len(val_ds):
         print(f"{len(val_ds) - len(data)} forecast windows have no {args.spinup}-step spin-up (data.time_range)")
-    usable = np.where(gc.available(data.init_seconds()))[0][::args.init_stride]
+    usable = (np.where(gc.available(data.init_seconds()))[0] if gc is not None
+              else np.arange(len(data)))[::args.init_stride]
     t = lambda n: np.datetime64(int(data.init_seconds()[n]), "s")
     print(f"{len(usable)} initialisations ({t(usable[0])} .. {t(usable[-1])}), spin-up {args.spinup} steps")
     index = {c.key: i for i, c in enumerate(layout.targets)}
@@ -346,14 +349,16 @@ def main():
             os.remove(blown)
         print(f"== {name}: memory knock-outs {sorted(wrapper.knock) or 'none'}")
         results = pipeline.evaluate(cfg, wrapper, data, stats, clim, args.device, indices=usable,
-                                    extra_forecasts={"graphcast": gc}, log=print, progress_path=progress)
+                                    extra_forecasts={"graphcast": gc} if gc is not None else None, log=print,
+                                    progress_path=progress)
         metrics = results["metrics"]
-        print(format_scorecard(metrics, "model", "graphcast"))
+        print(format_scorecard(metrics, "model", "graphcast" if gc is not None else "persistence"))
         pipeline.results_to_json(results, out)
-        ours, theirs = metrics["model"].compute(), metrics["graphcast"].compute()
+        ours = metrics["model"].compute()
+        theirs = metrics["graphcast"].compute() if gc is not None else None
         entry = {"blowups": _blowups(blown)}
         for key in HEADLINE_KEYS:
-            if key in index:
+            if key in index and theirs is not None:
                 j = index[key]
                 entry[key] = {"lead_h": metrics["model"].lead_hours,
                               "rmse_skill_vs_graphcast": rmse_skill_score(ours["rmse"][:, j], theirs["rmse"][:, j]).tolist(),

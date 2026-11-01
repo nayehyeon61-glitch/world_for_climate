@@ -32,7 +32,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-KNOCKOUTS = ("memory", "innovation", "readout", "spread", "adaptive")
+KNOCKOUTS = ("memory", "innovation", "readout", "spread", "adaptive", "long")
 
 
 @dataclasses.dataclass
@@ -44,9 +44,15 @@ class MemoryConfig:
     spread: bool = True                # learned horizontal diffusion of m
     innovation: bool = True            # absorb the innovation at re-observations (G)
     readout: bool = True               # hidden points restart from forecast + R(m)
+    # stage 10.2: slow channels (months to years) with fixed timescales and a fixed input
+    # projection b = tanh(W x) (W frozen): running means of the column state that only
+    # the readers C and R learn to use. They take no innovation and no control.
+    long_channels: int = 0
+    long_tau_hours: Tuple[float, float] = (720.0, 17520.0)  # 1 month .. 2 years
 
     def __post_init__(self):
         self.tau_hours = tuple(self.tau_hours)
+        self.long_tau_hours = tuple(self.long_tau_hours)
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "MemoryConfig":
@@ -70,8 +76,14 @@ class MemoryKernel(nn.Module):
     def __init__(self, cfg: MemoryConfig, d_feat: int, n_out: int, n_dyn: int, sh, call_seconds: float):
         super().__init__()
         self.cfg, self.sh_ref, self.dt = cfg, [sh], float(call_seconds)
-        k, h = cfg.channels, cfg.hidden
+        k, h, kl = cfg.channels, cfg.hidden, cfg.long_channels
+        self.short, self.channels = k, k + kl  # the short (adaptive) channels come first
         tau0 = np.geomspace(cfg.tau_hours[0], cfg.tau_hours[1], k) * 3600.0
+        if kl:
+            tau0 = np.concatenate([tau0, np.geomspace(cfg.long_tau_hours[0], cfg.long_tau_hours[1], kl) * 3600.0])
+            gen = torch.Generator().manual_seed(0)
+            w = torch.randn(d_feat, kl, generator=gen) / np.sqrt(d_feat)
+            self.register_buffer("inp_long", w)  # frozen projection of the column features
         self.register_buffer("log_tau0", torch.tensor(np.log(tau0), dtype=torch.float32))
         if cfg.adaptive:
             self.rate = _net(d_feat, h, k)             # log tau shift, zero at the start
@@ -83,9 +95,9 @@ class MemoryKernel(nn.Module):
             self.gain = nn.Linear(2 * n_dyn, k)        # G(innovation, observed), linear
             nn.init.zeros_(self.gain.weight)
             nn.init.zeros_(self.gain.bias)
-        self.tend = _net(d_feat + k, h, n_out)         # C: memory term of the tendencies
-        self.read = _net(k, h, n_dyn)                  # R: hidden-point restart correction
-        self.kappa = nn.Parameter(torch.full((k,), -3.0))  # softplus: diffusion per update at n = trunc
+        self.tend = _net(d_feat + k + kl, h, n_out)    # C: memory term of the tendencies
+        self.read = _net(k + kl, h, n_dyn)             # R: hidden-point restart correction
+        self.kappa = nn.Parameter(torch.full((k + kl,), -3.0))  # softplus: diffusion per update at n = trunc
         self.knock: set = set()                        # evaluation knock-outs (KNOCKOUTS)
         self.control_tau: Optional[Tensor] = None      # [B, K, H, W] shift of ln tau set by a memory
                                                        # controller for the current step (stage 10 D-memctrl)
@@ -97,14 +109,17 @@ class MemoryKernel(nn.Module):
     def tau(self, x: Tensor) -> Tensor:
         """Timescales [B, H, W, K] in seconds for column features x [B, H, W, F]
         (with a controller's shift `control_tau`, clipped to e^{+-4})."""
+        k = self.short
         if not self.cfg.adaptive:
-            log = (self.log_tau0 + self.log_tau).expand(*x.shape[:-1], -1)
+            log = (self.log_tau0[:k] + self.log_tau).expand(*x.shape[:-1], -1)
         elif "adaptive" in self.knock:
-            log = self.log_tau0.expand(*x.shape[:-1], -1)
+            log = self.log_tau0[:k].expand(*x.shape[:-1], -1)
         else:
-            log = self.log_tau0 + 2.0 * torch.tanh(self.rate(x))  # within e^{+-2} of tau0
+            log = self.log_tau0[:k] + 2.0 * torch.tanh(self.rate(x))  # within e^{+-2} of tau0
         if self.control_tau is not None:
             log = log + self.control_tau.clamp(-4.0, 4.0).permute(0, 2, 3, 1)
+        if self.channels > k:  # the slow channels keep their timescales
+            log = torch.cat([log, self.log_tau0[k:].expand(*x.shape[:-1], -1)], -1)
         return torch.exp(log)
 
     def update(self, m: Tensor, x: Tensor) -> Tensor:
@@ -122,6 +137,8 @@ class MemoryKernel(nn.Module):
             self.track.append(torch.cat([lt.mean((0, 2, 3)), torch.quantile(flat.flatten(), qs), per]).cpu())
         a = torch.exp(-self.dt / tau)
         b = torch.tanh(self.inp(x)) if self.cfg.adaptive else self.inp(x)
+        if self.channels > self.short:
+            b = torch.cat([b, torch.tanh(x @ self.inp_long)], -1)
         m = (a * m.permute(0, 2, 3, 1) + (1 - a) * b).permute(0, 3, 1, 2)
         return self.spread(m)
 
@@ -133,25 +150,35 @@ class MemoryKernel(nn.Module):
         filt = torch.exp(-nn.functional.softplus(self.kappa).view(-1, 1, 1) * lam)  # [K, 1, N]
         return sh.to_grid(sh.to_spec(m) * filt)
 
+    def _readable(self, m: Tensor) -> Tensor:
+        """m with the slow channels zeroed under the "long" knock-out."""
+        if "long" in self.knock and self.channels > self.short:
+            m = torch.cat([m[:, :self.short], torch.zeros_like(m[:, self.short:])], 1)
+        return m
+
     def tendency(self, x: Tensor, m: Tensor) -> Tensor:
         """Memory term [B, H, W, n_out] in the column network's output units."""
         if "memory" in self.knock:
             return x.new_zeros(*x.shape[:-1], self.tend[-1].out_features)
-        return self.tend(torch.cat([x, m.permute(0, 2, 3, 1)], -1))
+        return self.tend(torch.cat([x, self._readable(m).permute(0, 2, 3, 1)], -1))
 
     # ---------------------------------------------------------- observations
     def absorb(self, m: Tensor, forecast_g: Tensor, innov_g: Tensor, observed_g: Tensor) -> Tensor:
         """m after a re-observation; inputs [B, C_dyn, H, W] on the Gaussian grid."""
         if not self.cfg.innovation or self.knock & {"innovation", "memory"}:
             return m
+        k = self.short
         if self.cfg.adaptive:
-            z = torch.cat([forecast_g, innov_g, observed_g, m], 1)
+            z = torch.cat([forecast_g, innov_g, observed_g, m[:, :k]], 1)
         else:
             z = torch.cat([innov_g, observed_g], 1)
-        return m + self.gain(z.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        g = self.gain(z.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        if self.channels > k:  # the slow channels take no innovation
+            g = torch.cat([g, torch.zeros_like(m[:, k:])], 1)
+        return m + g
 
     def readout(self, m: Tensor) -> Optional[Tensor]:
         """Correction [B, C_dyn, H, W] (normalised units, Gaussian grid) of the hidden points."""
         if not self.cfg.readout or self.knock & {"readout", "memory"}:
             return None
-        return self.read(m.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return self.read(self._readable(m).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
