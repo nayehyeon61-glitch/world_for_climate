@@ -46,7 +46,7 @@ def main():
     for name, r in res["runs"].items():
         ratio = r.get("err_ratio_finite")
         print(f"{name:24s} blow-ups {r['blowups']}/{len(res['inits'])}"
-              + (f" | error ratio vs none (finite in both, n={r['finite_both']}) 24 h {ratio[3]:.3f} 72 h {ratio[min(11, len(ratio) - 1)]:.3f}"
+              + (f" | error ratio vs none (finite in both, n={r['finite_both']}) 24 h {ratio[min(3, len(ratio) - 1)]:.3f} 72 h {ratio[min(11, len(ratio) - 1)]:.3f}"
                  if ratio else ""))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:

@@ -85,7 +85,88 @@ def causes_section(before: dict, after: dict) -> List[str]:
     return lines
 
 
-def verdicts(energies: Dict[str, dict], game, causes) -> List[str]:
+def _arm_run(arm: dict, kind: str):
+    return arm["data"]["runs"].get(f"{kind}:{arm['setting']}")
+
+
+def arms_section(arms: Dict[str, dict]) -> List[str]:
+    """E2 / E3 against E1 (the first arm): blow-ups per start kind and the error ratio
+    at 24 / 72 / 120 h on the initialisations finite in both, same inits."""
+    names = list(arms)
+    ref = arms[names[0]]
+    out = [f"## The corrector arms against {names[0]} (same initialisations)", "",
+           "Each arm is a checkpoint and the setting it runs under; the ratio is the all-point MSE of the arm over "
+           f"{names[0]} on the initialisations finite in both (< 1 = the arm is better).", "",
+           "| arm | checkpoint : setting | start | blow-ups | error ratio (24 / 72 / 120 h) | n |", "|---|---|---|---|---|---|"]
+    for name in names:
+        arm = arms[name]
+        for kind in arm["data"]["kinds"]:
+            run = _arm_run(arm, kind)
+            r0 = _arm_run(ref, kind)
+            if run is None:
+                continue
+            ratio, n = "reference" if name == names[0] else "-", ""
+            if name != names[0] and r0 is not None and "err_rows" in run and "err_rows" in r0:
+                same = arm["data"]["inits"] == ref["data"]["inits"]
+                ok = np.array([a is None and b is None for a, b in zip(run["blowup_steps"], r0["blowup_steps"])])
+                if same and ok.any():
+                    e1 = np.array(run["err_rows"])[ok].mean(0)
+                    e0 = np.array(r0["err_rows"])[ok].mean(0)
+                    last = min(19, len(e1) - 1)
+                    i24 = min(3, last)
+                    ratio = f"{e1[i24] / e0[i24]:.3f} / {e1[min(11, last)] / e0[min(11, last)]:.3f} / {e1[last] / e0[last]:.3f}"
+                    n = str(int(ok.sum()))
+                elif not same:
+                    ratio = "different initialisations"
+            out.append(f"| {name} | {arm['label']} | {kind} | {run['blowups']}/{len(run['blowup_steps'])} | {ratio} | {n} |")
+    return out
+
+
+def arm_verdicts(arms: Dict[str, dict]) -> List[str]:
+    names = list(arms)
+    if len(names) < 2:
+        return ["- **B2** (E2 against E1) and **B3** (soft against hard) wait for the E2 / E3 arms."]
+    ref = arms[names[0]]
+    lines = []
+
+    def totals(arm):
+        b, ratio72, n = 0, [], 0
+        for kind in arm["data"]["kinds"]:
+            run, r0 = _arm_run(arm, kind), _arm_run(ref, kind)
+            if run is None:
+                continue
+            b += run["blowups"]
+            if r0 is not None and "err_rows" in run and "err_rows" in r0 and arm["data"]["inits"] == ref["data"]["inits"]:
+                ok = np.array([a is None and c is None for a, c in zip(run["blowup_steps"], r0["blowup_steps"])])
+                if ok.any():
+                    e1 = np.array(run["err_rows"])[ok]
+                    e0 = np.array(r0["err_rows"])[ok]
+                    j = min(11, e1.shape[1] - 1)
+                    ratio72.append(e1[:, j].mean() / e0[:, j].mean())
+                    n += int(ok.sum())
+        return b, (float(np.mean(ratio72)) if ratio72 else None), n
+
+    b_ref = totals(ref)[0]
+    e2 = [k for k in names[1:] if k.upper().startswith("E2")]
+    e3 = [k for k in names[1:] if k.upper().startswith("E3")]
+    for name in e2:
+        b, r, n = totals(arms[name])
+        ok = r is not None and r <= 0.97 and b <= b_ref
+        lines.append(f"- **B2** {name} beats {names[0]} by >= 3% at 72 h with no more blow-ups  \n  → "
+                     f"{'supported' if ok else 'not supported'} (blow-ups {b} vs {b_ref}; 72 h ratio "
+                     f"{'-' if r is None else f'{r:.3f}'} = gain {_pct(None if r is None else 1 - r)} on {n} finite pairs)")
+    for name in e3:
+        b, r, n = totals(arms[name])
+        hard = [totals(arms[k])[0] for k in e2] or [b_ref]
+        lines.append(f"- **B3** the soft arm {name} blows up more than the hard arm(s)  \n  → "
+                     f"{'supported' if b > min(hard) else 'not supported'} (blow-ups {b} vs hard {min(hard)}; 72 h ratio "
+                     f"{'-' if r is None else f'{r:.3f}'} vs {names[0]})")
+    if not e2 and not e3:
+        lines.append("- **B2** / **B3**: no arm labelled E2 / E3 was given.")
+    return lines
+
+
+def verdicts(energies: Dict[str, dict], game, causes, arms: Optional[Dict[str, dict]] = None) -> List[str]:
     out = ["## Decision rules", ""]
     mem, n1 = energies.get("memory"), energies.get("n1")
     removed, total = 0, 0
@@ -131,7 +212,7 @@ def verdicts(energies: Dict[str, dict], game, causes) -> List[str]:
                         found.append(f"{name}: {t} x{b / max(s, 1e-9):.1f}")
         out.append(f"- **B4** the injecting term: a term's mean over the four steps before a blow-up is >= 2x the same "
                    f"leads of the finite runs  \n  → {'supported' if found else 'not supported'}" + (f" ({'; '.join(found)})" if found else " (no term stands out, or no blow-up recorded)"))
-    out += ["- **B2** (E2 against E1) and **B3** (soft against hard) wait for the E2 / E3 arms."]
+    out += arm_verdicts(arms or {})
     return out
 
 
@@ -164,8 +245,18 @@ def main():
     parser.add_argument("--energy", nargs="+", required=True, metavar="LABEL=PATH")
     parser.add_argument("--game", nargs=2, default=None, metavar=("WITHOUT", "WITH"))
     parser.add_argument("--causes", nargs=2, default=None, metavar=("WITHOUT", "WITH"))
+    parser.add_argument("--arms", nargs="*", default=[], metavar="LABEL=PATH:SETTING",
+                        help="corrector arms (first = the reference, e.g. E1=runs/stage10_Dnoactor/energy_2020.json:flux500_nowork "
+                             "E2=runs/stage13_E2/energy_2020.json:flux500_nowork E3=runs/stage13_E3/energy_2020.json:none)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    arms: Dict[str, dict] = {}
+    for item in args.arms:
+        label, rest = item.split("=", 1)
+        path, setting = rest.rsplit(":", 1)
+        d = load(path)
+        if d is not None and setting in d["settings"]:
+            arms[label] = {"data": d, "setting": setting, "label": f"{os.path.basename(os.path.dirname(path))} : {setting}"}
     energies = {}
     for item in args.energy:
         label, path = item.split("=", 1)
@@ -187,7 +278,9 @@ def main():
         lines += game_section(*game) + [""]
     if causes:
         lines += causes_section(*causes) + [""]
-    lines += verdicts(energies, game, causes) + [""] + direction(energies)
+    if arms:
+        lines += arms_section(arms) + [""]
+    lines += verdicts(energies, game, causes, arms) + [""] + direction(energies)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         f.write("\n".join(lines) + "\n")

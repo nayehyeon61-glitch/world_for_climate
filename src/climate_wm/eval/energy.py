@@ -101,7 +101,8 @@ def diagnose_energy(model, dataset, indices: Sequence[int], steps: int, settings
             err = np.array([r["err"] for r in rows])
             blown = [r["blowup_step"] for r in rows]
             run = {"blowups": int(sum(b is not None for b in blown)), "blowup_steps": blown,
-                   "err": err.mean(0).tolist(), "energy": np.mean([r["energy"] for r in rows], 0).tolist()}
+                   "err": err.mean(0).tolist(), "err_rows": err.tolist(),  # per initialisation (arm comparisons)
+                   "energy": np.mean([r["energy"] for r in rows], 0).tolist()}
             if base_rows is not None and name != "none":
                 ok = np.array([b is None and r["blowup_step"] is None for b, r in zip(blown, base_rows)])
                 if ok.any():

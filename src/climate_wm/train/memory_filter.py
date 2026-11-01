@@ -50,6 +50,7 @@ class FilterConfig:
     grad_clip: float = 1.0
     cap: float = 10.0          # a window ends before a step whose error exceeds this
     train_model: bool = True   # False: only the memory learns
+    new_prefix: str = "memory."  # the parameters at lr_new (stage 13: "corrector.")
     log_every: int = 10
     save_every: int = 10
     seed: int = 0
@@ -92,8 +93,9 @@ def expand_state_dict(model, state: Dict[str, Tensor]) -> List[str]:
         else:
             load[key] = value
     missing = model.load_state_dict(load, strict=False).missing_keys
-    if any(not k.startswith("memory.") for k in missing):
-        raise ValueError(f"checkpoint lacks {[k for k in missing if not k.startswith('memory.')]}")
+    new = ("memory.", "corrector.")  # modules a checkpoint may lack: they start fresh
+    if any(not k.startswith(new) for k in missing):
+        raise ValueError(f"checkpoint lacks {[k for k in missing if not k.startswith(new)]}")
     return expanded
 
 
@@ -113,7 +115,7 @@ def train_filter(model, dataset, order: List[int], cfg: FilterConfig, device="cp
     attach_loss(model)
     model_params, new_params = [], []
     for name, p in model.named_parameters():
-        if name.startswith("memory."):
+        if name.startswith(cfg.new_prefix):
             new_params.append(p)
         else:
             p.requires_grad_(cfg.train_model)
@@ -136,10 +138,14 @@ def train_filter(model, dataset, order: List[int], cfg: FilterConfig, device="cp
     t2d = model.layout.target_to_dynamic
     mask = None
     t_start = time.time()
+    corrector = getattr(model, "corrector", None)
+    soft = corrector is not None and corrector.cfg.soft_weight > 0  # stage 13 E3
     for n in range(done, total):
         j = order[n % len(order)]
         if n % len(order) == 0 and n > done:
             mem = None  # a new pass starts with an empty memory
+        if soft:
+            corrector.penalties = []
         item = dataset[j]
         batch = {k: v[None].to(device) for k, v in item.items()}
         if mask is None:
@@ -169,6 +175,8 @@ def train_filter(model, dataset, order: List[int], cfg: FilterConfig, device="cp
         gnorm = float("nan")
         if losses:
             loss = torch.stack(losses).mean()
+            if soft and corrector.penalties:
+                loss = loss + torch.stack(corrector.penalties).mean()
             if cfg.train_model or new_params:
                 loss.backward()
                 params = [p for g in opt.param_groups for p in g["params"]]
@@ -176,7 +184,7 @@ def train_filter(model, dataset, order: List[int], cfg: FilterConfig, device="cp
                 if math.isfinite(gnorm):
                     opt.step()
         sched.step()
-        mem = state["mem"].detach() if not blown and torch.isfinite(state["mem"]).all() else None
+        mem = state["mem"].detach() if "mem" in state and not blown and torch.isfinite(state["mem"]).all() else None
         model.eval()
         history["window"].append(n)
         history["loss"].append(float(np.mean(fill_err + free_err)) if losses else float("nan"))

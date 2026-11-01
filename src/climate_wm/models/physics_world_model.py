@@ -35,6 +35,7 @@ from torch.utils.checkpoint import checkpoint
 from ..data import forcings as forcing_lib
 from ..data.graphcast_mapping import ChannelLayout
 from .memory_kernel import MemoryConfig, MemoryKernel
+from .energy_corrector import CorrectorConfig, EnergyCorrector
 from .primitive_core import CP, EPS_V, R_DRY, CoreConfig, PrimitiveCore
 
 GRAV = 9.80665
@@ -83,15 +84,18 @@ class PhysicsModelConfig:
     carry_residual: bool = True
     grad_checkpoint: bool = True
     memory: Optional[MemoryConfig] = None  # stage 10
+    corrector: Optional[CorrectorConfig] = None  # stage 13 E2 / E3
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "PhysicsModelConfig":
         d = dict(d or {})
         d.pop("type", None)
         mem = d.pop("memory", None)
+        corr = d.pop("corrector", None)
         return cls(core=CoreConfig.from_dict(d.pop("core", None)),
                    column=ColumnConfig.from_dict(d.pop("column", None)),
-                   memory=MemoryConfig.from_dict(mem) if mem else None, **d)
+                   memory=MemoryConfig.from_dict(mem) if mem else None,
+                   corrector=CorrectorConfig.from_dict(corr) if corr else None, **d)
 
 
 def _mlp(d_in: int, hidden: int, d_out: int, layers: int) -> nn.Sequential:
@@ -144,6 +148,11 @@ class PhysicsWorldModel(nn.Module):
                 raise ValueError("the memory kernel reads and feeds the column physics")
             self.memory = MemoryKernel(cfg.memory, d_in, n_out, len(layout.dynamic), self.core.sh,
                                        cc.call_minutes * 60.0)
+        self.corrector = None
+        if cfg.corrector is not None and cfg.corrector.enabled:
+            if self.column is None:
+                raise ValueError("the energy corrector corrects the column physics")
+            self.corrector = EnergyCorrector(cfg.corrector, n_lev, d_in, self.core.sh.trunc)
         self.register_buffer("mean", torch.zeros(len(layout.targets)))
         self.register_buffer("std", torch.ones(len(layout.targets)))
         self.register_buffer("in_mean", torch.zeros(len(layout.dynamic)))
@@ -319,6 +328,8 @@ class PhysicsWorldModel(nn.Module):
         if self.cfg.column.energy_max_flux is not None or self.cfg.column.energy_no_work \
                 or self.energy_track is not None:
             out = self.energy_bound(out, u, v)
+        if self.corrector is not None:  # stage 13 E2 / E3: after the bound, so it redistributes bounded input
+            out = self.corrector(out, x, u, v, self.dp_layer)
         for name in self.column_knock:  # after the budget: precipitation is still diagnosed
             for key in COLUMN_KNOCKS[name]:
                 out[key] = torch.zeros_like(out[key])

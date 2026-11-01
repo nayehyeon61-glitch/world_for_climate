@@ -701,7 +701,11 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 - 수분 ∫S dp/g = E − P는 이미 있습니다. Beucler 등(2021, PRL)의 hard constraint 방식이고, Brenowitz 등(2020)이 보인 "학습된 칼럼 + 역학의 불안정"을 겨냥합니다.
 - 진단(`eval/energy.py`, `scripts/diagnose_energy.py`): 칼럼 호출마다 가열·수분·일 플럭스의 전구 평균, 칼럼 최대 |플럭스|·일, 잘린 칼럼 비율을 기록하고, 폭주 직전 4걸음의 항을 유한하게 남은 실행의 같은 리드와 비교해 어느 항이 주입하는지 읽습니다.
 
-**E2 신경 연산자 에너지 제약(제안, E1 결과 뒤 구현):** 11단계 SFNO가 상태와 칼럼 경향을 읽어 보정장을 내되, 출력은 E1과 같은 투영(에너지 중립)을 통과하도록 매개변수화하고 2018–19 자유예보 손실로 학습합니다. E1이 "어디서 에너지를 빼는가"(균일)를 고정하는 데 비해 E2는 그것을 배웁니다. **E3** 소프트 벌칙(손실에 에너지 유입 항)은 hard 대 soft의 통제군입니다.
+**E2 신경 연산자 에너지 제약 (`models/energy_corrector.py`, `scripts/train_energy_corrector.py`, `configs/energy_corrector_wb2.yaml`; 11/01 12:30 구현):** 11단계와 같은 SFNO(은닉 16, 2층, 16모드, 2.4만 파라미터)가 칼럼의 입력 시야(정규화 상태·정적장·강제력)와 칼럼 경향(Q, S, F_u, F_v; 예산과 E1 바운드 뒤)을 읽어 네 경향의 보정장을 냅니다. 출력은 칼럼마다 (i) 에너지 중립 c_p∫δQ dp/g + L_v∫δS dp/g = 0, (ii) 운동량 중립 ∫δF dp = 0, (iii) 일 금지 ∫δF·u dp ≤ 0 로 투영되므로, 보정자는 열·수분·운동량을 칼럼 안에서(연직으로, 열↔수분으로) 재분배만 할 수 있고 E1이 묶은 에너지 유입은 그대로입니다. E1이 "어디서 에너지를 빼는가"를 균일로 고정하는 데 비해 E2는 그것을 배웁니다. 학습: 기본 모델(칼럼·기억) 동결, 보정자만 2018–19 연속 필터 창(24h 재관측 + 48h 자유, 243창, 10.2와 같은 `train_filter`)의 자유예보 손실로 1회 통과. 마지막 층 0 초기화라 학습 전에는 E1과 같습니다.
+- **E3 소프트 벌칙:** 같은 보정자를 투영 없이(`corrector.neutral=false`) 쓰고, 바운드 없이 손실에 soft_weight·mean(relu(|플럭스| − 500)/500)² 을 더합니다(hard 대 soft의 통제군).
+- **E2-mlp (국소 통제군):** 같은 입력을 1×1 칼럼별 망으로 — 비국소 연산자가 필요한지 봅니다.
+- 평가: 체크포인트에 보정자가 들어 있으므로 기존 진단(`diagnose_energy.py`)을 그대로 씁니다. E2는 학습 설정(500 + 일 금지)과 바운드 없이(`none`, 재분배만으로 폭주가 서는가) 두 가지로.
+- 비용: 창당 ~42 s(1스레드, 12걸음 전후진) → 243창 ~2.8h. 체인 9(체인 8 뒤): E2 학습·진단 → E3 → E2-mlp, 2h마다 재시작(재개 가능).
 
 **실행(체인 7, 1스레드):** ① D-noactor 2020 콜드 10개 초기 시각 × 출발 2종(완전 스냅샷, 영역 캡 숨김) × 설정 5종(없음·500·250·일 금지·500+일 금지) × 120h. ② N1에 같은 것(안정한 모델에서 제약의 비용). ③ 10단계 영역 게임(31개, D-noactor full·nudging)에 500+일 금지. ④ 9단계 `no_moistening`(N1, 2020, 8/8 폭주)에 500+일 금지.
 
@@ -711,7 +715,7 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 - B3 (E3 뒤) soft가 hard보다 폭주가 많음.
 - B4 원인: 폭주 직전 4걸음에서 가열·수분·일 가운데 한 항의 전구 평균 또는 칼럼 최대가 유한 실행의 2배 이상(주입 항의 식별).
 
-**시간 (KST):** E1 구현·테스트 ~1h(11/01 11:45 완료), 체인 7 ~1h(체인 5 뒤 ~12:00부터) → 13:30 1차 보고. E2 구현 2h + 학습 2h(레인) → 11/02.
+**시간 (KST):** E1 구현·테스트 ~1h(11/01 11:45 완료), 체인 7 ~1h(11:03–11:50) → 11:55 1차 보고. E2/E3 구현·테스트 ~1h(12:30 완료), 체인 9: E2 학습 ~2.8h + 진단 ~0.5h(13:00부터 → ~16:30), E3 ~3.3h(→ ~20:00), E2-mlp ~3h(→ ~23:00) → E2 보고 11/01 저녁, E3·mlp 포함 최종 11/02 아침.
 
 **E1 결과 (11/01 11:50, `stage13_energy/energy.md`; 이득은 + = 개선):**
 - 폭주 수(2020, 10개 초기 시각, 120h): 기억 모델(D-noactor) 콜드 5 → 2(500 W/m²), 영역 캡 2 → 0. 일 금지만으로는 변화 없음(6, 1). N1 콜드 0 → 0, N1 영역 4 → 2. 10단계 영역 게임(31개) full 1 → 1, nudging 0 → 0. `no_moistening` 절단 8 → 8(첫 폭주 18h 그대로).
@@ -752,6 +756,14 @@ python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/
     n1=runs/physics_n1/compare_graphcast_2020.json --warm2020 runs/stage10_Dnoactor/compare_memory_2020.json \
     --cold2018 memory=runs/stage10_Dnoactor/compare_graphcast_2018.json n1=runs/physics_n1/compare_graphcast.json \
     n0=runs/physics_n0/compare_graphcast.json --out docs/results/stage10_memory/compare.md
+# 13단계 E2 / E3 (보정자 학습; PYTHONPATH 에 neuraloperator; E3: --set corrector.neutral=false corrector.soft_weight=1.0, 바운드 없이)
+python scripts/train_energy_corrector.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/energy_corrector_wb2.yaml \
+    --data-dir DATA2020 --out runs/stage13_E2 --set model.column.energy_max_flux=500 model.column.energy_no_work=true
+python scripts/diagnose_energy.py --checkpoint runs/stage13_E2/checkpoint.pt --config configs/dreamer_wb2.yaml --data-dir DATA2020 \
+    --inits 10 --steps 20 --kinds none region --settings none flux500_nowork --out runs/stage13_E2/energy_2020.json
+python scripts/report_energy.py --energy memory=runs/stage10_Dnoactor/energy_2020.json n1=runs/physics_n1/energy_2020.json \
+    --arms E1=runs/stage10_Dnoactor/energy_2020.json:flux500_nowork E2=runs/stage13_E2/energy_2020.json:flux500_nowork \
+           E3=runs/stage13_E3/energy_2020.json:none E2mlp=runs/stage13_E2mlp/energy_2020.json:flux500_nowork --out docs/results/stage13_energy/energy.md
 # 13단계 E1 (학습 없음; 설정은 --set model.column.energy_max_flux=500 model.column.energy_no_work=true 로 어느 평가에나)
 python scripts/diagnose_energy.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/dreamer_wb2.yaml \
     --data-dir DATA2020 --inits 10 --steps 20 --kinds none region --out runs/stage10_Dnoactor/energy_2020.json
