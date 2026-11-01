@@ -62,7 +62,8 @@ from climate_wm.train.dreamer_game import play_memory
 from climate_wm.train.prediction_game import reobserved_fields, sample_mask, target_mask
 from compare_graphcast import GraphCastForecasts, format_scorecard
 
-VARIANTS = {"warm": (), "warm_no_memory": ("memory",), "nudging": ()}
+VARIANTS = {"warm": (), "warm_no_memory": ("memory",), "warm_no_readout": ("readout",),
+            "warm_no_innovation": ("innovation",), "nudging": ()}
 STEP_S = 6 * 3600
 
 
@@ -459,7 +460,11 @@ def main():
         if not args.base:
             parser.error("the nudging variant needs --base")
         bcfg, bstate, _ = pipeline.load_checkpoint(args.base, args.device)
-        base = pipeline.build_model(dict(cfg, model=bcfg["model"]), layout, train_ds).to(args.device)
+        bmodel = dict(bcfg["model"], column=dict(bcfg["model"].get("column") or {}))
+        for key, value in (cfg["model"].get("column") or {}).items():  # the energy bound (--set) binds the base too
+            if key.startswith("energy"):
+                bmodel["column"][key] = value
+        base = pipeline.build_model(dict(cfg, model=bmodel), layout, train_ds).to(args.device)
         base.load_state_dict(bstate)
         base.eval()
     if args.obs_kind != "none":
