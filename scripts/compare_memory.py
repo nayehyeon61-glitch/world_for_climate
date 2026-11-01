@@ -27,6 +27,21 @@ across consecutive windows (the pass is resumable), and m is snapshotted at
 each initialisation; the free run then starts from the snapshot. With a kernel
 whose time scales are bounded (tau <= 10 days in stage 10) this should equal a
 spin-up of a month or more (saturation); it is the fill of a long-memory kernel.
+
+`--obs-kind region` (감자 09:49 KST 11/01: "관측을 통해서 예보가 되면"): observations
+keep arriving during the forecast. The spin-up observes everything, so at the
+initialisation the model holds the same analysis as GraphCast; from then on a
+cap of the sphere (`--region-fraction` of its area, one cap per
+initialisation, the same for every forecast) is hidden and the points outside
+it are re-observed every 6 h through the forecast. Every forecast, GraphCast's
+free run included, is scored on the cap only (the residual outside is zeroed
+and inside scaled by 1 / sqrt(hidden weight fraction), so the RMSE is the
+latitude-weighted RMSE over the cap; ACC and the persistence and climatology
+rows are not valid in this mode). The question is at which lead a forecast fed
+by observations outside the cap beats the best free forecast inside it.
+Variants: `warm` (the memory model, posterior re-observation) and `nudging`
+(--base: N1 with the truth inserted on the observed points, the stage 10
+reference).
 """
 
 import argparse
@@ -41,11 +56,13 @@ from torch.utils.data import Dataset
 
 from climate_wm import pipeline
 from climate_wm.data.era5_lazy_loader import GraphCastWindowDataset
-from climate_wm.eval.graphcast_metrics import HEADLINE_KEYS, acc_skill_score, rmse_skill_score
+from climate_wm.eval.graphcast_metrics import (HEADLINE_KEYS, acc_skill_score, normalized_latitude_weights,
+                                               rmse_skill_score)
 from climate_wm.train.dreamer_game import play_memory
+from climate_wm.train.prediction_game import reobserved_fields, sample_mask, target_mask
 from compare_graphcast import GraphCastForecasts, format_scorecard
 
-VARIANTS = {"warm": (), "warm_no_memory": ("memory",)}
+VARIANTS = {"warm": (), "warm_no_memory": ("memory",), "nudging": ()}
 STEP_S = 6 * 3600
 
 
@@ -257,6 +274,109 @@ class FilledStart(WarmStart):
         return pred[None].expand(members, *pred.shape)
 
 
+class ObservedStart(WarmStart):
+    """Observations keep arriving during the forecast (module docstring): the
+    spin-up observes everything (play_memory with nothing hidden, the state
+    after its last re-observation kept), then the forecast re-observes the
+    points outside a cap every step; the cap is sampled per initialisation
+    (seeded by its time, so every forecast gets the same cap) and `hide`
+    scores it alone. `rule`: "posterior" (the memory model) or a nudging
+    strength (N1, 1.0 = insertion)."""
+
+    def __init__(self, model, spinup: int, lat, lon, kind: str = "region", region_fraction: float = 0.25,
+                 seed: int = 0, rule="posterior", knock=(), cap: float = 10.0, blown_path: str = None):
+        super().__init__(model, spinup, knock, cap, blown_path)
+        self.lat, self.lon, self.kind, self.frac, self.seed, self.rule = lat, lon, kind, region_fraction, seed, rule
+        self.lat_w = torch.tensor(normalized_latitude_weights(lat), dtype=torch.float32)
+        self.current: Dict[str, torch.Tensor] = {}  # of the latest batch: target mask, physical target
+        self.hidden_fraction: list = []
+
+    def masks(self, inits) -> torch.Tensor:
+        out = []
+        for t in inits:
+            gen = torch.Generator().manual_seed(self.seed + int(t) // STEP_S)
+            out.append(sample_mask(self.layout, self.kind, self.lat, self.lon, gen, self.frac)[0])
+        return torch.stack(out)
+
+    def hide(self, pred: torch.Tensor, target: torch.Tensor, tmask: torch.Tensor) -> torch.Tensor:
+        """pred, target [B, L, C, H, W]; tmask [B, C, H, W] (1 = hidden): the residual on the cap scaled
+        so that its latitude-weighted mean square over the grid is the mean square over the cap."""
+        w = self.lat_w.to(pred.device)[None, None, :, None]
+        frac = (tmask * w).sum((-2, -1)) / w.expand_as(tmask).sum((-2, -1))  # [B, C]
+        scale = (tmask / frac.clamp_min(1e-6).sqrt()[..., None, None])[:, None]
+        return target + (pred - target) * scale
+
+    @torch.no_grad()
+    def rollout(self, batch: Dict[str, torch.Tensor], steps: int, members: int = 1, **_) -> torch.Tensor:
+        long = {k[5:]: v for k, v in batch.items() if k.startswith("spin_")}
+        x = long["inputs"]
+        if not torch.allclose(long["targets"][:, self.spinup:], batch["targets"]):
+            raise ValueError("the spin-up window does not end on the forecast window")
+        inits = batch["init_time"].cpu().tolist()
+        mask = self.masks(inits).to(x.device)
+        tmask = target_mask(self.model, mask)
+        model, t2d = self.model, self.model.layout.target_to_dynamic
+        preds, last, blown = [], None, torch.zeros(len(inits), dtype=torch.bool)
+        mem = model.memory
+        if mem is not None:
+            mem.knock = set(self.knock)
+        try:
+            # the spin-up with everything observed: the state before step `spinup` is the
+            # analysis at the initialisation (after the re-observation of its truth)
+            keep: list = []
+            play_memory(model, None, long, torch.zeros_like(mask), self.spinup + 1, obs_prob=1.0, rule=self.rule,
+                        gen=torch.Generator().manual_seed(0), cap=self.cap, keep=keep)
+            state, resid, _, ctx, _ = keep[self.spinup]
+            state, ctx = dict(state), dict(ctx, resid=resid)
+            for k in range(steps):
+                state, precip = model.advance(state, ctx, self.spinup + k)
+                pred = model.predict(state, ctx, self.spinup + k, precip)
+                truth = long["targets"][:, self.spinup + k][:, t2d]
+                ok = torch.isfinite(pred).flatten(1).all(1).cpu() & _finite_rows(state)
+                blown |= ~ok
+                scored = pred.float().cpu()
+                scored = torch.nan_to_num(scored) if last is None else torch.where(blown[:, None, None, None], last, scored)
+                last = scored
+                preds.append(scored)
+                fc = torch.nan_to_num(pred[:, t2d])
+                if self.rule == "posterior":  # the observed points re-observed, the cap carried
+                    state = model.posterior(state, ctx, fc, truth, mask)
+                else:
+                    fresh = model.reobserve(ctx, reobserved_fields(truth, fc, mask, None if self.rule == "reset" else self.rule))
+                    if "mem" in state:
+                        fresh["mem"] = state["mem"]
+                    state = fresh
+        finally:
+            if mem is not None:
+                mem.knock = set()
+        if self.blown_path:
+            with open(self.blown_path, "a") as f:
+                f.write(json.dumps({"init": inits, "blown": blown.tolist()}) + "\n")
+        pred = self.hide(torch.stack(preds, 1).to(x.device), batch["targets"], tmask)
+        w = self.lat_w[None, None, :, None]
+        self.hidden_fraction += ((tmask.cpu() * w).sum((-2, -1)) / w.expand_as(tmask.cpu()).sum((-2, -1))).mean(1).tolist()
+        self.current = {"tmask": tmask.cpu(), "init": inits}
+        return pred[None].expand(members, *pred.shape)
+
+
+class HiddenGraphCast:
+    """GraphCast's free forecast scored on the hidden cap of the batch the wrapper just ran."""
+
+    def __init__(self, gc, wrapper: ObservedStart, stats, targets, val_items):
+        self.gc, self.wrapper, self.stats, self.targets, self.items = gc, wrapper, stats, targets, val_items
+
+    def available(self, inits):
+        return self.gc.available(inits)
+
+    def __call__(self, init, lead):
+        pred = self.gc(init, lead)  # physical [B, L, C, H, W]
+        cur = self.wrapper.current
+        if [int(t) for t in init] != [int(t) for t in cur["init"]]:
+            raise RuntimeError("GraphCast batch does not match the wrapper's")
+        target = self.stats.unnormalize(torch.stack([self.items(int(t))["targets"] for t in init]), self.targets)
+        return self.wrapper.hide(pred.float(), target.float(), cur["tmask"])
+
+
 def _blowups(path: str) -> int:
     if not os.path.exists(path):
         return 0
@@ -283,6 +403,11 @@ def main():
                         help="continuous: one pass from --fill-start with the memory carried (variant 'fill')")
     parser.add_argument("--fill-start", default=None, help="e.g. 2018-01-01 (the fill of 2020 then holds two years)")
     parser.add_argument("--fill-chunk", type=int, default=120, help="window length of the pass (steps)")
+    parser.add_argument("--obs-kind", choices=["none", "region"], default="none",
+                        help="region: observations keep arriving outside a hidden cap, scored on the cap")
+    parser.add_argument("--region-fraction", type=float, default=0.25)
+    parser.add_argument("--obs-seed", type=int, default=0)
+    parser.add_argument("--base", default=None, help="N1 checkpoint for the nudging reference (variant nudging)")
     parser.add_argument("--cap", type=float, default=10.0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", required=True, help="OUT_<variant>.json per variant, OUT_summary.json")
@@ -328,6 +453,18 @@ def main():
     index = {c.key: i for i, c in enumerate(layout.targets)}
     summary = {"spinup_steps": args.spinup, "inits": int(len(usable)), "variants": {}}
     variants = list(args.variants)
+    base = None
+    if "nudging" in variants:
+        if not args.base:
+            parser.error("the nudging variant needs --base")
+        bcfg, bstate, _ = pipeline.load_checkpoint(args.base, args.device)
+        base = pipeline.build_model(dict(cfg, model=bcfg["model"]), layout, train_ds).to(args.device)
+        base.load_state_dict(bstate)
+        base.eval()
+    if args.obs_kind != "none":
+        summary.update({"obs_kind": args.obs_kind, "region_fraction": args.region_fraction, "obs_seed": args.obs_seed,
+                        "note": "RMSE over the hidden cap; ACC, persistence and climatology are not valid here"})
+    items = lambda t: data[int(np.where(data.init_seconds() == t)[0][0])]
     if args.fill == "continuous":
         if not args.fill_start:
             parser.error("--fill continuous needs --fill-start")
@@ -340,8 +477,17 @@ def main():
     for name in variants:
         out = args.out.replace(".json", f"_{name}.json")
         blown = out.replace(".json", "_blown.jsonl")
+        extra = {"graphcast": gc} if gc is not None else None
         if name == "fill":
             wrapper = FilledStart(model, fill.snaps, (), args.cap, blown)
+        elif args.obs_kind != "none":
+            m, rule = (base, 1.0) if name == "nudging" else (model, "posterior")
+            wrapper = ObservedStart(m, args.spinup, data.lat, data.lon, args.obs_kind, args.region_fraction,
+                                    args.obs_seed, rule, VARIANTS[name], args.cap, blown)
+            if gc is not None:
+                extra = {"graphcast": HiddenGraphCast(gc, wrapper, stats, layout.targets, items)}
+        elif name == "nudging":
+            parser.error("the nudging variant is for --obs-kind region")
         else:
             wrapper = WarmStart(model, args.spinup, VARIANTS[name], args.cap, blown)
         progress = out + ".progress.pt" if args.resume else None
@@ -349,14 +495,15 @@ def main():
             os.remove(blown)
         print(f"== {name}: memory knock-outs {sorted(wrapper.knock) or 'none'}")
         results = pipeline.evaluate(cfg, wrapper, data, stats, clim, args.device, indices=usable,
-                                    extra_forecasts={"graphcast": gc} if gc is not None else None, log=print,
-                                    progress_path=progress)
+                                    extra_forecasts=extra, log=print, progress_path=progress)
         metrics = results["metrics"]
         print(format_scorecard(metrics, "model", "graphcast" if gc is not None else "persistence"))
         pipeline.results_to_json(results, out)
         ours = metrics["model"].compute()
         theirs = metrics["graphcast"].compute() if gc is not None else None
         entry = {"blowups": _blowups(blown)}
+        if isinstance(wrapper, ObservedStart) and wrapper.hidden_fraction:
+            entry["hidden_fraction"] = float(np.mean(wrapper.hidden_fraction))
         for key in HEADLINE_KEYS:
             if key in index and theirs is not None:
                 j = index[key]

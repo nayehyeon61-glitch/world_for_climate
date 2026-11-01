@@ -245,12 +245,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n1", nargs="+", required=True, help="N1 causes json per year (first = main)")
     parser.add_argument("--n0", nargs="*", default=[], help="N0 causes json per year (same order)")
+    parser.add_argument("--labels", nargs="*", default=None,
+                        help="column labels for the --n1 files instead of their years (e.g. memory N1, to compare "
+                             "the stage 10 memory model with N1 on the same year: the invariance section then "
+                             "measures whether the fine-tuned model kept N1's causal responses)")
+    parser.add_argument("--title", default="Stage 9: the coupled physics of N1 under interventions")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     n1s = [r for r in map(_load, args.n1) if r]
     n0s = [r for r in map(_load, args.n0) if r]
-    years = [r["year"] for r in n1s]
-    md = ["# Stage 9: the coupled physics of N1 under interventions", "",
+    years = args.labels or [r["year"] for r in n1s]
+    md = [f"# {args.title}", "",
           f"Model: `{'/'.join(n1s[0]['checkpoint'].split('/')[-3:])}`; {n1s[0]['inits']} initialisations per year ({', '.join(map(str, years))}),"
           " 72 h, the same dates in N0. Changes: channel-mean normalised MSE vs the intact model"
           " (+ = worse without the arrow). Blow-ups: runs that diverged by 72 h (per year).", "",
@@ -258,14 +263,14 @@ def main():
     md += arrow_table(n1s, n0s, years)
     md += ["", "Arrows without a path in N1:", ""]
     md += [f"- {k}: {v}" for k, v in n1s[0]["missing_edges"].items()]
-    for r in n1s:
-        md += ["", f"## Per variable at 72 h, {r['year']}", ""] + variable_table(r)
+    for label, r in zip(years, n1s):
+        md += ["", f"## Per variable at 72 h, {label}", ""] + variable_table(r)
     prop, growth = propagation_table(n1s[0])
     md += ["", f"## Propagation ({years[0]}): RMS response vs the intact model, normalised units", ""] + prop
-    for r in n1s:
-        md += ["", f"## The sun ({r['year']})", ""] + sun_table(r)
-    for r in n1s:
-        md += ["", f"## Pairs: loops of the diagram ({r['year']})", "",
+    for label, r in zip(years, n1s):
+        md += ["", f"## The sun ({label})", ""] + sun_table(r)
+    for label, r in zip(years, n1s):
+        md += ["", f"## Pairs: loops of the diagram ({label})", "",
                "interaction = change(A+B) - change(A) - change(B); eta = |D_AB - D_A - D_B| / (|D_A| + |D_B|) "
                "(0: independent paths); rho(A given B) = share of A's effect left once B is cut "
                "(0: B mediates A).", ""] + pair_table(r)
