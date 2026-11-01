@@ -148,6 +148,7 @@ def main():
             L += ["", "## ERA5 2020 (GraphCast protocol, 31 initialisations; + = better than " + ref_lab + ")", "",
                   "| model | " + " | ".join(f"{s} {h} h" for s, _ in VARS for h in (24, 72, 120)) + " | worst |",
                   "|---" * (2 + 3 * len(VARS)) + "|"]
+            verdicts = []
             for lab, d in data.items():
                 cells, worst = [], 0.0
                 for s, v in VARS:
@@ -158,8 +159,9 @@ def main():
                         cells.append(f"{x:.4g} ({100 * g:+.1f}%)" if lab != ref_lab else f"{x:.4g}")
                 L.append(f"| {lab} | " + " | ".join(cells) + f" | {100 * worst:+.1f}% |")
                 if lab != ref_lab:
-                    L.append(f"\n- **G4** {lab}: worst change {100 * worst:+.1f}% → "
-                             f"{'supported' if worst >= -0.03 else 'not supported'} (limit −3%)\n")
+                    verdicts.append(f"- **G4** {lab}: worst change {100 * worst:+.1f}% → "
+                                    f"{'supported' if worst >= -0.03 else 'not supported'} (limit −3%)")
+            L += [""] + verdicts
     with open(args.out, "w") as f:
         f.write("\n".join(L) + "\n")
     print("\n".join(L))
