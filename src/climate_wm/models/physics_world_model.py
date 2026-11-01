@@ -85,6 +85,12 @@ class PhysicsModelConfig:
     grad_checkpoint: bool = True
     memory: Optional[MemoryConfig] = None  # stage 10
     corrector: Optional[CorrectorConfig] = None  # stage 13 E2 / E3
+    # stage 14 (simulator world): action fields appended to the column input
+    # (batch["action"] [B, A, H, W], normalised; zero = no intervention), and the
+    # insolation the column sees: "diurnal" (ERA5) or "daily_mean" (SPEEDY has no
+    # diurnal cycle); batch["solar_factor"] [B] scales it (solar intervention)
+    action_channels: int = 0
+    solar: str = "diurnal"
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "PhysicsModelConfig":
@@ -132,7 +138,7 @@ class PhysicsWorldModel(nn.Module):
         self.column = self.surface = None
         if cc.enabled:
             n_f = 5 if cc.use_forcings else 0
-            d_in = len(COLUMN_IN) * n_lev + 1 + 2 + n_f + 1
+            d_in = len(COLUMN_IN) * n_lev + 1 + 2 + n_f + 1 + cfg.action_channels
             n_out = 4 * n_lev + 1 + (2 if cc.budget else 0)
             self.column = _mlp(d_in, cc.hidden, n_out, cc.layers)
             if cc.budget:  # drag starts near zero; evaporation at ~3.5 mm/day
@@ -240,11 +246,29 @@ class PhysicsWorldModel(nn.Module):
                 out[:, k] = surf[j]
         return out
 
-    def _forcing_grid(self, times_s: np.ndarray, gauss: bool = True) -> Tensor:
+    def _daily_mean_tisr(self, times_s: np.ndarray, lat, lon) -> np.ndarray:
+        """Daily-mean TOA insolation (J/m^2 per hour) of each time's UTC day (cached per day)."""
+        cache = self.__dict__.setdefault("_tisr_cache", {})
+        out = []
+        for t in np.asarray(times_s, np.int64):
+            day = int(t // 86400)
+            key = (day, len(lat), len(lon))
+            if key not in cache:
+                hours = (day * 86400 + 1800 + 3600 * np.arange(24)).astype("datetime64[s]")
+                cache[key] = forcing_lib.toa_incident_solar_radiation(hours, lat, lon).mean(0)
+            out.append(cache[key])
+        return np.stack(out)
+
+    def _forcing_grid(self, times_s: np.ndarray, gauss: bool = True,
+                      solar_scale: float = 1.0) -> Tensor:
         """Normalised forcings [T, 5, H, W] at the given times on the Gaussian (or data) grid."""
         lat, lon = (self.lat_g, self.lon_g) if gauss else (self.lat, self.lon)
         t = np.asarray(times_s).astype("datetime64[s]")
-        f = {"toa_incident_solar_radiation": forcing_lib.toa_incident_solar_radiation(t, lat, lon)}
+        if self.cfg.solar == "daily_mean":
+            tisr = self._daily_mean_tisr(np.asarray(times_s), lat, lon)
+        else:
+            tisr = forcing_lib.toa_incident_solar_radiation(t, lat, lon)
+        f = {"toa_incident_solar_radiation": tisr * solar_scale}
         f.update(forcing_lib.time_forcings(t, lon, len(lat)))
         for key, value in self.forcing_override.items():
             f[key] = np.full_like(f[key], value)
@@ -257,7 +281,8 @@ class PhysicsWorldModel(nn.Module):
         return sh.to_grid(sh.from_data(x))
 
     # ------------------------------------------------------ column physics
-    def column_inputs(self, state, static_g: Tensor, forc_g: Optional[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    def column_inputs(self, state, static_g: Tensor, forc_g: Optional[Tensor],
+                      action_g: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
         """The column network's input x [B, H, W, C] (normalised grid fields, the
         lowest-level geopotential, static fields, forcings, sin lat) and the grid
         winds u, v (stage 12 reads x for the memory's timescale map)."""
@@ -277,6 +302,9 @@ class PhysicsWorldModel(nn.Module):
             feats.append(forc_g)
         b = zb.shape[0]
         feats.append(self.sinlat_g[None, None, :, None].expand(b, 1, *zb.shape[-2:]))
+        if self.cfg.action_channels:  # stage 14: last, so a widened checkpoint keeps its columns
+            feats.append(action_g if action_g is not None else
+                         zb.new_zeros(b, self.cfg.action_channels, *zb.shape[-2:]))
         x = torch.cat(feats, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
         return x, u, v
 
@@ -286,10 +314,11 @@ class PhysicsWorldModel(nn.Module):
             return None
         return self._forcing_grid(ctx["init"] + 21600 * k)
 
-    def column_forcing(self, state, static_g: Tensor, forc_g: Optional[Tensor]) -> Dict[str, Tensor]:
+    def column_forcing(self, state, static_g: Tensor, forc_g: Optional[Tensor],
+                       action_g: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """Grid tendencies of the column physics; with the memory kernel also the
         updated memory ("mem")."""
-        x, u, v = self.column_inputs(state, static_g, forc_g)
+        x, u, v = self.column_inputs(state, static_g, forc_g, action_g)
         if "all" in self.column_paths:
             x = self._hold_inputs(x, self.column_paths["all"])
         y = self.column(x)
@@ -460,6 +489,10 @@ class PhysicsWorldModel(nn.Module):
                "static_g": self._to_gauss(static) if self.column is not None else None,
                "init": batch["init_time"].cpu().numpy().astype(np.int64),
                "forcings_tgt": batch.get("forcings_tgt")}
+        if self.cfg.action_channels and batch.get("action") is not None and self.column is not None:
+            ctx["action_g"] = self._to_gauss(batch["action"].to(static.dtype))
+        if batch.get("solar_factor") is not None:
+            ctx["solar_scale"] = batch["solar_factor"].detach().cpu().numpy().astype(np.float64)
         if self.memory is not None:
             sh = self.core.sh
             state["mem"] = static.new_zeros(static.shape[0], self.memory.channels, sh.nlat, sh.nlon)
@@ -509,7 +542,9 @@ class PhysicsWorldModel(nn.Module):
         if self.column is not None and cc.use_forcings:
             calls = np.arange(0, nsub, call_every)
             times = ctx["init"][:, None] + 21600 * k + (calls * core.cfg.dt_minutes * 60)[None]
-            forc_g = torch.stack([self._forcing_grid(t) for t in times])  # [B, n_calls, 5, H, W]
+            scale = ctx.get("solar_scale")
+            forc_g = torch.stack([self._forcing_grid(t, solar_scale=1.0 if scale is None else float(scale[b]))
+                                  for b, t in enumerate(times)])  # [B, n_calls, 5, H, W]
         keys = list(state)
 
         def six_hours(*flat):
@@ -519,7 +554,7 @@ class PhysicsWorldModel(nn.Module):
             for j in range(nsub):
                 if self.column is not None and j % call_every == 0:
                     fg = forc_g[:, j // call_every] if forc_g is not None else None
-                    forcing = self.column_forcing(st, ctx["static_g"], fg)
+                    forcing = self.column_forcing(st, ctx["static_g"], fg, ctx.get("action_g"))
                     if "mem" in forcing:
                         st["mem"] = forcing.pop("mem")
                     if "precip" in forcing:
