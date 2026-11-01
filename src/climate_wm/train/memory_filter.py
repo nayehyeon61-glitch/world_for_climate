@@ -34,7 +34,7 @@ from torch import Tensor
 
 from ..data.era5_lazy_loader import GraphCastWindowDataset
 from .physics_game import _finite, attach_loss
-from .prediction_game import errors, target_mask
+from .prediction_game import sample_mask, errors, target_mask
 
 STEP_S = 6 * 3600
 
@@ -51,6 +51,9 @@ class FilterConfig:
     cap: float = 10.0          # a window ends before a step whose error exceeds this
     train_model: bool = True   # False: only the memory learns
     new_prefix: str = "memory."  # the parameters at lr_new (stage 13: "corrector.")
+    persistent_cap: float = 0.0  # stage 13 R3: a random region cap of this fraction stays hidden through the
+                                 # whole window (forecast + readout there, the rest re-observed in the fill
+                                 # steps), so the readout learns a filled memory and long-hidden points
     log_every: int = 10
     save_every: int = 10
     seed: int = 0
@@ -150,7 +153,10 @@ def train_filter(model, dataset, order: List[int], cfg: FilterConfig, device="cp
         batch = {k: v[None].to(device) for k, v in item.items()}
         if mask is None:
             mask = torch.zeros_like(batch["inputs"][:, -1])
-            tmask = target_mask(model, mask)
+            tmask = target_mask(model, mask)  # the loss counts every point, the cap included
+        if cfg.persistent_cap > 0:  # R3: this window's hidden cap
+            gen = torch.Generator().manual_seed(cfg.seed + 7919 * n)
+            mask = sample_mask(model.layout, "region", dataset.lat, dataset.lon, gen, cfg.persistent_cap)[0][None].to(device)
         model.train(cfg.train_model)
         opt.zero_grad(set_to_none=True)
         state, ctx = model.begin(batch)

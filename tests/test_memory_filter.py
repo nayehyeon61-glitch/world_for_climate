@@ -50,3 +50,26 @@ def test_slow_channels_start_as_the_checkpoint_and_the_filter_trains():
     resumed = train_filter(model, windows, order, FilterConfig(fill_steps=1, free_steps=2, epochs=2, log_every=1),
                            progress=saved[-1], log=print)
     assert len(resumed["loss"]) == 4
+
+
+def test_persistent_cap_hides_a_region_through_the_window():
+    layout, stats, data = _tiny()
+    model = _mem_model(layout, stats, data, {"channels": 4, "hidden": 8})
+    ds = make_synthetic_era5(num_days=4, num_lat=9, num_lon=16, levels=(500, 850))
+    cfg = FilterConfig(fill_steps=2, free_steps=1, epochs=1, warmup_windows=1, log_every=1, save_every=2,
+                       persistent_cap=0.25)
+    windows, order = consecutive_windows(ds, layout, stats, "2016-01-01T06:00", "2016-01-03T00:00", cfg.steps)
+    seen = []
+    original = model.posterior
+
+    def spy(state, ctx, forecast, truth, mask):
+        seen.append(mask.clone())
+        return original(state, ctx, forecast, truth, mask)
+
+    model.posterior = spy
+    history = train_filter(model, windows, order, cfg, log=print)
+    assert len(history["loss"]) == 2 and history["blowups"] == [0, 0]
+    assert seen and all(0 < float(m.mean()) < 0.6 for m in seen)  # a cap is hidden at every re-observation
+    first_window = seen[:3]  # snapshot + 2 fill steps share the window's cap
+    assert all(torch.equal(m, first_window[0]) for m in first_window)
+    assert not torch.equal(seen[0], seen[-1])  # the next window draws another cap

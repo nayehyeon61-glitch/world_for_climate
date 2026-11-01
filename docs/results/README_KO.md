@@ -739,6 +739,7 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 - **R1 판독 바운드 (`memory.readout_max`, 소프트 r_max·tanh(R/r_max); 체인 11, 14:36 완료): 기각.** r_max 0.5 / 1 / 2 모두 31/31 폭주(6h는 판독 없는 것과 같고 24h부터 발산; r_max 1에서는 유한하지만 z500 24h 1473 = 너징의 6.3배). 크기가 문제가 아닙니다. 기제: R(m)은 36시간 게임에서 "한 걸음 뒤 재관측되는" 점의 1회 보정으로 학습됐는데, 지속 캡에서는 6시간마다 같은 부호의 증분으로 **적분**되어(20걸음 × 0.5σ = 10σ) 캡 경계에 모순된 장을 쌓습니다. 규칙 R1(어느 r_max에서 폭주 ≤ 3/31)은 성립하지 않았습니다.
 - **R2 나이 게이트 판독 (`memory.readout_decay_steps`; 체인 12, 15:30 완료): 기각.** 각 점이 숨겨진 걸음 수 a를 상태에 싣고(관측되면 0) 판독을 exp(−(a−1)/τ_R)로 줄였습니다(처음 숨겨진 걸음은 온전히). τ_R = 1(둘째 걸음 0.37, 다섯째 0.02)에서도 28/31 폭주, τ_R = 3에서 31/31. 즉 지속 적분(R1의 가설)만이 아니라 **첫 몇 번의 판독 자체가 이미 해롭습니다**: 10일 완전 관측으로 채워진 기억 m은 판독 R이 학습 때 본 적 없는 상태(학습은 빈 기억에서 36시간 게임)이고, 그 R(m)을 캡 전체에 한 번만 얹어도 캡 경계에 정합하지 않는 장이 생겨 미세조정 칼럼이 넘어집니다. 판독 크기(R1)·지속 시간(R2) 어느 쪽의 평가 시 투영도 소용없고 판독을 끄는 것만 듣습니다(3/31, N1+너징과 동급).
 - **결론 (관측 공급 폭주):** 원인은 판독의 분포 밖 사용(채워진 기억 + 지속 캡)이며, 처방은 평가 시 투영이 아니라 학습입니다 — **R3 (제안, 10.2 팔로 추가):** 연속 필터 학습(`train/memory_filter.py`)의 창 안에서 무작위 캡(25%)을 창 내내 숨겨 두고 나머지만 재관측하게 하여, R이 채워진 기억과 오래 숨겨진 점을 학습에서 보게 합니다(`filter.persistent_cap: 0.25`). 그때까지 관측 공급·능동 관측 설정에서는 판독을 끄거나(`memory.readout` 끄기 = N1+너징 수준) 숨긴 비율을 작게(12단계: 25%) 유지합니다.
+- **R3 구현·큐 (15:45; `train/memory_filter.py` `filter.persistent_cap`, 10.2 팔 `L0cap` = L0 + 창마다 무작위 25% 영역 캡을 창 내내 숨김, 손실은 캡 포함 전점):** A줄에서 L·L0 뒤에 `L0cap train obs fill`(학습 ~2h, 관측 공급 시험 ~40분, 채움 ~1h; 11/02 아침). 규칙 R3: L0cap이 관측 공급 설정에서 폭주 ≤ 3/31이고 캡 위 24h 오차가 판독 없는 D-noactor(너징의 1.09배)보다 낮으면 지지 — 판독이 학습으로 "채워진 기억 + 오래 숨긴 점"을 다루게 됨. L0와의 비교가 캡 학습의 비용(자유 예보)을 읽습니다.
 - **방향:** ① E2(SFNO 에너지 중립 보정자)를 구현해 "어디서 에너지를 빼는가"를 배우게 하고 B2로 E1과 비교. ② 바운드를 10.2 연속 필터 학습에 기본으로 넣어(학습 중 flux500) 칼럼이 바운드에 기대지 않게 함. ③ 영역 캡 폭주는 에너지가 아니라 경계 처리이므로 12단계처럼 캡을 예보값 + 기억 판독으로 채우는 쪽으로 평가를 옮김. ④ 관측 공급 비교(31/31 폭주)를 바운드 아래서 다시 봄(체인 8).
 
 ---
@@ -780,6 +781,9 @@ python scripts/compare_memory.py --checkpoint runs/stage10_Dnoactor/checkpoint.p
     --spinup 40 --obs-kind region --variants warm_no_readout warm_no_memory --out runs/stage10_Dnoactor/compare_obs_knock_2020.json
 python scripts/compare_memory.py ... --obs-kind region --variants warm --set model.memory.readout_max=1.0 --out runs/stage10_Dnoactor/compare_obs_rmax1.0_2020.json
 python scripts/compare_memory.py ... --obs-kind region --variants warm --set model.memory.readout_decay_steps=1.0 --out runs/stage10_Dnoactor/compare_obs_rdecay1.0_2020.json
+# R3: 지속 캡 연속 필터 학습 (10.2 L0cap), 그 뒤 위의 관측 공급 비교를 runs/stage10_2_L0cap/checkpoint.pt 로
+python scripts/train_memory_filter.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/memory_filter_wb2.yaml \
+    --data-dir DATA2020 --out runs/stage10_2_L0cap --set memory.long_channels=0 filter.persistent_cap=0.25
 # 13단계 E2 / E3 (보정자 학습; PYTHONPATH 에 neuraloperator; E3: --set corrector.neutral=false corrector.soft_weight=1.0, 바운드 없이)
 python scripts/train_energy_corrector.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/energy_corrector_wb2.yaml \
     --data-dir DATA2020 --out runs/stage13_E2 --set model.column.energy_max_flux=500 model.column.energy_no_work=true
