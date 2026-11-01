@@ -790,7 +790,11 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
   - **해석:** 기억은 약 30일에서 포화합니다. 커널 시간 척도 상한이 10일이고, 학습은 36h 게임·72h 창이라 2년을 이어 간 기억 상태는 학습 분포 밖으로 표류합니다. 더 긴 기억이 쓸모 있으려면 느린 채널(10.2 L, τ 1개월–2년)과 그것을 이어 가며 배우는 연속 필터 학습이 필요합니다. 15단계 SPEEDY에서는 숨은 SST가 실제로 느린 변수이므로 같은 질문을 정답과 함께 다시 봅니다(15.5).
 - **GraphCast·ClimODE 대비 (감자 21:09, `stage13_energy/compare_E2_baselines.md`, 2020 초기 31개):** E2 30일 채움은 GraphCast RMSE의 z500 8.3배·t850 5.3배(24h)에서 3.9배·3.4배(120h)로 리드가 길수록 좁혀지고, 72h부터는 N1(120h 4.3배·3.9배)보다 더 좁힙니다. ClimODE 공개값(2017–18, 36h까지)에는 모든 리드에서 못 미칩니다: 24h z500 290 대 193, t850 1.90 대 1.55 K, u10 2.13 대 2.01 m/s, t2m 2.76 대 1.40 K. 바람이 가장 가깝고(6–10%), 2 m 기온이 가장 멉니다(2배, 18h부터 지속 예보보다도 나쁨) → 남은 큰 결손은 지표 일변화·지표 정의입니다.
 - **인과 구조 (체인 19, 22:12 완료, `stage13_energy/causes_E2.md`, 2020 초기 8개, 72h, 빈 기억):** E2와 N1의 부호 일치는 89%(유의한 쌍 289개)이고, 72h 효과 크기 순위 상관은 0.61입니다. D-noactor(76%, 0.35)보다 N1 쪽으로 돌아왔습니다. 기준인 N1 자기 2018 대 2020은 100%, 0.95입니다. 뒤집혔던 칼럼 경로가 대부분 돌아옵니다. 가열 전체 72h는 D-noactor −13.5%에서 E2 +8.0%(N1 +35.8%)로, T→수분원은 −30.6%에서 −1.4%(N1 +16.0%)로, 바다 칼럼 일치는 3/6에서 8/8로 바뀌었습니다. q→가열(72h −11.2%)과 지표 기압 출력(−13.3%)은 아직 끊으면 나아집니다. 해석: 에너지 중립 보정이 칼럼의 연직 구조를 고치면서 인과 경로도 다시 쓸모 있게 됐지만, 효과 크기는 N1의 1/4–1/2입니다. 방향: 남은 표류 자리는 q→가열과 지표 기압 경로이며, 이것이 실제 오류인지는 15단계 SPEEDY 정답 인과(T2)로 확인합니다.
-- **남은 팔:** E3(소프트 벌칙, B3)·E2-mlp(국소 통제군)은 9번 사슬에서 밤에(17:04 메모리 부족으로 E3가 한 번 죽어 창 100/243에서 재개).
+- **남은 팔 결과 (11/02 06:56 KST, 체인 9, `stage13_energy/energy.md` "corrector arms"; E1 대비, 같은 2020 초기 10개, 양쪽 유한한 쌍, + = 이득):**
+  - **E2-mlp (칼럼별 1×1 망, 같은 에너지 중립 + E1 바운드):** 폭주 0/20, 72h 이득 +16.9%로 B2 지지입니다. E2(SFNO)는 +19.7%입니다. 콜드 출발 24/72/120h 오차 비는 0.925/0.755/0.549로 E2의 0.917/0.718/0.516에 가깝습니다. 이득의 약 86%가 칼럼 안의 재분배에서 나오고, 비국소 연산자가 더하는 것은 72h·120h에서 약 3점입니다.
+  - **E3 (소프트 벌칙, 투영·바운드 없음):** 영역 출발에서 1/10 폭주했고 E2는 0/10이라 B3 지지입니다. 다만 20번 중 1번 차이라 약한 증거입니다. 유한한 실행에서는 E3가 E2보다 정확합니다: 72h 이득 +20.8%, 콜드 120h 오차 비 0.461 대 E2 0.516. E3에 바운드를 걸어도 72h +22.8%이고 영역 폭주 1/10은 그대로입니다.
+  - **원인 분석:** E2-mlp가 E2와 거의 같으므로 10단계 미세조정이 망친 것은 주로 각 칼럼의 연직 구조이고, 칼럼 사이의 전달은 작은 몫입니다. E3가 더 정확하면서 한 번 폭주한 것은, 에너지 중립을 정확히 강제하면 칼럼이 가진 실제 순 에너지 신호까지 막아 정확도를 몇 점 내주고 그 대신 안정성을 얻는다는 뜻입니다.
+  - **방향:** 10.2 연속 필터 학습에는 값싼 E2-mlp식 국소 중립 보정자를 기본으로 넣습니다. 정확도가 필요하면 중립을 칼럼 순 에너지의 작은 허용 폭(예: ±50 W/m²)으로 풀어 E2와 E3 사이를 시험합니다. GraphCast·ClimODE 비교(E2-mlp, E3의 30일 채움과 콜드, 2020 초기 31개)는 체인 27에서 ~11:00에 나옵니다.
 - **방향:** ① E2(SFNO 에너지 중립 보정자)를 구현해 "어디서 에너지를 빼는가"를 배우게 하고 B2로 E1과 비교 — 완료, 지지. ② 바운드를 10.2 연속 필터 학습에 기본으로 넣어(학습 중 flux500) 칼럼이 바운드에 기대지 않게 함. ③ 영역 캡 폭주는 에너지가 아니라 경계 처리이므로 12단계처럼 캡을 예보값 + 기억 판독으로 채우는 쪽으로 평가를 옮김. ④ 관측 공급 비교(31/31 폭주)를 바운드 아래서 다시 봄(체인 8).
 
 ---
@@ -1032,17 +1036,18 @@ python scripts/train_energy_corrector.py --checkpoint runs/stage10_Dnoactor/chec
     --data-dir DATA2020 --out runs/stage13_E2 --set model.column.energy_max_flux=500 model.column.energy_no_work=true
 python scripts/diagnose_energy.py --checkpoint runs/stage13_E2/checkpoint.pt --config configs/dreamer_wb2.yaml --data-dir DATA2020 \
     --inits 10 --steps 20 --kinds none region --settings none flux500_nowork --out runs/stage13_E2/energy_2020.json
-python scripts/report_energy.py --energy memory=runs/stage10_Dnoactor/energy_2020.json n1=runs/physics_n1/energy_2020.json \
-    --arms E1=runs/stage10_Dnoactor/energy_2020.json:flux500_nowork E2=runs/stage13_E2/energy_2020.json:flux500_nowork \
-           E3=runs/stage13_E3/energy_2020.json:none E2mlp=runs/stage13_E2mlp/energy_2020.json:flux500_nowork --out docs/results/stage13_energy/energy.md
+python scripts/report_energy.py --energy memory=runs/stage10_Dnoactor/energy_2020.json n1=runs/physics_n1/energy_2020.json E2=runs/stage13_E2/energy_2020.json \
+    --game runs/stage10_Dnoactor/eval_2020.json runs/stage10_Dnoactor/eval_2020_energy.json \
+    --causes runs/physics_n1/causes_2020.json runs/physics_n1/causes_2020_energy.json \
+    --arms E1=runs/stage10_Dnoactor/energy_2020_rows.json:flux500_nowork E2=runs/stage13_E2/energy_2020.json:flux500_nowork \
+           "E2 unbounded=runs/stage13_E2/energy_2020.json:none" E3=runs/stage13_E3/energy_2020.json:none \
+           "E3 bounded=runs/stage13_E3/energy_2020.json:flux500_nowork" E2mlp=runs/stage13_E2mlp/energy_2020.json:flux500_nowork \
+           none=runs/stage10_Dnoactor/energy_2020_rows.json:none --out docs/results/stage13_energy/energy.md
 # 13단계 E1 (학습 없음; 설정은 --set model.column.energy_max_flux=500 model.column.energy_no_work=true 로 어느 평가에나)
 python scripts/diagnose_energy.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/dreamer_wb2.yaml \
     --data-dir DATA2020 --inits 10 --steps 20 --kinds none region --out runs/stage10_Dnoactor/energy_2020.json
 python scripts/eval_dreamer.py ... --kinds region --variants full nudging --set model.column.energy_max_flux=500 \
     model.column.energy_no_work=true --out runs/stage10_Dnoactor/eval_2020_energy.json
-python scripts/report_energy.py --energy memory=runs/stage10_Dnoactor/energy_2020.json n1=runs/physics_n1/energy_2020.json \
-    --game runs/stage10_Dnoactor/eval_2020.json runs/stage10_Dnoactor/eval_2020_energy.json \
-    --causes runs/physics_n1/causes_2020.json runs/physics_n1/causes_2020_energy.json --out docs/results/stage13_energy/energy.md
 # 12단계 (얼린 D-noactor 위; DATA2020)
 BOUND="model.column.energy_max_flux=500 model.column.energy_no_work=true"   # every stage 12 job (amendment 12:40 KST 11/01)
 python scripts/train_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/active_obs_wb2.yaml \

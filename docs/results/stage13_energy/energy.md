@@ -161,6 +161,12 @@ Each arm is a checkpoint and the setting it runs under; the ratio is the all-poi
 | E2 | stage13_E2 : flux500_nowork | region | 0/10 | 1.013 / 0.888 / 0.700 | 10 |
 | E2 unbounded | stage13_E2 : none | none | 0/10 | 0.923 / 0.778 / 0.593 | 8 |
 | E2 unbounded | stage13_E2 : none | region | 0/10 | 0.986 / 0.906 / 0.733 | 10 |
+| E3 | stage13_E3 : none | none | 0/10 | 0.915 / 0.661 / 0.461 | 8 |
+| E3 | stage13_E3 : none | region | 1/10 | 1.012 / 0.923 / 0.707 | 9 |
+| E3 bounded | stage13_E3 : flux500_nowork | none | 0/10 | 0.925 / 0.631 / 0.416 | 8 |
+| E3 bounded | stage13_E3 : flux500_nowork | region | 1/10 | 1.043 / 0.914 / 0.674 | 9 |
+| E2mlp | stage13_E2mlp : flux500_nowork | none | 0/10 | 0.925 / 0.755 / 0.549 | 8 |
+| E2mlp | stage13_E2mlp : flux500_nowork | region | 0/10 | 1.014 / 0.907 / 0.687 | 10 |
 | none | stage10_Dnoactor : none | none | 5/10 | 1.021 / 1.174 / 1.584 | 4 |
 | none | stage10_Dnoactor : none | region | 2/10 | 0.981 / 1.056 / 1.238 | 8 |
 
@@ -174,6 +180,12 @@ Each arm is a checkpoint and the setting it runs under; the ratio is the all-poi
   → supported (blow-ups 0 vs 2; 72 h ratio 0.803 = gain +19.7% on 18 finite pairs)
 - **B2** E2 unbounded beats E1 by >= 3% at 72 h with no more blow-ups  
   → supported (blow-ups 0 vs 2; 72 h ratio 0.842 = gain +15.8% on 18 finite pairs)
+- **B2** E2mlp beats E1 by >= 3% at 72 h with no more blow-ups  
+  → supported (blow-ups 0 vs 2; 72 h ratio 0.831 = gain +16.9% on 18 finite pairs)
+- **B3** the soft arm E3 blows up more than the hard arm(s)  
+  → supported (blow-ups 1 vs hard 0; 72 h ratio 0.792 vs E1)
+- **B3** the soft arm E3 bounded blows up more than the hard arm(s)  
+  → supported (blow-ups 1 vs hard 0; 72 h ratio 0.772 vs E1)
 
 ## Direction
 
