@@ -179,7 +179,7 @@ def verdicts(gains, knock_gain_24, ratios, below):
     for n, d in ratios.items():
         out.setdefault("C3", "")
         out["C3"] += f"{n}: " + ", ".join(f"{h} h {_f(r, 2)}x" for h, r in d.items()) + "; "
-    label = "memory cold" if "memory cold" in below else next(iter(below), None)
+    label = "memory cold" if "memory cold" in below else None  # the rule names the memory model
     if label:
         flags = below[label]
         out["C4"] = (f"{'supported' if sum(flags) >= 3 else 'not supported'} ({label} below ClimODE at 24 h on "
@@ -247,7 +247,8 @@ def main():
            "ClimODE, FourCastNet, ClimaX and IFS as printed in Verma et al. (2024); ours on the 31 initialisations "
            "of 2018. 2018 is a fine-tuning year of the memory model (its N1 base was trained on 2015-2017), so "
            "its 2018 scores are a reference, not a held-out test.", ""]
-    ours = [(c, t) for c, t in (("GraphCast (WB2)", (cold18.get("memory") or cold18.get("n1") or {}).get("graphcast")),
+    any18 = next((v for v in cold18.values() if v), {})
+    ours = [(c, t) for c, t in (("GraphCast (WB2)", any18.get("graphcast")),
                                 ("N0", (cold18.get("n0") or {}).get("model")), ("N1", (cold18.get("n1") or {}).get("model")),
                                 ("memory cold", (cold18.get("memory") or {}).get("model")),
                                 ("memory warm", w18 and w18["model"])) if t]
