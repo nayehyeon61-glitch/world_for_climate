@@ -18,8 +18,41 @@ import _path  # noqa: F401
 import numpy as np
 import torch
 
+import pandas as pd
+
 from climate_wm import pipeline
+from climate_wm.eval.climatology import Climatology
 from climate_wm.eval.graphcast_metrics import format_scorecard
+
+
+class _MonthlyValues:
+    """values[d, h] of a Climatology from monthly x hour-of-day means
+    (the day-of-year table at 64x32 x 83 channels would hold 2-6 GB while built)."""
+
+    def __init__(self, monthly: np.ndarray):
+        self.monthly = monthly
+        self.month = np.append(pd.date_range("2001-01-01", periods=365).month.values - 1, 11)
+
+    def __getitem__(self, idx):
+        d, h = idx
+        return self.monthly[self.month[d], h]
+
+
+def monthly_climatology(train_ds, stride: int) -> Climatology:
+    hours = (0, 6, 12, 18)
+    sums, counts = None, np.zeros((12, 4))
+    for k in range(0, len(train_ds), stride):
+        frames, _, times = train_ds.raw_window(k)
+        for frame, t in zip(frames, times):
+            ts = pd.Timestamp(t)
+            if ts.hour not in hours:
+                continue
+            if sums is None:
+                sums = np.zeros((12, 4) + frame.shape, np.float64)
+            sums[ts.month - 1, hours.index(ts.hour)] += frame
+            counts[ts.month - 1, hours.index(ts.hour)] += 1
+    monthly = (sums / np.maximum(counts, 1)[..., None, None, None]).astype(np.float32)
+    return Climatology(_MonthlyValues(monthly), hours, channels=train_ds.layout.targets)
 
 
 def speedy_config(cfg: dict, zarr: str, train, val, lead_steps: int) -> dict:
@@ -45,6 +78,7 @@ def main() -> None:
     ap.add_argument("--val", nargs=2, default=["1984-01-01", "1984-12-31T12:00"])
     ap.add_argument("--lead-steps", type=int, default=20)
     ap.add_argument("--n-inits", type=int, default=31)
+    ap.add_argument("--clim-stride", type=int, default=8, help="training windows between climatology samples")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True)
@@ -66,7 +100,7 @@ def main() -> None:
     model = pipeline.build_model(cfg, layout, train_ds).to(args.device)
     model.load_state_dict(state, strict=False)
     model.eval()
-    clim = pipeline.build_climatology(cfg, train_ds)
+    clim = monthly_climatology(train_ds, args.clim_stride)
     idx = np.linspace(0, len(val_ds) - 1, min(args.n_inits, len(val_ds))).astype(int).tolist()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     results = pipeline.evaluate(cfg, model, val_ds, stats, clim, args.device, indices=idx,
