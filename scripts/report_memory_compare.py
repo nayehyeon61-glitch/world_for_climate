@@ -292,8 +292,12 @@ def main():
     parser.add_argument("--obs-extra", nargs="*", default=[], metavar="LABEL=OUT:VARIANT",
                         help="further observed-protocol runs (e.g. E1=...compare_obs_energy_2020.json:warm "
                              "no_readout=...compare_obs_knock_2020.json:warm_no_readout)")
+    parser.add_argument("--extra2020", nargs="*", default=[], metavar="LABEL=OUT",
+                        help="further 2020 free-run columns (compare_graphcast JSON or a compare_memory variant JSON, "
+                             "e.g. 'E2 cold=runs/stage13_E2/compare_graphcast_2020.json')")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    extra20 = [(k, load(v)) for k, v in (s.split("=", 1) for s in args.extra2020)]
     cold20 = {k: load(v) for k, v in (s.split("=", 1) for s in args.cold2020)}
     cold18 = {k: load(v) for k, v in (s.split("=", 1) for s in args.cold2018)}
     warm = lambda base, name: load(base.replace(".json", f"_{name}.json")) if base else None
@@ -317,8 +321,9 @@ def main():
     md += ["## 2020 (held out for every model)", ""]
     if base:
         cols = [("GraphCast", base["graphcast"]), ("N1 cold", n1 and n1["model"]), ("memory cold", mem and mem["model"]),
-                ("memory warm", w20 and w20["model"]), ("warm, no memory", k20 and k20["model"]),
-                ("persistence", base["persistence"]), ("climatology", base["climatology"])]
+                ("memory warm", w20 and w20["model"]), ("warm, no memory", k20 and k20["model"])]
+        cols += [(k, t and t["model"]) for k, t in extra20]
+        cols += [("persistence", base["persistence"]), ("climatology", base["climatology"])]
         cols = [(c, t) for c, t in cols if t]
         md += [score_table(cols, VARS, LEADS), "", "ACC:", "",
                score_table([(c, t) for c, t in cols if c != "climatology"], HEADLINE, (24, 72, 120), key="acc"), ""]
