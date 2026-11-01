@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from climate_wm.data.era5_lazy_loader import GraphCastWindowDataset
@@ -73,3 +74,12 @@ def test_persistent_cap_hides_a_region_through_the_window():
     first_window = seen[:3]  # snapshot + 2 fill steps share the window's cap
     assert all(torch.equal(m, first_window[0]) for m in first_window)
     assert not torch.equal(seen[0], seen[-1])  # the next window draws another cap
+
+
+def test_consecutive_windows_refuse_a_start_without_input_frames():
+    layout, stats, _ = _tiny()
+    ds = make_synthetic_era5(num_days=2, num_lat=9, num_lon=16, levels=(500, 850))
+    with pytest.raises(ValueError, match="no consecutive windows"):  # 00:00 has no frame before it
+        consecutive_windows(ds, layout, stats, "2016-01-01T00:00", "2016-01-02T00:00", 2)
+    _, order = consecutive_windows(ds, layout, stats, "2016-01-01T06:00", "2016-01-02T00:00", 2)
+    assert len(order) >= 1

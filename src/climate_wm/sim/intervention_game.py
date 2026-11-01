@@ -281,6 +281,8 @@ def train_game(model, world: SpeedyWorld, cfg: GameConfig, device="cpu",
     acts = train_actions()
     rng = np.random.default_rng(cfg.seed)
     points = world.branch_points(cfg.train_start, cfg.train_end, cfg.branch_days)
+    if not points:
+        raise ValueError(f"no branch points in {cfg.train_start} .. {cfg.train_end}")
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(cfg.warmup, 1))

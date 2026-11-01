@@ -94,3 +94,12 @@ def test_f1_stepper_trains_without_tendencies_and_reloads():
     with torch.no_grad():
         assert torch.allclose(g.forward_rollout(eps.batch(0, 0, steps), steps),
                               f1.forward_rollout(eps.batch(0, 0, steps), steps))
+
+
+def test_first_update_aborts_on_an_exploding_normalised_loss():
+    layout, stats, data = _tiny()
+    model = _with_action(layout, stats, data)
+    eps = StubEpisodes(data, len(layout.task.pressure_levels))
+    eps.tendency_std = lambda seed=0: np.full(len(TEND_KEYS) * eps.n_lev, 1e-12, np.float32)  # a zero std
+    with pytest.raises(ValueError, match="normalisation"):
+        train_teacher(model, eps, TeacherConfig(curriculum=((1, 2),), lambda_tend=1.0), log=lambda s: None)

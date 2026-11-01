@@ -74,6 +74,10 @@ def consecutive_windows(ds, layout, stats, start: str, end: str, steps: int, ini
     while t + steps * STEP_S <= t1 and t in starts:
         order.append(starts[t])
         t += steps * STEP_S
+    if not order:  # 11/01: a start without two input frames silently trained on nothing
+        first = data.times[data.indices[0]] if len(data.indices) else None
+        raise ValueError(f"no consecutive windows from {start}: it must be an initialisation time of the data "
+                         f"(two input frames before it; the first one here is {first})")
     return data, order
 
 

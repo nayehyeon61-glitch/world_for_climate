@@ -40,6 +40,7 @@ class TeacherConfig:
     groups: Tuple[str, ...] = ("A", "B", "C")
     init_stride: int = 2                       # window starts every 12 h
     lr: float = 1e-4
+    max_start_loss: float = 1e3     # abort when the first update's state or tendency loss exceeds this
     grad_clip: float = 1.0
     cap: float = 10.0
     seed: int = 0
@@ -206,6 +207,11 @@ def train_teacher(model, data, cfg: TeacherConfig, device="cpu", progress: Optio
             model.train()
             opt.zero_grad(set_to_none=True)
             ls, lt, blown = teacher_rollout(model, batch, steps, std, cfg)
+            first = [float(torch.as_tensor(x).detach()) for x in (ls, lt)] if u == 0 and ls is not None else []
+            if first and max(first) > cfg.max_start_loss:
+                # 11/01: a near-zero tendency std gave a normalised loss of 1e13 that ran unnoticed
+                raise ValueError(f"first update: state loss {first[0]:.3g}, tendency loss {first[1]:.3g} "
+                                 f"> {cfg.max_start_loss:g}; check the normalisation")
             if ls is not None:
                 loss = ls + cfg.lambda_tend * lt
                 loss.backward()
