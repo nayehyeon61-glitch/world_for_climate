@@ -72,16 +72,16 @@ def game_section(before: dict, after: dict) -> List[str]:
 
 def causes_section(before: dict, after: dict) -> List[str]:
     lines = ["## The stage 9 cuts on N1 (2020, 8 initialisations, 72 h), without and with the bound", "",
-             "| cut | blow-ups without | with | 72 h all-MSE change without | with |", "|---|---|---|---|---|"]
+             "| cut | blow-ups without | with | first blow-up (h) without | with | 72 h all-MSE gain of the cut (+ = better) without | with |",
+             "|---|---|---|---|---|---|---|"]
     for name in ("no_moistening", "no_heating"):
-        b, a = before.get(name), after.get(name)
+        b, a = before["interventions"].get(name), after["interventions"].get(name)
         if not b or not a:
             continue
-        fb = lambda d: f"{d.get('blowups', '-')}" if isinstance(d.get("blowups"), int) else str(d.get("blowups", "-"))
-        cb = b.get("all_change", b.get("change", {}))
-        ca = a.get("all_change", a.get("change", {}))
-        lines.append(f"| {name} | {fb(b)} | {fb(a)} | {cb if isinstance(cb, str) else _pct(np.array(cb).flatten()[-1]) if cb else '-'} | "
-                     f"{ca if isinstance(ca, str) else _pct(np.array(ca).flatten()[-1]) if ca else '-'} |")
+        fb = lambda d: (f"{max(d['blowups'])}", f"{min(h for h in d['first_blowup_h'] if h is not None) if any(h is not None for h in d['first_blowup_h']) else '-'}",
+                        _pct(-d["change_all"]["mean"][-1]) if d.get("change_all") else "-")
+        (bb, bh, bc), (ab, ah, ac) = fb(b), fb(a)
+        lines.append(f"| {name} | {bb} | {ab} | {bh} | {ah} | {bc} | {ac} |")
     return lines
 
 
@@ -104,9 +104,10 @@ def verdicts(energies: Dict[str, dict], game, causes) -> List[str]:
         total += b0
         parts.append(f"game region {b0}→{b1}")
     if causes:
-        b0 = causes[0].get("no_moistening", {}).get("blowups")
-        b1 = causes[1].get("no_moistening", {}).get("blowups")
-        if isinstance(b0, int) and isinstance(b1, int):
+        c0 = causes[0]["interventions"].get("no_moistening", {}).get("blowups")
+        c1 = causes[1]["interventions"].get("no_moistening", {}).get("blowups")
+        if c0 and c1:
+            b0, b1 = max(c0), max(c1)
             removed += max(b0 - b1, 0)
             total += b0
             parts.append(f"no_moistening {b0}→{b1}")
@@ -144,15 +145,16 @@ def direction(energies: Dict[str, dict]) -> List[str]:
     bf = sum(mem["runs"].get(f"{k}:flux500", {}).get("blowups", 0) for k in mem["kinds"])
     bw = sum(mem["runs"].get(f"{k}:nowork", {}).get("blowups", 0) for k in mem["kinds"])
     lines.append(f"- Blow-ups of the memory model: none {b0}, flux bound {bf}, no-work {bw}, both {b1}. "
-                 + ("The energy input is the lever: next, E2 learns where the excess is taken from, and the bound goes into "
+                 + ("No blow-up in this sample: the bound's cost and the energy terms are the result." if b0 == 0 else
+                    ("The energy input is the lever: next, E2 learns where the excess is taken from, and the bound goes into "
                     "the stage 10.2 training so the column never learns to rely on it." if b1 < b0 else
                     "The bounds alone do not stop the blow-ups: the instability is not the column's net energy input "
                     "but its vertical structure or the dynamics' response; next, bound the static stability (no heating that "
-                    "makes a layer superadiabatic) and look at the momentum forcing's vertical shear."))
+                    "makes a layer superadiabatic) and look at the momentum forcing's vertical shear.")))
     r = mem["runs"].get("none:flux500_nowork", {}).get("err_ratio_finite")
     if r:
-        lines.append(f"- On the finite runs the bound changes the memory model's error by {_pct(r[3] - 1)} at 24 h and "
-                     f"{_pct(r[min(11, len(r) - 1)] - 1)} at 72 h: " + ("the unbounded column was injecting energy the forecast did "
+        lines.append(f"- On the finite runs the bound gains the memory model {_pct(1 - r[3])} at 24 h and "
+                     f"{_pct(1 - r[min(11, len(r) - 1)])} at 72 h (+ = better): " + ("the unbounded column was injecting energy the forecast did "
                      "not need." if r[3] < 1 else "the column's energy input carries real signal; a tighter bound costs skill."))
     return lines
 

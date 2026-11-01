@@ -30,7 +30,8 @@ def _pct(x: float) -> str:
 
 
 def _ci(ch: dict) -> str:
-    return f"{_pct(ch['mean'][0])} [{_pct(ch['lo'][0])}, {_pct(ch['hi'][0])}]"
+    """Gain (+ = better) with its interval: the negative of the relative error change."""
+    return f"{_pct(-ch['mean'][0])} [{_pct(-ch['hi'][0])}, {_pct(-ch['lo'][0])}]"
 
 
 def free_mean(run: dict, obs_steps: int) -> float:
@@ -65,9 +66,9 @@ def game_section(g: dict, title: str) -> List[str]:
              f"{len(g['inits'])} initialisations ({g.get('period', ['', ''])[0][:10]} .. {g.get('period', ['', ''])[1][:10]}), "
              f"{leads[-1]} h episodes: observations chosen after the first {obs} forecasts ({6 * obs} h), then free. "
              f"GraphCast-weighted all-point MSE (normalised units) of the forecast before each re-observation; "
-             f"'free' = mean over the free leads ({6 * (obs + 1)}-{leads[-1]} h); changes against {g['reference']} "
+             f"'free' = mean over the free leads ({6 * (obs + 1)}-{leads[-1]} h); gains (+ = better) against {g['reference']} "
              f"(paired, bootstrap 95% over initialisations). Blow-ups are counted and scored 10 from then on.", "",
-             "| run | budget | " + " | ".join(f"{h} h" for h in cols) + " | free | vs random | blow-ups | selection entropy (nat) | rho(freq, log tau) |",
+             "| run | budget | " + " | ".join(f"{h} h" for h in cols) + " | free | gain vs random (+ = better) | blow-ups | selection entropy (nat) | rho(freq, log tau) |",
              "|---" * (len(cols) + 7) + "|"]
     for name, r in g["runs"].items():
         ch = g["change"].get(name)
@@ -92,8 +93,8 @@ def game_section(g: dict, title: str) -> List[str]:
 def budget_section(g: dict) -> List[str]:
     obs = g["obs_steps"]
     lines = ["## Cause ablation: the observation budget", "",
-             "Free-lead MSE of the policy against the random rule at the same budget (ratio of means, memory model):", "",
-             "| budget | random | policy | policy vs random | age | readout | tendency |", "|---|---|---|---|---|---|---|"]
+             "Free-lead MSE of the policy against the random rule at the same budget (memory model; gain + = better):", "",
+             "| budget | random | policy | policy gain vs random | age | readout | tendency |", "|---|---|---|---|---|---|---|"]
     for b in g["budgets"]:
         suf = "" if b == g["budgets"][0] else f"@{b:g}"
         get = lambda rule: g["runs"].get(f"memory:{rule}{suf}")
@@ -102,7 +103,7 @@ def budget_section(g: dict) -> List[str]:
             continue
         fr, fp = free_mean(rnd, obs), free_mean(pol, obs)
         others = " | ".join(f"{free_mean(get(r), obs):.3f}" if get(r) else "-" for r in ("age", "readout", "tendency"))
-        lines.append(f"| {b:g} | {fr:.3f} | {fp:.3f} | {_pct((fp - fr) / fr)} | {others} |")
+        lines.append(f"| {b:g} | {fr:.3f} | {fp:.3f} | {_pct((fr - fp) / fr)} | {others} |")
     return lines
 
 
@@ -127,14 +128,14 @@ def climate_section(c: dict) -> List[str]:
     lines = ["## The climate frame (2020)", "",
              f"{len(c['inits'])} initialisations; {c['spinup_days']:g} days of budgeted observations (budget {c['budget']:g}) "
              f"under each rule, then {len(weeks)} weeks free; weekly means scored against ERA5 (GraphCast-weighted "
-             f"all-point MSE) and the climatology; changes against {c['reference']} (paired bootstrap). A run that "
+             f"all-point MSE) and the climatology; gains (+ = better) against {c['reference']} (paired bootstrap). A run that "
              f"blows up is scored with the climatology from then on.", "",
-             "| run | " + " | ".join(f"week {w}" for w in weeks) + " | vs random, weeks " + ", ".join(map(str, weeks)) + " | blow-ups |",
+             "| run | " + " | ".join(f"week {w}" for w in weeks) + " | gain vs random (+ = better), weeks " + ", ".join(map(str, weeks)) + " | blow-ups |",
              "|---" * (len(weeks) + 3) + "|"]
     for name, r in c["runs"].items():
         ch = c["change"].get(name)
         lines.append(f"| {name} | " + " | ".join(f"{x:.3f}" for x in r["all"]) + " | "
-                     + (" ".join(_pct(x) for x in ch["mean"]) if ch else "reference") + f" | {r['blowups']} |")
+                     + (" ".join(_pct(-x) for x in ch["mean"]) if ch else "reference") + f" | {r['blowups']} |")
     keys = [k for k in c["keys"] if k in HEAD]
     lines += ["", "Weekly RMSE (physical units) and ACC, z500 and t2m:", "",
               "| run | " + " | ".join(f"{HEAD[k]} RMSE w1..w{len(weeks)}" for k in keys[:3]) + " | z500 ACC |",
@@ -176,7 +177,7 @@ def verdicts(g: dict, c: Optional[dict], gt: Optional[dict], nomem: Optional[dic
         rel = (free_mean(runs["memory:policy"], obs) - fixed[best]) / fixed[best]
         a2 = rel <= -0.03
         out.append(f"- **A2** the policy is >= 3% below the best fixed rule  \n  → {'supported' if a2 else 'not supported'} "
-                   f"(best fixed rule {best}: policy {_pct(rel)}; " + ", ".join(f"{r} {v:.3f}" for r, v in fixed.items()) + ")")
+                   f"(best fixed rule {best}: policy gain {_pct(-rel)}; " + ", ".join(f"{r} {v:.3f}" for r, v in fixed.items()) + ")")
     rho = g["spearman_tau"].get("memory:policy", float("nan"))
     a3 = np.isfinite(rho) and rho >= 0.3
     out.append(f"- **A3** Spearman(selection frequency, patch log tau) >= +0.3: the policy looks where the memory lasts  \n"
@@ -185,13 +186,13 @@ def verdicts(g: dict, c: Optional[dict], gt: Optional[dict], nomem: Optional[dic
         fm, fn = free_mean(runs["memory:policy"], obs), free_mean(runs["n1:policy"], obs)
         rel = (fm - fn) / fn
         out.append(f"- **A4** the memory model is >= 5% below N1 + nudging under the same policy (memory maps zero on N1)  \n"
-                   f"  → {'supported' if rel <= -0.05 else 'not supported'} (memory {fm:.3f} vs N1 {fn:.3f}, {_pct(rel)})")
+                   f"  → {'supported' if rel <= -0.05 else 'not supported'} (memory {fm:.3f} vs N1 {fn:.3f}, gain {_pct(-rel)})")
     if c is not None and "memory:policy" in c["change"]:
         m = c["change"]["memory:policy"]["mean"]
         w12 = float(np.mean(m[:2]))
         out.append(f"- **A5** climate frame: the policy's weeks 1-2 error is >= 3% below random  \n"
-                   f"  → {'supported' if w12 <= -0.03 else 'not supported'} (weeks 1-2 {_pct(w12)}; weeks 3-4 "
-                   + ", ".join(_pct(x) for x in m[2:]) + ")")
+                   f"  → {'supported' if w12 <= -0.03 else 'not supported'} (weeks 1-2 gain {_pct(-w12)}; weeks 3-4 gain "
+                   + ", ".join(_pct(-x) for x in m[2:]) + ")")
     if gt is not None and "memory:policy" in gt["runs"] and "memory:policy" in runs:
         r = spearman(gt["runs"]["memory:policy"]["freq"], runs["memory:policy"]["freq"])
         out.append(f"- **A6** invariance: rank correlation of the policy's patch frequencies, 2018-19 vs 2020, >= 0.7  \n"
@@ -234,7 +235,7 @@ def direction(g: dict, c: Optional[dict]) -> List[str]:
                          "continuous filter before the next observation-policy round.")
     if c is not None and "memory:policy" in c["change"] and len(c["change"]["memory:policy"]["mean"]) > 2:
         m = c["change"]["memory:policy"]["mean"]
-        lines.append(f"- Climate frame: weeks 3-4 change vs random {', '.join(_pct(x) for x in m[2:])}; "
+        lines.append(f"- Climate frame: weeks 3-4 gain vs random {', '.join(_pct(-x) for x in m[2:])}; "
                      + ("observation placement reaches the subseasonal range." if min(m[2:]) <= -0.03
                         else "beyond two weeks the placement no longer matters, as expected without slow memory channels (10.2)."))
     return lines
