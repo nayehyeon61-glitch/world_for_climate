@@ -242,9 +242,10 @@ class PhysicsWorldModel(nn.Module):
         return sh.to_grid(sh.from_data(x))
 
     # ------------------------------------------------------ column physics
-    def column_forcing(self, state, static_g: Tensor, forc_g: Optional[Tensor]) -> Dict[str, Tensor]:
-        """Grid tendencies of the column physics; with the memory kernel also the
-        updated memory ("mem")."""
+    def column_inputs(self, state, static_g: Tensor, forc_g: Optional[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+        """The column network's input x [B, H, W, C] (normalised grid fields, the
+        lowest-level geopotential, static fields, forcings, sin lat) and the grid
+        winds u, v (stage 12 reads x for the memory's timescale map)."""
         sh, core = self.core.sh, self.core
         u, v = sh.uv(state["zeta"], state["div"])
         grid = {"temp": sh.to_grid(state["temp"]), "q": sh.to_grid(state["q"]), "u": u, "v": v,
@@ -262,6 +263,18 @@ class PhysicsWorldModel(nn.Module):
         b = zb.shape[0]
         feats.append(self.sinlat_g[None, None, :, None].expand(b, 1, *zb.shape[-2:]))
         x = torch.cat(feats, 1).permute(0, 2, 3, 1)  # [B, H, W, C]
+        return x, u, v
+
+    def forcing_grid_at(self, ctx, k: int) -> Optional[Tensor]:
+        """Normalised forcings [B, F, H_g, W_g] at lead k (None when the column takes none)."""
+        if self.column is None or not self.cfg.column.use_forcings:
+            return None
+        return self._forcing_grid(ctx["init"] + 21600 * k)
+
+    def column_forcing(self, state, static_g: Tensor, forc_g: Optional[Tensor]) -> Dict[str, Tensor]:
+        """Grid tendencies of the column physics; with the memory kernel also the
+        updated memory ("mem")."""
+        x, u, v = self.column_inputs(state, static_g, forc_g)
         if "all" in self.column_paths:
             x = self._hold_inputs(x, self.column_paths["all"])
         y = self.column(x)

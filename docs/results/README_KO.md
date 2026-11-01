@@ -664,6 +664,33 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 
 **설치:** `pip install neuraloperator torch-harmonics==0.7.4` (`pyproject.toml`의 `operator`). torch-harmonics 0.9는 torch < 2.15를 요구하고, 0.7.4의 구면 조화 변환은 순수 Python이라 torch 2.15에서 작동합니다(확인함).
 
+## 12단계 — 능동 관측: 관측 위치를 고르는 행동 (`stage12_active_obs/`)
+
+**가설 (감자, 11/01 10:04–10:07):** "Action적 요소를 추가해서 진정한 의미의 월드 모델로 강화구조를 만들고 싶다. 특히 기후예측이라는 목적을 가지고." 대기는 행동으로 바꿀 수 없지만 관측 체계는 바꿀 수 있습니다. 행위자가 어디를 관측할지 고르고, 기억 모델이 그 관측을 동화(10단계 사후 규칙)해 나머지를 예측합니다. 보상은 예보 오차이므로 행위자는 "이 모델과 이 기억에게 어느 관측이 가장 값진가"를 배웁니다. 기후 예측의 목적에서는 관측의 가치가 기억(느린 변수)을 채우는 곳에 있어야 한다는 것이 검증 대상입니다. 세 대안(능동 관측 / 연산자 선택 = 11단계 / 강제력 시나리오 개입) 가운데 결정 카드로 능동 관측을 골랐습니다.
+
+**구현 (`train/active_obs.py`, `scripts/train_active_obs.py`, `scripts/eval_active_obs.py`, `scripts/report_active_obs.py`, `configs/active_obs_wb2.yaml`; 세계 모델 쪽은 `physics_world_model.column_inputs`로 칼럼 입력 x를 바깥에서 읽어 τ(x) 지도를 얻습니다):**
+- 게임: 초기 시각의 완전 관측 스냅샷(GraphCast 초기화와 같음, 기억 0)에서 시작해 6시간마다 예보합니다. 처음 `obs_steps`번의 예보 뒤마다 규칙이 24개 등면적 패치(위도대 4 × 경도 구역 6, 위도 경계 −90/−30/0/30/90°) 가운데 n = 예산 25% = 6개를 골라 그 패치의 모든 변수를 재관측하고, 나머지는 예보 + 기억 판독 R(m)을 유지합니다(10단계 사후 규칙; 기억 없는 N1에서는 nudging α = 1). 그 뒤는 자유 예측입니다. 점수는 매 걸음 재관측 전 예보의 GraphCast 가중 전역 오차이므로 k번째 선택은 k+1 이후의 오차로 보상받습니다.
+- 규칙: `policy`(학습), `random`(같은 예산의 무작위, 통제군), `age`(가장 오래 안 본 패치: 순환 관측), `readout`(기억 판독 |R(m)|이 큰 패치: 모델 자신의 오차 추정), `tendency`(6시간 변화가 큰 패치), `full`(전부 관측, 상한), `none`(무관측 = 콜드 자유예보, 하한).
+- 정책: 패치마다 공유 MLP(29 → 64 → 64 → 1)가 로짓을 냅니다. 입력은 패치 안의 예보 6시간 변화 RMS(변수 묶음 6개), 기억 판독·기억 상태 RMS, log τ 평균, 나이(마지막 관측 뒤 걸음 수), 같은 특징의 전구 평균(문맥), 위도 사인, 걸음 one-hot입니다. 선택은 Plackett–Luce 분포의 비복원 표본(Gumbel-top-k), 시험에서는 로짓 상위 n개. 마지막 층이 0에서 시작하므로 학습 전 정책 = random입니다.
+- 학습: 세계 모델은 얼립니다(7단계처럼 C만 학습). 반복마다 2018–19의 한 시점에서 8개 에피소드(60시간 = 36시간 동안 관측 선택 6번 + 24시간 자유)를 표본 추출하고 선택마다 집단 정규화 보상 누적합(7·9·11단계의 `reward_to_go_advantages`)으로 REINFORCE 합니다. 100회 갱신, 학습률 1e-3 코사인, 폭주한 멤버는 상한 10점이고 마지막 유한 걸음까지만 기여합니다.
+- 평가(2020, 규칙끼리 초기 시각마다 같은 난수로 짝지음): ① 게임 120시간(48시간 동안 선택 8번 + 72시간 자유, GraphCast 리드), 31개 초기 시각, 예산 12.5/25/50%, 기억 모델의 7개 규칙 + N1(nudging)의 policy/random/full/none. ② 기후 틀(`eval_memory_climate`와 같은 채점): 예산 관측 10일 뒤 4주 자유, 주평균을 ERA5·기후값과 비교, 8개 초기 시각. 기록: 패치별 선택 빈도와 그 엔트로피, 기억의 패치별 log τ 지도와 판독 지도.
+
+**원인 절제:** 예산 12.5/25/50%(선택의 가치가 예산에 따라 어떻게 변하는가), P-nomem(기억 지도를 못 보는 정책: 정책이 기억을 읽어야 하는가; N1에도 공정한 정책), 기억 모델 대 N1(같은 규칙 아래 기억이 관측을 더 오래 유지하는가), 고정 규칙 셋(학습이 필요한가).
+
+**판정 규칙 (사전 등록):**
+- A1 선택의 가치: 2020 게임에서 policy의 자유 구간(54–120h) 전역 오차가 random보다 5% 이상 낮음(부트스트랩 95% 구간이 0을 넘지 않음).
+- A2 학습의 필요: policy가 가장 좋은 고정 규칙(age·readout·tendency)보다 3% 이상 낮음. 고정 규칙이 policy와 같으면 "선택에 정보는 있으나 학습은 필요 없음".
+- A3 기억과의 결합: policy의 패치별 선택 빈도와 기억의 패치별 log τ 지도의 Spearman 상관 ≥ +0.3(기억이 오래 남는 곳을 더 자주 봄). 부호가 반대면 "빨리 잊는 곳을 자주 본다"로 따로 보고.
+- A4 기억 모델 대 N1: 같은 policy(기억 지도 입력은 N1에서 0) 아래 기억 모델의 자유 구간 오차가 N1 + nudging보다 5% 이상 낮음.
+- A5 기후: 기후 틀에서 policy의 1–2주 주평균 오차가 random보다 3% 이상 낮음. 3–4주는 보고만(C4처럼 어느 규칙도 기후값을 넘지 못하리라 예상).
+- A6 불변성: 2018–19(학습 연도) 15개 초기 시각과 2020의 패치별 선택 빈도의 순위상관 ≥ 0.7(정책이 연도가 아니라 규칙을 배움).
+
+**시간 (KST):** 구현·테스트 ~2h(11/01 12:30 완료), 학습 P ~1.7h(1스레드 부업, 체인 4 뒤 ~13:30부터), 게임 평가 ~1.5h, 기후 평가 ~1.5h, P-nomem 학습·평가 ~3h → 보고 11/02 저녁(앞당겨지면 11/01 밤).
+
+**결과:** 실행 대기.
+
+---
+
 ## 재현
 
 ```bash
@@ -692,6 +719,17 @@ python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/
     n1=runs/physics_n1/compare_graphcast_2020.json --warm2020 runs/stage10_Dnoactor/compare_memory_2020.json \
     --cold2018 memory=runs/stage10_Dnoactor/compare_graphcast_2018.json n1=runs/physics_n1/compare_graphcast.json \
     n0=runs/physics_n0/compare_graphcast.json --out docs/results/stage10_memory/compare.md
+# 12단계 (얼린 D-noactor 위; DATA2020)
+python scripts/train_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/active_obs_wb2.yaml \
+    --data-dir DATA2020 --out runs/stage12_P            # P-nomem: --set policy.use_memory=false
+python scripts/eval_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --base runs/physics_n1/checkpoint.pt \
+    --policy runs/stage12_P/policy.pt --config configs/active_obs_wb2.yaml --data-dir DATA2020 --mode game \
+    --budgets 0.25 0.125 0.5 --out runs/stage12_P/game_2020.json   # 2018-19: --split train --inits 15
+python scripts/eval_active_obs.py ... --mode climate --inits 8 --rules policy random full none --base-rules policy random \
+    --out runs/stage12_P/climate_2020.json
+python scripts/report_active_obs.py --game runs/stage12_P/game_2020.json --game-train runs/stage12_P/game_2018_19.json \
+    --climate runs/stage12_P/climate_2020.json --nomem runs/stage12_Pnomem/game_2020.json --history runs/stage12_P/train_history.json \
+    --out docs/results/stage12_active_obs/active.md
 # 10.2 (L: memory.long_channels=4, L0: 0); 채움은 2018-01-01부터 연속 통과, 28일은 --graphcast none
 python scripts/train_memory_filter.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/memory_filter_wb2.yaml \
     --data-dir DATA2020 --out runs/stage10_2_L --set memory.long_channels=4
