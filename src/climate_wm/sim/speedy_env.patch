@@ -51,10 +51,10 @@ index e05d49f..8c19517 100755
  end module
 diff --git a/source/env_control.f90 b/source/env_control.f90
 new file mode 100644
-index 0000000..877f347
+index 0000000..a46dcfd
 --- /dev/null
 +++ b/source/env_control.f90
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,320 @@
 +!> Environment control for the climate world-model experiments (stage 14).
 +!  Restart files, interventions (solar factor, CO2 absorptivity, SST patches,
 +!  convection relaxation time, surface drag) and extra surface output
@@ -69,6 +69,7 @@ index 0000000..877f347
 +    private
 +    public read_control, write_restart, read_restart, apply_sst_patch
 +    public save_surface, accumulate_step, output_surface, write_static
++    public save_tendencies, output_tendencies
 +    public restart_in, restart_out, static_out
 +
 +    integer, parameter :: max_patch = 8
@@ -90,6 +91,12 @@ index 0000000..877f347
 +    real(p) :: t0_sav(ix,il) = 0.0, u0_sav(ix,il) = 0.0, v0_sav(ix,il) = 0.0, ts_sav(ix,il) = 0.0
 +    real(p) :: patch_field(ix,il) = 0.0     !! Sum of the SST patches (K), before masks
 +
++    ! Stage 15 (simulator as teacher): per-process physics tendencies, averaged over the output interval
++    logical :: tend_out = .false.           !! Write yyyymmddhhmm_tend.nc at every output time
++    integer, parameter :: n_tend = 10
++    real(p) :: tend_acc(ix,il,kx,n_tend) = 0.0  !! Sums of the per-process tendencies since the last output
++    integer :: n_tend_acc = 0                !! Number of physics calls in tend_acc
++
 +contains
 +    !> Reads the &control namelist and applies the parameter interventions.
 +    subroutine read_control
@@ -97,7 +104,7 @@ index 0000000..877f347
 +        use convection, only: trcnv
 +        use surface_fluxes, only: cdl, cds
 +        namelist /control/ restart_in, restart_out, static_out, solar_factor, co2_factor, &
-+            & conv_factor, drag_factor, n_patch, patch_lon, patch_lat, patch_radius, patch_amp
++            & conv_factor, drag_factor, n_patch, patch_lon, patch_lat, patch_radius, patch_amp, tend_out
 +        logical :: exists
 +
 +        inquire(file="namelist.nml", exist=exists)
@@ -220,6 +227,72 @@ index 0000000..877f347
 +        end do
 +        call check(nf90_close(ncid))
 +        prec_acc = 0.0
++    end subroutine
++
++    !> Adds the per-process tendencies of one physics call (T: K/s, q: g/kg/s, u, v: m/s^2).
++    subroutine save_tendencies(tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, qt_lsc, qt_pbl, ut_pbl, vt_pbl)
++        real(p), dimension(ix,il,kx), intent(in) :: tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, &
++            & qt_lsc, qt_pbl, ut_pbl, vt_pbl
++        if (.not. tend_out) return
++        tend_acc(:,:,:,1) = tend_acc(:,:,:,1) + tt_cnv
++        tend_acc(:,:,:,2) = tend_acc(:,:,:,2) + tt_lsc
++        tend_acc(:,:,:,3) = tend_acc(:,:,:,3) + tt_rsw
++        tend_acc(:,:,:,4) = tend_acc(:,:,:,4) + tt_rlw
++        tend_acc(:,:,:,5) = tend_acc(:,:,:,5) + tt_pbl
++        tend_acc(:,:,:,6) = tend_acc(:,:,:,6) + qt_cnv
++        tend_acc(:,:,:,7) = tend_acc(:,:,:,7) + qt_lsc
++        tend_acc(:,:,:,8) = tend_acc(:,:,:,8) + qt_pbl
++        tend_acc(:,:,:,9) = tend_acc(:,:,:,9) + ut_pbl
++        tend_acc(:,:,:,10) = tend_acc(:,:,:,10) + vt_pbl
++        n_tend_acc = n_tend_acc + 1
++    end subroutine
++
++    !> Writes the mean per-process tendencies since the last output to yyyymmddhhmm_tend.nc
++    !  (sigma levels, top to bottom as in the model).
++    subroutine output_tendencies(timestep)
++        use date, only: model_datetime
++        use geometry, only: radang, fsg
++        integer, intent(in) :: timestep
++        character(len=20) :: file_name = 'yyyymmddhhmm_tend.nc'
++        integer :: ncid, londim, latdim, levdim, timedim, lonvar, latvar, levvar, timevar, k, n
++        integer :: varid(n_tend)
++        character(len=8), parameter :: names(n_tend) = (/ 'tt_cnv  ', 'tt_lsc  ', 'tt_rsw  ', &
++            & 'tt_rlw  ', 'tt_pbl  ', 'qt_cnv  ', 'qt_lsc  ', 'qt_pbl  ', 'ut_pbl  ', 'vt_pbl  ' /)
++        real(sp) :: field(ix,il,kx)
++
++        if (.not. tend_out) return
++        write (file_name(1:4),'(i4.4)') model_datetime%year
++        write (file_name(5:6),'(i2.2)') model_datetime%month
++        write (file_name(7:8),'(i2.2)') model_datetime%day
++        write (file_name(9:10),'(i2.2)') model_datetime%hour
++        write (file_name(11:12),'(i2.2)') model_datetime%minute
++
++        call check(nf90_create(file_name, nf90_clobber, ncid))
++        call check(nf90_def_dim(ncid, "time", nf90_unlimited, timedim))
++        call check(nf90_def_dim(ncid, "lon", ix, londim))
++        call check(nf90_def_dim(ncid, "lat", il, latdim))
++        call check(nf90_def_dim(ncid, "lev", kx, levdim))
++        call check(nf90_def_var(ncid, "time", nf90_real4, timedim, timevar))
++        call check(nf90_def_var(ncid, "lon", nf90_real4, londim, lonvar))
++        call check(nf90_def_var(ncid, "lat", nf90_real4, latdim, latvar))
++        call check(nf90_def_var(ncid, "lev", nf90_real4, levdim, levvar))
++        do n = 1, n_tend
++            call check(nf90_def_var(ncid, trim(names(n)), nf90_real4, (/ londim, latdim, levdim, timedim /), &
++                & varid(n)))
++        end do
++        call check(nf90_put_att(ncid, nf90_global, "units", "tt: K/s, qt: g/kg/s, ut/vt: m/s2; mean since previous output"))
++        call check(nf90_enddef(ncid))
++        call check(nf90_put_var(ncid, timevar, timestep*24.0/real(nsteps,sp), (/ 1 /)))
++        call check(nf90_put_var(ncid, lonvar, (/ (3.75*k, k = 0, ix-1) /), (/ 1 /)))
++        call check(nf90_put_var(ncid, latvar, (/ (radang(k)*90.0/asin(1.0), k = 1, il) /), (/ 1 /)))
++        call check(nf90_put_var(ncid, levvar, real(fsg, sp), (/ 1 /)))
++        do n = 1, n_tend
++            field = real(tend_acc(:,:,:,n)/max(n_tend_acc, 1), sp)
++            call check(nf90_put_var(ncid, varid(n), field, (/ 1, 1, 1, 1 /)))
++        end do
++        call check(nf90_close(ncid))
++        tend_acc = 0.0
++        n_tend_acc = 0
 +    end subroutine
 +
 +    !> Writes orography (m), land fraction and sea fraction to static_out.
@@ -401,14 +474,14 @@ index 7595d3e..b7989cc 100755
      public fmask_l
      public land_coupling_flag
 diff --git a/source/physics.f90 b/source/physics.f90
-index ac8113b..c1cafe0 100755
+index ac8113b..f37ed73 100755
 --- a/source/physics.f90
 +++ b/source/physics.f90
 @@ -41,6 +41,7 @@ contains
      !> Compute physical parametrization tendencies for u, v, t, q and add them
      !  to the dynamical grid-point tendencies
      subroutine get_physical_tendencies(vor, div, t, q, phi, psl, utend, vtend, ttend, qtend)
-+        use env_control, only: save_surface
++        use env_control, only: save_surface, save_tendencies
          use auxiliaries, only: precnv, precls, cbmf, tsr, ssrd, ssr, slrd, slr, olr, slru, ustr, &
              & vstr, shf, evap, hfluxn
          use physical_constants, only: sigh, grdsig, grdscp, cp
@@ -432,6 +505,15 @@ index ac8113b..c1cafe0 100755
          ! Recompute sea fluxes in case of anomaly coupling
          if (sea_coupling_flag > 0) then
             call get_surface_fluxes(psg, ug, vg, tg, qg, rh, phig, phis0, fmask_l, ssti_om, &
+@@ -199,6 +203,8 @@ contains
+         tt_pbl(:,:,kx) = tt_pbl(:,:,kx)  + shf(:,:,3)*rps*grdscp(kx)
+         qt_pbl(:,:,kx) = qt_pbl(:,:,kx) + evap(:,:,3)*rps*grdsig(kx)
+ 
++        call save_tendencies(tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, qt_lsc, qt_pbl, ut_pbl, vt_pbl)
++
+         utend = utend + ut_pbl
+         vtend = vtend + vt_pbl
+         ttend = ttend + tt_pbl
 diff --git a/source/sea_model.f90 b/source/sea_model.f90
 index 117890c..f9638fa 100755
 --- a/source/sea_model.f90
@@ -483,14 +565,14 @@ index 561923c..d20ffb0 100644
                                            !! cloud cover = 0
      real(p), parameter :: rhcl2   = 1.00  !! Relative humidity correponding to cloud cover = 1
 diff --git a/source/speedy.f90 b/source/speedy.f90
-index 0dc0f6d..bd21e6d 100755
+index 0dc0f6d..2851255 100755
 --- a/source/speedy.f90
 +++ b/source/speedy.f90
 @@ -14,6 +14,7 @@ program speedy
      use diagnostics, only: check_diagnostics
      use prognostics, only: vor, div, t, ps, tr, phi
      use forcing, only: set_forcing
-+    use env_control, only: accumulate_step, output_surface, write_restart
++    use env_control, only: accumulate_step, output_surface, output_tendencies, write_restart
  
      implicit none
  
@@ -502,7 +584,7 @@ index 0dc0f6d..bd21e6d 100755
  
          ! Check model diagnostics
          call check_diagnostics(vor(:,:,:,2), div(:,:,:,2), t(:,:,:,2), model_step)
-@@ -47,9 +49,14 @@ program speedy
+@@ -47,9 +49,15 @@ program speedy
          call newdate
  
          ! Output
@@ -510,6 +592,7 @@ index 0dc0f6d..bd21e6d 100755
 +        if (mod(model_step-1, nsteps_out) == 0) then
 +            call output(model_step-1,  vor, div, t, ps, tr, phi)
 +            call output_surface(model_step-1)
++            call output_tendencies(model_step-1)
 +        end if
  
          ! Exchange data with coupler

@@ -62,6 +62,21 @@ class Intervention:
         return self == Intervention()
 
 
+@dataclasses.dataclass
+class Perturbation:
+    """Stage 15 episode group B: a smooth random perturbation of the restart state
+    (red spectrum with e-folding total wavenumber `scale`, zero global mean)."""
+    seed: int = 0          # 0 = none
+    t: float = 0.0         # rms K
+    vor: float = 0.0       # rms 1/s
+    ps: float = 0.0        # rms of log surface pressure
+    scale: float = 8.0
+
+    def namelist(self) -> str:
+        return (f"perturb_seed = {self.seed}\nperturb_t = {self.t}\nperturb_vor = {self.vor}\n"
+                f"perturb_ps = {self.ps}\nperturb_scale = {self.scale}")
+
+
 def _dt_block(name: str, t: dt.datetime) -> str:
     return "\n".join(f"{name}%{k} = {getattr(t, k)}"
                      for k in ("year", "month", "day", "hour", "minute"))
@@ -70,8 +85,9 @@ def _dt_block(name: str, t: dt.datetime) -> str:
 class SpeedyRunner:
     """Runs the patched SPEEDY binary in its own directory per segment."""
 
-    def __init__(self, root: str, workdir: str, nsteps_out: int = 9):
+    def __init__(self, root: str, workdir: str, nsteps_out: int = 9, tendencies: bool = False):
         self.root = Path(root)
+        self.tendencies = tendencies   # stage 15: also write yyyymmddhhmm_tend.nc (per-process physics)
         self.binary = self.root / "bin" / "speedy"
         self.bc = self.root / "data" / "bc" / "t30"
         self.workdir = Path(workdir)
@@ -81,7 +97,8 @@ class SpeedyRunner:
 
     def run(self, tag: str, start: dt.datetime, end: dt.datetime,
             restart_in: Optional[str] = None, restart_out: bool = True,
-            intervention: Optional[Intervention] = None, static: bool = False) -> Path:
+            intervention: Optional[Intervention] = None, static: bool = False,
+            perturbation: Optional["Perturbation"] = None) -> Path:
         """One segment from `start` to `end` (00 UTC boundaries keep the daily
         forcing and shortwave cycles aligned with a straight run)."""
         if start.hour or start.minute:
@@ -99,6 +116,12 @@ class SpeedyRunner:
         control = [f"restart_in = '{os.path.abspath(restart_in) if restart_in else ''}'",
                    f"restart_out = '{run / 'restart.bin' if restart_out else ''}'",
                    f"static_out = '{run / 'static.nc' if static else ''}'", iv.namelist()]
+        if self.tendencies:
+            control.append("tend_out = .true.")
+        if perturbation is not None and perturbation.seed:
+            if not restart_in:
+                raise ValueError("a perturbation needs a restart to perturb")
+            control.append(perturbation.namelist())
         text = ("&params\nnsteps_out = %d\nnstdia = 100000\n/\n&date\n%s\n%s\n/\n&control\n%s\n/\n"
                 % (self.nsteps_out, _dt_block("start_datetime", start),
                    _dt_block("end_datetime", end), "\n".join(control)))
@@ -290,3 +313,46 @@ def to_dataset(arrays: Dict[str, np.ndarray], times: Sequence[dt.datetime],
         else:
             data[k] = (("longitude", "latitude"), v)
     return xr.Dataset(data, coords=coords, attrs=attrs or {})
+
+
+# --------------------------------------------------------------------------- stage 15: teacher tendencies
+TEND_NAMES = ("tt_cnv", "tt_lsc", "tt_rsw", "tt_rlw", "tt_pbl", "qt_cnv", "qt_lsc", "qt_pbl", "ut_pbl", "vt_pbl")
+# the per-process tendencies on pressure levels: N1 column outputs Q (K/s), S (kg/kg/s), F (m/s^2)
+TEND_GROUPS = {
+    "Q_cnv": ("tt_cnv",), "Q_lsc": ("tt_lsc",), "Q_sw": ("tt_rsw",), "Q_lw": ("tt_rlw",), "Q_pbl": ("tt_pbl",),
+    "S_cnv": ("qt_cnv",), "S_lsc": ("qt_lsc",), "S_pbl": ("qt_pbl",),
+    "F_u": ("ut_pbl",), "F_v": ("vt_pbl",),
+}
+
+
+def read_tendencies(run: Path, times: Sequence[dt.datetime]) -> Dict[str, np.ndarray]:
+    """Mean per-process physics tendencies over the 6 h before each output time,
+    [T, K, 48, 96] on the model's sigma levels (T: K/s, q: g/kg/s, u, v: m/s^2)."""
+    import netCDF4
+    out: Dict[str, List[np.ndarray]] = {}
+    for t in times:
+        with netCDF4.Dataset(run / f"{t.strftime('%Y%m%d%H%M')}_tend.nc") as ds:
+            for v in TEND_NAMES:
+                out.setdefault(v, []).append(np.asarray(ds[v][0], dtype=np.float64))
+    return {k: np.stack(v) for k, v in out.items()}
+
+
+def tendencies_to_wb2(tend: Dict[str, np.ndarray], native: Dict[str, np.ndarray],
+                      levels: Sequence[int] = WB2_LEVELS) -> Dict[str, np.ndarray]:
+    """Per-process tendencies on the WB2 grid and pressure levels, [T, L, lon, lat] float32:
+    Q_* (K/s), S_* (kg/kg/s; SPEEDY q is g/kg), F_u, F_v (m/s^2), and the totals Q, S.
+    Zero below the surface (p > ps); between the lowest full level and ps held constant.
+    The pressure of each column is the one at the end of the averaging interval."""
+    lat, sigma, ps = native["lat"], native["sigma"], native["ps"]
+    rg = Regridder(lat, nlon_src=ps.shape[-1])
+    above = (np.asarray(levels, dtype=np.float64)[None, :, None, None] * 100.0) <= ps[:, None]
+    out = {}
+    for name, srcs in TEND_GROUPS.items():
+        x = sum(tend[s] for s in srcs)
+        if name.startswith("S_"):
+            x = x * 1e-3
+        xp = to_pressure(x, ps, sigma, levels, "tend") * above
+        out[name] = np.swapaxes(rg(xp), -1, -2).astype(np.float32)
+    out["Q"] = sum(out[k] for k in ("Q_cnv", "Q_lsc", "Q_sw", "Q_lw", "Q_pbl"))
+    out["S"] = sum(out[k] for k in ("S_cnv", "S_lsc", "S_pbl"))
+    return out

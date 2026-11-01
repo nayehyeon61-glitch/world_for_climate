@@ -1,5 +1,6 @@
 #!/bin/bash
-# Stage 14: build the patched SPEEDY (speedy.f90) used as the simulator environment.
+# Stage 14/15: build the patched SPEEDY (speedy.f90) used as the simulator environment and teacher
+# (&control tend_out = .true. also writes the per-process physics tendencies, yyyymmddhhmm_tend.nc).
 #   bash scripts/setup_speedy.sh DEST      (DEST/bin/speedy, DEST/data/bc/t30 afterwards)
 # Needs gfortran and the NetCDF Fortran library (Ubuntu: apt-get install gfortran libnetcdff-dev).
 set -e
