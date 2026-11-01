@@ -53,6 +53,11 @@ RULES = {
     "C4": "ClimODE (indirect): on 2018 at 24 h the cold memory model's RMSE is below ClimODE's published RMSE "
           "on >= 3 of z500, t850, t2m, u10 (2018 is a fine-tuning year of the memory model; ClimODE's test "
           "years are 2017-2018 after ten training years)",
+    "C5": "observations (감자 09:49): with the points outside a hidden cap re-observed every 6 h, the memory "
+          "model's RMSE on the cap is >= 10% below N1 + nudging at 24 h (mean over z500, t850, t2m, u10; the "
+          "stage 10 P1 in physical units)",
+    "C6": "crossing: the first lead at which the observation-fed memory model beats GraphCast's free forecast on "
+          "the cap (mean ratio < 1), if any within 120 h",
 }
 
 
@@ -167,8 +172,38 @@ def climode_section(ours):
     return "\n".join(lines), below
 
 
-def verdicts(gains, knock_gain_24, ratios, below):
+def observed_section(gc, nudging, memory, summ):
+    leads = (6, 24, 72, 120)
+    lines = [f"Hidden cap of {100 * summ.get('region_fraction', 0.25):.0f}% of the sphere per initialisation "
+             f"(mean hidden weight {summ.get('hidden_fraction', float('nan')):.2f}); RMSE over the cap only. "
+             f"Blow-ups: {summ.get('blowups', '-')}.", "",
+             "| variable | lead | GraphCast (free) | N1 + nudging | memory (posterior) | memory / GraphCast | memory / nudging |",
+             "|---|---|---|---|---|---|---|"]
+    vs_gc, vs_nudge = {}, {}
+    for var in VARS:
+        for h in leads:
+            g, n, m = rmse(gc, var, h), rmse(nudging, var, h), rmse(memory, var, h)
+            if not np.isfinite(m):
+                continue
+            lines.append(f"| {SHORT[var]} | {h} h | {_f(g)} | {_f(n)} | {_f(m)} | {_f(m / g, 2)}x | {_f(m / n, 2)}x |")
+            if var in HEADLINE:
+                vs_gc.setdefault(h, []).append(m / g)
+                vs_nudge.setdefault(h, []).append(m / n)
+    all_leads = sorted({h for _, h in memory})
+    cross = [h for h in all_leads if np.isfinite(np.nanmean([rmse(memory, v, h) / rmse(gc, v, h) for v in HEADLINE]))
+             and np.nanmean([rmse(memory, v, h) / rmse(gc, v, h) for v in HEADLINE]) < 1]
+    return "\n".join(lines), {h: float(np.mean(v)) for h, v in vs_gc.items()}, {h: float(np.mean(v)) for h, v in vs_nudge.items()}, cross
+
+
+def verdicts(gains, knock_gain_24, ratios, below, obs=None):
     out = {}
+    if obs:
+        vs_gc, vs_nudge, cross = obs
+        if 24 in vs_nudge:
+            out["C5"] = (f"{'supported' if vs_nudge[24] <= 0.9 else 'not supported'} (memory / nudging on the cap: " +
+                         ", ".join(f"{h} h {r:.2f}x" for h, r in vs_nudge.items()) + ")")
+        out["C6"] = ((f"crosses at {cross[0]} h" if cross else "no crossing within the forecast") +
+                     " (memory / GraphCast on the cap: " + ", ".join(f"{h} h {r:.2f}x" for h, r in vs_gc.items()) + ")")
     if 24 in gains and np.isfinite(gains[24]):
         ok = gains[24] <= -0.03 and abs(knock_gain_24) <= 0.01
         out["C1"] = (f"{'supported' if ok else 'not supported'} (warm vs cold {_pct(gains[24])}, spin-up alone "
@@ -193,6 +228,7 @@ def main():
     parser.add_argument("--warm2020", default=None, help="OUT of compare_memory.py")
     parser.add_argument("--cold2018", nargs="*", default=[], help="memory=... n1=... n0=...")
     parser.add_argument("--warm2018", default=None)
+    parser.add_argument("--obs2020", default=None, help="OUT of compare_memory.py --obs-kind region (warm + nudging)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     cold20 = {k: load(v) for k, v in (s.split("=", 1) for s in args.cold2020)}
@@ -257,7 +293,20 @@ def main():
         md += [text, ""]
     else:
         md.append("No 2018 scores yet.")
-    v = verdicts(gains, knock24, ratios, below)
+    obs = None
+    if args.obs2020:
+        ow, on = warm(args.obs2020, "warm"), warm(args.obs2020, "nudging")
+        osumm = {}
+        if os.path.exists(args.obs2020.replace(".json", "_summary.json")):
+            with open(args.obs2020.replace(".json", "_summary.json")) as f:
+                osumm = json.load(f)
+        if ow and on:
+            md += ["", "## Forecasts fed by observations outside a hidden cap (2020)", ""]
+            entry = dict(osumm, **osumm.get("variants", {}).get("warm", {}))
+            text, vs_gc, vs_nudge, cross = observed_section(ow["graphcast"], on["model"], ow["model"], entry)
+            md += [text, ""]
+            obs = (vs_gc, vs_nudge, cross)
+    v = verdicts(gains, knock24, ratios, below, obs)
     md += ["", "## Decision rules", ""]
     md += [f"- **{k}** {RULES[k]}  \n  → {v.get(k, 'pending')}" for k in RULES]
     if notes:

@@ -23,9 +23,14 @@ def test_report(tmp_path):
     with open(tmp_path / "cm_summary.json", "w") as f:
         json.dump({"inits": 31, "variants": {"warm": {"blowups": 1}, "warm_no_memory": {"blowups": 0}}}, f)
     cold18 = _file(tmp_path / "cold18.json", 0.5)
+    _file(tmp_path / "obs_warm.json", 1.5, gc=1.0)     # on the cap: 1.5x GraphCast at every lead
+    _file(tmp_path / "obs_nudging.json", 2.0, gc=1.0)  # 25% below nudging
+    with open(tmp_path / "obs_summary.json", "w") as f:
+        json.dump({"inits": 31, "region_fraction": 0.25, "variants": {"warm": {"blowups": 2, "hidden_fraction": 0.25}}}, f)
     out = tmp_path / "compare.md"
     subprocess.run([sys.executable, SCRIPT, "--cold2020", f"memory={cold}", f"n1={n1}",
-                    "--warm2020", str(tmp_path / "cm.json"), "--cold2018", f"memory={cold18}", "--out", str(out)],
+                    "--warm2020", str(tmp_path / "cm.json"), "--cold2018", f"memory={cold18}",
+                    "--obs2020", str(tmp_path / "obs.json"), "--out", str(out)],
                    check=True, capture_output=True)
     text = out.read_text()
     assert "| z500 | 24 h | 24 | 52.8 | 48 | 43.2 | 48 | 120 | 144 |" in text
@@ -36,3 +41,6 @@ def test_report(tmp_path):
     assert "| z500 | 24 h | 193 | 333 | 365 | 51 | 24 | 12 |" in text  # ClimODE row with GraphCast and ours (2018)
     assert "not supported (memory cold below ClimODE at 24 h on 1 of 4 variables)" in text  # 12 < 193 only
     assert "warm 1, warm_no_memory 0 of 31" in text
+    assert "| z500 | 24 h | 24 | 48 | 36 | 1.50x | 0.75x |" in text
+    assert "supported (memory / nudging on the cap: 6 h 0.75x, 24 h 0.75x, 72 h 0.75x, 120 h 0.75x)" in text
+    assert "no crossing within the forecast (memory / GraphCast on the cap: 6 h 1.50x" in text
