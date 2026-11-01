@@ -95,7 +95,7 @@ def main() -> None:
                        "train_actions": [a.name for a in train_actions()]}, f)
         print(f"saved {ckpt}")
     else:
-        models = {"init": model}
+        models = {"start": model}   # the --init student (a label must not clash with the row keys)
         for spec in args.models:   # more students on the same SPEEDY truth
             label, path = spec.split("=", 1)
             saved = torch.load(path, map_location="cpu", weights_only=False)
@@ -118,7 +118,7 @@ def main() -> None:
 
         res = forced_response_eval(models, world, [points[i] for i in idx], test_actions(), args.eval_steps,
                                    args.members_eval, args.device, done=done, save=save)
-        res["checkpoints"] = {"init": args.init, **dict(s.split("=", 1) for s in args.models)}
+        res["checkpoints"] = {"start": args.init, **dict(s.split("=", 1) for s in args.models)}
         with open(path, "w") as f:
             json.dump(res, f)
         os.remove(path + ".progress")

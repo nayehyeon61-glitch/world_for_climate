@@ -444,6 +444,9 @@ def forced_response_eval(models, world: SequentialWorld, points: Sequence[dt.dat
     `models`: one model or {label: model}; `done`/`save` resume per branch point."""
     if not isinstance(models, dict):
         models = {"model": models}
+    clash = set(models) & {"init", "action", "held_out", "snr", "zero_error"}
+    if clash:
+        raise ValueError(f"model labels {clash} clash with the row keys")
     for m in models.values():
         m.eval()
         attach_loss(m)
