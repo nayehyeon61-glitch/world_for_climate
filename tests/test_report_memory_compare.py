@@ -42,5 +42,5 @@ def test_report(tmp_path):
     assert "not supported (memory cold below ClimODE at 24 h on 1 of 4 variables)" in text  # 12 < 193 only
     assert "warm 1, warm_no_memory 0 of 31" in text
     assert "| z500 | 24 h | 24 | 48 | 36 | 1.50x | 0.75x |" in text
-    assert "supported (memory / nudging on the cap: 6 h 0.75x, 24 h 0.75x, 72 h 0.75x, 120 h 0.75x)" in text
+    assert "supported (memory / nudging on the cap: 6 h 0.75x, 24 h 0.75x, 72 h 0.75x, 120 h 0.75x; blow-ups" in text
     assert "no crossing within the forecast (memory / GraphCast on the cap: 6 h 1.50x" in text
