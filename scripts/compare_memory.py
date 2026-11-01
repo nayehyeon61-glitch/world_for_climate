@@ -398,7 +398,8 @@ def main():
     parser.add_argument("--spinup", type=int, default=40,
                         help="re-observed 6 h steps before each initialisation (40 = 10 days, as the climate "
                              "evaluation of stage 10)")
-    parser.add_argument("--variants", nargs="*", default=list(VARIANTS), choices=list(VARIANTS))
+    parser.add_argument("--variants", nargs="*", default=["warm", "warm_no_memory"], choices=list(VARIANTS),
+                        help="nudging needs --base; ignored with --fill continuous")
     parser.add_argument("--fill", choices=["spinup", "continuous"], default="spinup",
                         help="continuous: one pass from --fill-start with the memory carried (variant 'fill')")
     parser.add_argument("--fill-start", default=None, help="e.g. 2018-01-01 (the fill of 2020 then holds two years)")
@@ -454,7 +455,7 @@ def main():
     summary = {"spinup_steps": args.spinup, "inits": int(len(usable)), "variants": {}}
     variants = list(args.variants)
     base = None
-    if "nudging" in variants:
+    if "nudging" in variants and args.fill != "continuous":
         if not args.base:
             parser.error("the nudging variant needs --base")
         bcfg, bstate, _ = pipeline.load_checkpoint(args.base, args.device)
