@@ -584,6 +584,25 @@ V = V_Lie + V_phys + V_noise 분해(수치예보의 역학 코어 + 모수화 �
 
 **2차 예측(사전 등록):** C1 `none`에서 D의 3–4주 주평균 오차가 N1 + nudging보다 3% 이상 낮음(기억이 느린 정보를 지님). C2 `region`에서 1–2주 숨은 점 오차가 5% 이상 낮음. C3 D-memctrl이 3–4주에서 D보다 낮음(제어가 느린 기억을 돕는다). C4 3–4주에는 어느 변형도 기후값을 넘지 못함(자유 예측의 표류; 넘으면 C1과 함께 강한 증거).
 
+### 10.1 기억 모델을 GraphCast·ClimODE와 비교 (`stage10_memory/compare.md`)
+
+**요청 (감자, 11/01 08:57):** "기억 좋네요. 이걸 이제 한번 graph cast나 climate ode와 비교하면?"
+
+**틀:** 9단계와 같은 GraphCast 규약입니다. WB2 5.625°, 한 해 31개 초기 시각(12일 간격, 00 UTC), 6시간 간격으로 120시간, 위도 가중 RMSE·ACC(물리 단위), GraphCast는 WB2의 0.25° 예보를 5.625°로 평균한 것. 비교 대상은 기억 모델 D-noactor(N1 + 기억 커널, 2018–19 게임으로 미세조정, 행위자 없음)입니다.
+- 연도: 기억 모델은 2018–19를 봤으므로 2018은 그 모델에게 학습 연도입니다. 주 비교는 2020년(N1·기억 모델 모두 홀드아웃)으로 하고, 2018은 ClimODE(검증 2017–18)와 줄을 맞추려고 참고로만 돕니다.
+- 콜드스타트 (`scripts/compare_graphcast.py`): 기억을 비운 채(m = 0) 초기 시각에서 자유 예측. 9단계 N0·N1과 같은 코드 경로.
+- 웜스타트 (`scripts/compare_memory.py`): 초기 시각 전 10일(40걸음) 동안 "한 걸음 예측 → 참값 전부 재관측(사후 규칙, 혁신이 기억으로)"을 되풀이해 기억을 채운 뒤, 같은 초기 시각에서 120시간 자유 예측. 같은 `pipeline.evaluate`로 채점하므로 콜드·GraphCast·지속성·기후값과 초기 시각이 짝지어집니다. 폭주한 표본은 그 시점부터 마지막 유한 예보를 유지하고 횟수를 따로 셉니다.
+- 원인 절제: `warm_no_memory`(스핀업과 자유 예측 모두 기억 커널을 끔)는 스핀업 자체의 통제군입니다. 재관측된 참값에서 출발하므로 칼럼 모델의 콜드스타트와 같아야 합니다. 그래서 (웜 − 콜드) = 채워진 기억의 효과, (웜 − 웜-기억끔) = 커널의 효과, (웜-기억끔 − 콜드) = 코드 경로 차이(≈ 0이어야).
+- ClimODE (Verma, Heinonen, Garg, ICLR 2024, 표 6): 같은 5.625° 격자, 6시간 간격, 학습 2006–15(10년), 검증 2017–18, z500·t850·t2m·u10·v10의 6–36시간 RMSE. 간접 비교입니다(학습 연도 10 대 3 + 2, 검증 연도가 다름, 변수별 최소최대 정규화로 학습).
+
+**판정 규칙 (사전 등록):**
+- C1 기억이 예보 자체를 돕는다: 24시간에서 웜이 콜드보다 RMSE 3% 이상 낮고(z500·t850·t2m·u10 평균), 웜-기억끔은 콜드의 1% 안.
+- C2 리드: 웜의 이득이 1% 아래로 떨어지는 리드(채워진 기억이 더는 작용하지 않는 시점).
+- C3 GraphCast: 24·72시간 RMSE 비. 1.5배 이하면 GraphCast급인데, 이 단계의 어떤 모델도 거기 이르리라 기대하지 않습니다.
+- C4 ClimODE (간접): 2018년 24시간에서 콜드 기억 모델의 RMSE가 ClimODE 공개값보다 4개 변수(z500·t850·t2m·u10) 중 3개 이상에서 낮음.
+
+**결과:** 실행 중 (콜드 2020 → 웜 2020 → 2018; 11/01 ~14:00 KST).
+
 ---
 
 ## 11단계 — 신경 연산자 묶음과 강화학습 선택 (`stage11_operator_bank/`)
@@ -639,6 +658,15 @@ python scripts/train_dreamer.py --checkpoint runs/physics_n1/checkpoint.pt --con
                                                   # D-frozen: --checkpoint runs/stage10_Dnoactor/checkpoint.pt --set dreamer.train_model=false
 python scripts/eval_dreamer.py --checkpoint runs/stage10_D/checkpoint.pt --base runs/physics_n1/checkpoint.pt \
     --config configs/dreamer_wb2.yaml --data-dir DATA2020 --out runs/stage10_D/eval_2020.json
+# 10.1 GraphCast·ClimODE 비교 (2020: DATA2020에 graphcast.zarr; 2018: --data-dir DATA에 data.*/eval.climatology_zarr 덮어쓰기)
+python scripts/compare_graphcast.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --data-dir DATA2020 \
+    --init-stride 6 --lead-steps 20 --out runs/stage10_Dnoactor/compare_graphcast_2020.json     # 콜드; N1도 같은 명령
+python scripts/compare_memory.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --data-dir DATA2020 \
+    --init-stride 6 --lead-steps 20 --spinup 40 --variants warm warm_no_memory --out runs/stage10_Dnoactor/compare_memory_2020.json
+python scripts/report_memory_compare.py --cold2020 memory=runs/stage10_Dnoactor/compare_graphcast_2020.json \
+    n1=runs/physics_n1/compare_graphcast_2020.json --warm2020 runs/stage10_Dnoactor/compare_memory_2020.json \
+    --cold2018 memory=runs/stage10_Dnoactor/compare_graphcast_2018.json n1=runs/physics_n1/compare_graphcast.json \
+    n0=runs/physics_n0/compare_graphcast.json --out docs/results/stage10_memory/compare.md
 # 1단계
 python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA              # chain
 python scripts/train.py --config configs/wb2_64x32.yaml --data-dir DATA \
