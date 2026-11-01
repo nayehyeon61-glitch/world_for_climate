@@ -198,6 +198,8 @@ Further variants of the same protocol (RMSE on the cap as a ratio to N1 + nudgin
 | readout max 0.5 | 31 | 1.25x | 4.51x | blown | blown | 1.04x | 6.37x | blown | blown | 1.24x | 6.24x | blown | blown | 1.04x | 2.21x | blown | blown |
 | readout max 1 | 31 | 1.25x | 6.26x | 3.83x | 2.89x | 1.04x | 8.18x | 5.10x | 4.23x | 1.24x | 7.38x | 3.95x | 2.83x | 1.04x | 2.36x | 1.70x | 1.53x |
 | readout max 2 | 31 | 1.25x | blown | blown | blown | 1.04x | blown | blown | blown | 1.24x | blown | blown | blown | 1.04x | blown | blown | blown |
+| readout decay 1 | 28 | 1.25x | 3.81x | 2.80x | 2.41x | 1.04x | 4.70x | 2.78x | 2.46x | 1.24x | 4.58x | 2.88x | 2.13x | 1.04x | 1.70x | 1.32x | 1.20x |
+| readout decay 3 | 31 | 1.25x | 6.86x | blown | blown | 1.04x | 7.22x | blown | blown | 1.24x | 6.62x | blown | blown | 1.04x | 2.45x | blown | blown |
 
 
 ## Fill length: 10 days, 30 days, two years (2020)
