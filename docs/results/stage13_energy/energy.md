@@ -124,6 +124,17 @@ The energy terms over the four steps before a blow-up, against the same leads of
 | region:flux500_nowork | largest work of a column | 193 | 8.99 | 21.4 |
 | region:flux500_nowork | clamped fraction | 0.0402 | 0.0367 | 1.1 |
 
+## E2: free runs under the bounds (2020, 10 initialisations, 120 h)
+
+Blow-ups per start kind and setting; the error ratio against the unbounded model over the initialisations finite in both (GraphCast-weighted all-point MSE, normalised units); the energy terms are means over the run (W/m^2).
+
+| start | setting | blow-ups | error ratio vs none (24 / 72 / 120 h) | heating | moistening | work | largest flux | clamped |
+|---|---|---|---|---|---|---|---|---|
+| none | none | 0/10 | reference | 13.8 | 15.1 | -1.66 | 1519 | 0.0% |
+| none | flux500_nowork | 0/10 | 0.993 / 0.924 / 0.875 (n=10) | 17.2 | 16.2 | -1.43 | 1413 | 14.6% |
+| region | none | 0/10 | reference | 26.8 | 14.7 | -1.53 | 1821 | 0.0% |
+| region | flux500_nowork | 0/10 | 1.027 / 0.981 / 0.954 (n=10) | 35.9 | 14.6 | -1.40 | 1879 | 15.4% |
+
 ## The stage 10 game on region masks, D-noactor, without and with the bound (31 initialisations, 2020)
 
 | variant | blow-ups without | blow-ups with | 24 h hidden error without | with |
@@ -138,13 +149,31 @@ The energy terms over the four steps before a blow-up, against the same leads of
 | no_moistening | 8 | 8 | 18 | 18 | - | - |
 | no_heating | 0 | 0 | - | - | -35.8% | -36.2% |
 
+## The corrector arms against E1 (same initialisations)
+
+Each arm is a checkpoint and the setting it runs under; the ratio is the all-point MSE of the arm over E1 on the initialisations finite in both (< 1 = the arm is better).
+
+| arm | checkpoint : setting | start | blow-ups | error ratio (24 / 72 / 120 h) | n |
+|---|---|---|---|---|---|
+| E1 | stage10_Dnoactor : flux500_nowork | none | 2/10 | reference |  |
+| E1 | stage10_Dnoactor : flux500_nowork | region | 0/10 | reference |  |
+| E2 | stage13_E2 : flux500_nowork | none | 0/10 | 0.917 / 0.718 / 0.516 | 8 |
+| E2 | stage13_E2 : flux500_nowork | region | 0/10 | 1.013 / 0.888 / 0.700 | 10 |
+| E2 unbounded | stage13_E2 : none | none | 0/10 | 0.923 / 0.778 / 0.593 | 8 |
+| E2 unbounded | stage13_E2 : none | region | 0/10 | 0.986 / 0.906 / 0.733 | 10 |
+| none | stage10_Dnoactor : none | none | 5/10 | 1.021 / 1.174 / 1.584 | 4 |
+| none | stage10_Dnoactor : none | region | 2/10 | 0.981 / 1.056 / 1.238 | 8 |
+
 ## Decision rules
 
 - **B1** the bound (500 W/m^2 + no work) removes >= 80% of the blow-ups (region starts, cold memory, the moisture cut) and costs N1 <= 3% at 24 h  
   → not supported (removed 5 of 16 = +31.2%; memory none 5→2, memory region 2→0, game region 1→1, no_moistening 8→8; N1 24 h cost -0.1%)
 - **B4** the injecting term: a term's mean over the four steps before a blow-up is >= 2x the same leads of the finite runs  
   → supported (none:flux500: work_max x5.2; none:flux250: moist_mean x2.6; none:flux250: work_max x2.3; none:nowork: work_max x4.2; none:flux500_nowork: work_max x4.8; region:none: moist_mean x4.3; region:none: flux_max x2.7; region:none: work_max x4.7; region:nowork: heat_mean x2.3; region:nowork: moist_mean x44.3; region:nowork: work_mean x2.3; region:nowork: flux_max x2.6; region:nowork: work_max x3.8)
-- **B2** (E2 against E1) and **B3** (soft against hard) wait for the E2 / E3 arms.
+- **B2** E2 beats E1 by >= 3% at 72 h with no more blow-ups  
+  → supported (blow-ups 0 vs 2; 72 h ratio 0.803 = gain +19.7% on 18 finite pairs)
+- **B2** E2 unbounded beats E1 by >= 3% at 72 h with no more blow-ups  
+  → supported (blow-ups 0 vs 2; 72 h ratio 0.842 = gain +15.8% on 18 finite pairs)
 
 ## Direction
 
