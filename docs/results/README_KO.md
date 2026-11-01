@@ -693,9 +693,11 @@ R1이 지지되지 않고 O-soft가 같거나 나으면, 이 판에서는 선택
 - A5 기후: 기후 틀에서 policy의 1–2주 주평균 오차가 random보다 3% 이상 낮음. 3–4주는 보고만(C4처럼 어느 규칙도 기후값을 넘지 못하리라 예상).
 - A6 불변성: 2018–19(학습 연도) 15개 초기 시각과 2020의 패치별 선택 빈도의 순위상관 ≥ 0.7(정책이 연도가 아니라 규칙을 배움).
 
-**시간 (KST):** 구현·테스트 ~2h(11/01 12:30 완료), 학습 P ~1.7h(1스레드 부업, 체인 4 뒤 ~13:30부터), 게임 평가 ~1.5h, 기후 평가 ~1.5h, P-nomem 학습·평가 ~3h → 보고 11/02 저녁(앞당겨지면 11/01 밤).
+**설계 수정 (11/01 12:40 KST, 학습 시작 직후):** 예산 25%(18개 패치 숨김)에서는 얼린 세계 모델의 사후분포가 첫 반복에서 8/8 멤버 모두 폭주해(36시간 안) 보상이 전부 상한이고 학습 신호가 없습니다. 13단계 E1 바운드(500 W/m² + 일 금지)를 걸어도 8/8, 예산 50%는 4–6/8, 예산 75%(6개 숨김 = 10단계 학습 분포의 영역 캡 25%)는 0/8(자유 오차 0.41–0.54)였습니다. 그래서 **본 예산을 75%(18개 관측, 6개 숨김)로 바꾸고 절제 예산을 50%·87.5%로, 모든 12단계 실행(기억 모델·N1)에 E1 바운드를 겁니다.** 정책이 고르는 것은 "어느 18개를 볼 것인가" = "어느 6개를 안 볼 것인가"로 같은 기계(Plackett–Luce)입니다. 판정 규칙 A1–A6은 그대로이고, 예산 절제는 "예산이 줄수록 선택의 값이 커지는가, 아니면 모델이 무너지는가"를 읽습니다. 이 폭주는 10.1 관측 공급 시험의 31/31과 같은 현상(판독 되먹임)이며, E2 보정자(13단계)가 되면 25% 예산을 다시 시도합니다.
 
-**결과:** 실행 대기.
+**시간 (KST):** 구현·테스트 ~2h(11/01 12:30 완료), 학습 P 100회 × ~51 s ≈ 1.5h(1스레드 부업, 12:45부터), 게임 평가 ~1.5h, 기후 평가 ~1.5h, P-nomem 학습·평가 ~3h → 보고 11/02 아침(2 h 재시작 포함).
+
+**결과:** 실행 중.
 
 ---
 
@@ -783,12 +785,13 @@ python scripts/report_energy.py --energy memory=runs/stage10_Dnoactor/energy_202
     --game runs/stage10_Dnoactor/eval_2020.json runs/stage10_Dnoactor/eval_2020_energy.json \
     --causes runs/physics_n1/causes_2020.json runs/physics_n1/causes_2020_energy.json --out docs/results/stage13_energy/energy.md
 # 12단계 (얼린 D-noactor 위; DATA2020)
+BOUND="model.column.energy_max_flux=500 model.column.energy_no_work=true"   # every stage 12 job (amendment 12:40 KST 11/01)
 python scripts/train_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --config configs/active_obs_wb2.yaml \
-    --data-dir DATA2020 --out runs/stage12_P            # P-nomem: --set policy.use_memory=false
+    --data-dir DATA2020 --out runs/stage12_P --set $BOUND            # P-nomem: --set $BOUND policy.use_memory=false
 python scripts/eval_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt --base runs/physics_n1/checkpoint.pt \
     --policy runs/stage12_P/policy.pt --config configs/active_obs_wb2.yaml --data-dir DATA2020 --mode game \
-    --budgets 0.25 0.125 0.5 --out runs/stage12_P/game_2020.json   # 2018-19: --split train --inits 15
-python scripts/eval_active_obs.py ... --mode climate --inits 8 --rules policy random full none --base-rules policy random \
+    --budgets 0.75 0.5 0.875 --set $BOUND --out runs/stage12_P/game_2020.json   # 2018-19: --split train --inits 15
+python scripts/eval_active_obs.py ... --mode climate --inits 8 --rules policy random full none --base-rules policy random --set $BOUND \
     --out runs/stage12_P/climate_2020.json
 python scripts/report_active_obs.py --game runs/stage12_P/game_2020.json --game-train runs/stage12_P/game_2018_19.json \
     --climate runs/stage12_P/climate_2020.json --nomem runs/stage12_Pnomem/game_2020.json --history runs/stage12_P/train_history.json \
