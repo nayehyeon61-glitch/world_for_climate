@@ -100,7 +100,7 @@ class EpisodeSet:
     def tendency(self, e: int, times: Sequence[np.datetime64]) -> np.ndarray:
         """[T, 4 L, lat, lon] float32 in physical units (Q K/s, S kg/kg/s, F m/s^2)."""
         t = episode_tendencies(self.ds[e].sel(time=list(times)))
-        parts = [t[k].sel(level=self.levels).transpose("time", "level", "latitude", "longitude").values
+        parts = [t[k].sel(level=self.levels).transpose("time", "level", "lat", "lon").values
                  for k in TEND_KEYS]
         return np.concatenate(parts, 1).astype(np.float32)
 
@@ -125,8 +125,8 @@ class EpisodeSet:
         batch["tendency"] = torch.from_numpy(self.tendency(e, times))[None].to(device)
         iv = Intervention(**{k: v for k, v in self.specs[e]["intervention"].items() if k != "patches"})
         ds = self.ds[e]
-        sea = 1.0 - ds["land_sea_mask"].transpose("latitude", "longitude").values
-        batch["action"] = torch.from_numpy(action_field(iv, ds.latitude.values, ds.longitude.values,
+        sea = 1.0 - ds["land_sea_mask"].transpose("lat", "lon").values
+        batch["action"] = torch.from_numpy(action_field(iv, ds.lat.values, ds.lon.values,
                                                         sea))[None].to(device)
         batch["solar_factor"] = torch.tensor([iv.solar_factor], device=device)
         return batch
