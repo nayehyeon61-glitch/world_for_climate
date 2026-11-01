@@ -176,34 +176,45 @@ def observed_section(gc, nudging, memory, summ):
     leads = (6, 24, 72, 120)
     lines = [f"Hidden cap of {100 * summ.get('region_fraction', 0.25):.0f}% of the sphere per initialisation "
              f"(mean hidden weight {summ.get('hidden_fraction', float('nan')):.2f}); RMSE over the cap only. "
-             f"Blow-ups: {summ.get('blowups', '-')}.", "",
+             f"Blow-ups (of {summ.get('inits', '-')}): " + ", ".join(f"{k} {v.get('blowups', '-')}" for k, v in summ.get("variants", {}).items()) + ".", "",
              "| variable | lead | GraphCast (free) | N1 + nudging | memory (posterior) | memory / GraphCast | memory / nudging |",
              "|---|---|---|---|---|---|---|"]
     vs_gc, vs_nudge = {}, {}
+    # a blown-up sample keeps its last finite forecast, which can be astronomically large and
+    # dominate the mean: a lead whose memory / nudging ratio exceeds 100 is reported as blown
+    blown_lead = lambda m, n: not np.isfinite(m) or (np.isfinite(n) and n > 0 and m / n > 100)
     for var in VARS:
         for h in leads:
             g, n, m = rmse(gc, var, h), rmse(nudging, var, h), rmse(memory, var, h)
             if not np.isfinite(m):
+                continue
+            if blown_lead(m, n):
+                lines.append(f"| {SHORT[var]} | {h} h | {_f(g)} | {_f(n)} | blown | - | - |")
                 continue
             lines.append(f"| {SHORT[var]} | {h} h | {_f(g)} | {_f(n)} | {_f(m)} | {_f(m / g, 2)}x | {_f(m / n, 2)}x |")
             if var in HEADLINE:
                 vs_gc.setdefault(h, []).append(m / g)
                 vs_nudge.setdefault(h, []).append(m / n)
     all_leads = sorted({h for _, h in memory})
-    cross = [h for h in all_leads if np.isfinite(np.nanmean([rmse(memory, v, h) / rmse(gc, v, h) for v in HEADLINE]))
+    cross = [h for h in all_leads
+             if not any(blown_lead(rmse(memory, v, h), rmse(nudging, v, h)) for v in HEADLINE)
              and np.nanmean([rmse(memory, v, h) / rmse(gc, v, h) for v in HEADLINE]) < 1]
     return "\n".join(lines), {h: float(np.mean(v)) for h, v in vs_gc.items()}, {h: float(np.mean(v)) for h, v in vs_nudge.items()}, cross
 
 
-def verdicts(gains, knock_gain_24, ratios, below, obs=None):
+def verdicts(gains, knock_gain_24, ratios, below, obs=None, obs_blowups=None):
     out = {}
     if obs:
         vs_gc, vs_nudge, cross = obs
+        blow = f"; blow-ups {obs_blowups}" if obs_blowups else ""
         if 24 in vs_nudge:
             out["C5"] = (f"{'supported' if vs_nudge[24] <= 0.9 else 'not supported'} (memory / nudging on the cap: " +
-                         ", ".join(f"{h} h {r:.2f}x" for h, r in vs_nudge.items()) + ")")
+                         ", ".join(f"{h} h {r:.2f}x" for h, r in vs_nudge.items()) + blow + ")")
+        else:
+            out["C5"] = ("not supported (the memory model blew up before 24 h on most initialisations; 6 h ratio "
+                         + ", ".join(f"{r:.2f}x" for h, r in vs_nudge.items() if h == 6) + blow + ")")
         out["C6"] = ((f"crosses at {cross[0]} h" if cross else "no crossing within the forecast") +
-                     " (memory / GraphCast on the cap: " + ", ".join(f"{h} h {r:.2f}x" for h, r in vs_gc.items()) + ")")
+                     " (memory / GraphCast on the cap: " + ", ".join(f"{h} h {r:.2f}x" for h, r in vs_gc.items()) + blow + ")")
     if 24 in gains and np.isfinite(gains[24]):
         ok = gains[24] <= -0.03 and abs(knock_gain_24) <= 0.01
         out["C1"] = (f"{'supported' if ok else 'not supported'} (warm vs cold {_pct(gains[24])}, spin-up alone "
@@ -306,7 +317,8 @@ def main():
             text, vs_gc, vs_nudge, cross = observed_section(ow["graphcast"], on["model"], ow["model"], entry)
             md += [text, ""]
             obs = (vs_gc, vs_nudge, cross)
-    v = verdicts(gains, knock24, ratios, below, obs)
+            obs_blowups = {k: v.get("blowups") for k, v in osumm.get("variants", {}).items() if "blowups" in v}
+    v = verdicts(gains, knock24, ratios, below, obs, obs_blowups if obs else None)
     md += ["", "## Decision rules", ""]
     md += [f"- **{k}** {RULES[k]}  \n  → {v.get(k, 'pending')}" for k in RULES]
     if notes:

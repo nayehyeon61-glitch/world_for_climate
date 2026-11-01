@@ -148,6 +148,47 @@ ClimODE, FourCastNet, ClimaX and IFS as printed in Verma et al. (2024); ours on 
 | v10 | 36 h | 2.29 | 2.95 | 2.98 | - | 0.5495 | 4.326 | 2.486 | 2.905 |
 
 
+## Forecasts fed by observations outside a hidden cap (2020)
+
+Hidden cap of 25% of the sphere per initialisation (mean hidden weight 0.25); RMSE over the cap only. Blow-ups (of 31): warm 31, nudging 1.
+
+| variable | lead | GraphCast (free) | N1 + nudging | memory (posterior) | memory / GraphCast | memory / nudging |
+|---|---|---|---|---|---|---|
+| z500 | 6 h | 12.71 | 91.95 | 115 | 9.07x | 1.25x |
+| t850 | 6 h | 0.1041 | 0.8896 | 0.9243 | 8.88x | 1.04x |
+| t850 | 24 h | 0.3559 | 1.814 | blown | - | - |
+| t850 | 72 h | 0.7354 | 3.385 | blown | - | - |
+| t850 | 120 h | 1.234 | 4.134 | blown | - | - |
+| q700 | 6 h | 5.418e-05 | 0.0004268 | 0.0004353 | 8.04x | 1.02x |
+| q700 | 24 h | 0.0002585 | 0.0008577 | blown | - | - |
+| q700 | 72 h | 0.0005047 | 0.001497 | blown | - | - |
+| q700 | 120 h | 0.0007565 | 0.001916 | blown | - | - |
+| u850 | 6 h | 0.1466 | 1.686 | 1.719 | 11.72x | 1.02x |
+| u850 | 24 h | 0.6236 | 2.71 | blown | - | - |
+| u850 | 72 h | 1.368 | 4.309 | blown | - | - |
+| u850 | 120 h | 2.322 | 5.362 | blown | - | - |
+| t2m | 6 h | 0.2356 | 1.496 | 1.86 | 7.90x | 1.24x |
+| t2m | 24 h | 0.3219 | 2.399 | blown | - | - |
+| t2m | 72 h | 0.5439 | 5.207 | blown | - | - |
+| t2m | 120 h | 0.851 | 7.298 | blown | - | - |
+| msl | 6 h | 15.35 | 145 | 179 | 11.66x | 1.23x |
+| msl | 24 h | 41.27 | 344 | blown | - | - |
+| msl | 72 h | 118 | 802 | blown | - | - |
+| msl | 120 h | 230 | 1217 | blown | - | - |
+| u10 | 6 h | 0.1074 | 1.469 | 1.529 | 14.24x | 1.04x |
+| u10 | 24 h | 0.4084 | 2.735 | blown | - | - |
+| u10 | 72 h | 0.9547 | 3.945 | blown | - | - |
+| u10 | 120 h | 1.674 | 4.512 | blown | - | - |
+| v10 | 6 h | 0.1125 | 1.531 | 1.598 | 14.20x | 1.04x |
+| v10 | 24 h | 0.4303 | 2.84 | blown | - | - |
+| v10 | 72 h | 1.04 | 3.981 | blown | - | - |
+| v10 | 120 h | 1.824 | 4.466 | blown | - | - |
+| tp6 | 6 h | 0.0002564 | 0.0008828 | 0.000973 | 3.79x | 1.10x |
+| tp6 | 24 h | 0.0004431 | 0.001048 | 0.002123 | 4.79x | 2.03x |
+| tp6 | 72 h | 0.000719 | 0.001289 | 0.002412 | 3.35x | 1.87x |
+| tp6 | 120 h | 0.0009066 | 0.001423 | 0.002398 | 2.64x | 1.68x |
+
+
 ## Decision rules
 
 - **C1** memory helps the forecast itself: the warm start lowers the cold start's RMSE by >= 3% at 24 h (mean over z500, t850, t2m, u10) while warm_no_memory stays within 1% of the cold start  
@@ -159,6 +200,6 @@ ClimODE, FourCastNet, ClimaX and IFS as printed in Verma et al. (2024); ours on 
 - **C4** ClimODE (indirect): on 2018 at 24 h the cold memory model's RMSE is below ClimODE's published RMSE on >= 3 of z500, t850, t2m, u10 (2018 is a fine-tuning year of the memory model; ClimODE's test years are 2017-2018 after ten training years)  
   → not supported (memory cold below ClimODE at 24 h on 0 of 5 variables)
 - **C5** observations (감자 09:49): with the points outside a hidden cap re-observed every 6 h, the memory model's RMSE on the cap is >= 10% below N1 + nudging at 24 h (mean over z500, t850, t2m, u10; the stage 10 P1 in physical units)  
-  → pending
+  → not supported (the memory model blew up before 24 h on most initialisations; 6 h ratio 1.14x; blow-ups {'warm': 31, 'nudging': 1})
 - **C6** crossing: the first lead at which the observation-fed memory model beats GraphCast's free forecast on the cap (mean ratio < 1), if any within 120 h  
-  → pending
+  → no crossing within the forecast (memory / GraphCast on the cap: 6 h 10.02x; blow-ups {'warm': 31, 'nudging': 1})
