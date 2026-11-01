@@ -19,6 +19,14 @@ the free run then starts from the re-observed truth, so this is the column
 model's cold start under the warm-start code path, the control for the spin-up
 itself). A sample whose state blows up keeps its last finite forecast from then
 on (counted in the summary); the cold start lets non-finite values through.
+
+`--fill continuous --fill-start 2018-01-01` fills the memory with one
+continuous pass instead: from `fill-start` to the last initialisation the model
+makes one-step forecasts and re-observes the full truth, the memory carried
+across consecutive windows (the pass is resumable), and m is snapshotted at
+each initialisation; the free run then starts from the snapshot. With a kernel
+whose time scales are bounded (tau <= 10 days in stage 10) this should equal a
+spin-up of a month or more (saturation); it is the fill of a long-memory kernel.
 """
 
 import argparse
@@ -123,6 +131,132 @@ class WarmStart:
         return pred[None].expand(members, *pred.shape)
 
 
+def _finite_rows(state) -> torch.Tensor:
+    """[B] whether every state tensor of the sample is finite."""
+    return torch.stack([torch.isfinite(v).flatten(1).all(1) for v in state.values()]).all(0).cpu()
+
+
+class ContinuousFill:
+    """Memory states at the wanted initialisation times from one continuous pass
+    of fully re-observed one-step forecasts from `start`: the memory is carried
+    across consecutive windows of `chunk` steps (the dynamic state restarts
+    from the truth at every step anyway, so a window boundary is not a restart
+    of the memory), and m is snapshotted after the re-observation at each
+    wanted time. `path`: the pass is saved there after every window and
+    continued from it. A non-finite memory restarts from zero (counted)."""
+
+    def __init__(self, model, ds, layout, stats, start: str, wanted, chunk: int = 120, knock=(),
+                 device="cpu", path: str = None, log=None):
+        self.model, self.device, self.knock = model, device, set(knock)
+        self.snaps: Dict[int, torch.Tensor] = {}
+        self.resets = 0
+        self.wanted = sorted(int(t) for t in wanted)
+        t0 = int(np.datetime64(start).astype("datetime64[s]").astype(np.int64))
+        last = self.wanted[-1]
+        if t0 >= last:
+            raise ValueError("the fill must start before the first initialisation")
+        self.segments = []  # (start seconds, steps)
+        t = t0
+        while t < last:
+            n = min(chunk, (last - t) // STEP_S)
+            self.segments.append((t, n))
+            t += n * STEP_S
+        self.datasets = {n: GraphCastWindowDataset(ds, layout, stats, n, start=str(np.datetime64(t0, "s")))
+                         for n in {n for _, n in self.segments}}
+        self.starts = {n: {_seconds(d, i): j for j, i in enumerate(d.indices)} for n, d in self.datasets.items()}
+        self.path = path
+        self.run(log)
+
+    def run(self, log=None):
+        model, mask = self.model, None
+        t2d = model.layout.target_to_dynamic
+        mem, done = None, 0
+        if self.path and os.path.exists(self.path):
+            saved = torch.load(self.path, weights_only=False)
+            mem, done, self.snaps, self.resets = saved["mem"], saved["done"], saved["snaps"], saved["resets"]
+            if log is not None:
+                log(f"[fill] resumed after {done}/{len(self.segments)} windows")
+        kernel = model.memory
+        kernel.knock = set(self.knock)
+        try:
+            with torch.no_grad():
+                for s, (t, n) in enumerate(self.segments):
+                    if s < done:
+                        continue
+                    j = self.starts[n].get(t)
+                    if j is None:
+                        raise ValueError(f"no window of {n} steps starts at {np.datetime64(t, 's')}")
+                    item = self.datasets[n][j]
+                    batch = {k: v[None].to(self.device) for k, v in item.items()}
+                    state, ctx = model.begin(batch)
+                    if mask is None:
+                        mask = torch.zeros_like(batch["inputs"][:, -1])
+                    if mem is None:  # the start of the pass: as play_memory
+                        snap = batch["inputs"][:, -1]
+                        state = model.posterior(state, ctx, snap, snap, mask)
+                    else:
+                        state["mem"] = mem
+                    for k in range(n):
+                        state, precip = model.advance(state, ctx, k)
+                        pred = model.predict(state, ctx, k, precip)
+                        truth = batch["targets"][:, k][:, t2d]
+                        state = model.posterior(state, ctx, torch.nan_to_num(pred[:, t2d]), truth, mask)
+                        if not torch.isfinite(state["mem"]).all():
+                            state["mem"] = torch.zeros_like(state["mem"])
+                            self.resets += 1
+                        tk = t + (k + 1) * STEP_S
+                        if tk in self.wanted:
+                            self.snaps[tk] = state["mem"].detach().cpu().clone()
+                    mem = state["mem"]
+                    if self.path:
+                        torch.save({"mem": mem, "done": s + 1, "snaps": self.snaps, "resets": self.resets},
+                                   self.path + ".tmp")
+                        os.replace(self.path + ".tmp", self.path)
+                    if log is not None:
+                        log(f"[fill] {s + 1}/{len(self.segments)} windows ({np.datetime64(t + n * STEP_S, 's')}), "
+                            f"{len(self.snaps)} snapshots, {self.resets} memory resets")
+        finally:
+            kernel.knock = set()
+        missing = [t for t in self.wanted if t not in self.snaps]
+        if missing:
+            raise RuntimeError(f"no snapshot for {len(missing)} initialisations, e.g. {np.datetime64(missing[0], 's')}")
+
+
+class FilledStart(WarmStart):
+    """The free run from a ContinuousFill snapshot of the memory (no spin-up)."""
+
+    def __init__(self, model, snaps: Dict[int, torch.Tensor], knock=(), cap: float = 10.0, blown_path: str = None):
+        super().__init__(model, 0, knock, cap, blown_path)
+        self.snaps = snaps
+
+    @torch.no_grad()
+    def rollout(self, batch: Dict[str, torch.Tensor], steps: int, members: int = 1, **_) -> torch.Tensor:
+        model, x = self.model, batch["inputs"]
+        inits = batch["init_time"].cpu().tolist()
+        mem_k = model.memory
+        mem_k.knock = set(self.knock)
+        try:
+            state, ctx = model.begin(batch)
+            state["mem"] = torch.cat([self.snaps[t] for t in inits]).to(x.device)
+            snap = x[:, -1]
+            state = model.posterior(state, ctx, snap, snap, torch.zeros_like(snap))  # as play_memory's start
+            preds, last, blown = [], None, torch.zeros(len(inits), dtype=torch.bool)
+            for k in range(steps):
+                state, precip = model.advance(state, ctx, k)
+                pred = model.predict(state, ctx, k, precip).float().cpu()
+                blown |= ~(torch.isfinite(pred).flatten(1).all(1) & _finite_rows(state))
+                pred = torch.nan_to_num(pred) if last is None else torch.where(blown[:, None, None, None], last, pred)
+                last = pred
+                preds.append(pred)
+        finally:
+            mem_k.knock = set()
+        if self.blown_path:
+            with open(self.blown_path, "a") as f:
+                f.write(json.dumps({"init": inits, "blown": blown.tolist()}) + "\n")
+        pred = torch.stack(preds, 1).to(x.device)
+        return pred[None].expand(members, *pred.shape)
+
+
 def _blowups(path: str) -> int:
     if not os.path.exists(path):
         return 0
@@ -145,6 +279,10 @@ def main():
                         help="re-observed 6 h steps before each initialisation (40 = 10 days, as the climate "
                              "evaluation of stage 10)")
     parser.add_argument("--variants", nargs="*", default=list(VARIANTS), choices=list(VARIANTS))
+    parser.add_argument("--fill", choices=["spinup", "continuous"], default="spinup",
+                        help="continuous: one pass from --fill-start with the memory carried (variant 'fill')")
+    parser.add_argument("--fill-start", default=None, help="e.g. 2018-01-01 (the fill of 2020 then holds two years)")
+    parser.add_argument("--fill-chunk", type=int, default=120, help="window length of the pass (steps)")
     parser.add_argument("--cap", type=float, default=10.0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", required=True, help="OUT_<variant>.json per variant, OUT_summary.json")
@@ -186,10 +324,23 @@ def main():
     print(f"{len(usable)} initialisations ({t(usable[0])} .. {t(usable[-1])}), spin-up {args.spinup} steps")
     index = {c.key: i for i, c in enumerate(layout.targets)}
     summary = {"spinup_steps": args.spinup, "inits": int(len(usable)), "variants": {}}
-    for name in args.variants:
+    variants = list(args.variants)
+    if args.fill == "continuous":
+        if not args.fill_start:
+            parser.error("--fill continuous needs --fill-start")
+        wanted = data.init_seconds()[usable]
+        fill = ContinuousFill(model, ds, layout, stats, args.fill_start, wanted, args.fill_chunk, device=args.device,
+                              path=args.out.replace(".json", "_fill_pass.pt"), log=print)
+        summary.update({"fill_start": args.fill_start, "fill_chunk": args.fill_chunk, "memory_resets": fill.resets,
+                        "spinup_steps": None})
+        variants = ["fill"]
+    for name in variants:
         out = args.out.replace(".json", f"_{name}.json")
         blown = out.replace(".json", "_blown.jsonl")
-        wrapper = WarmStart(model, args.spinup, VARIANTS[name], args.cap, blown)
+        if name == "fill":
+            wrapper = FilledStart(model, fill.snaps, (), args.cap, blown)
+        else:
+            wrapper = WarmStart(model, args.spinup, VARIANTS[name], args.cap, blown)
         progress = out + ".progress.pt" if args.resume else None
         if not args.resume and os.path.exists(blown):
             os.remove(blown)

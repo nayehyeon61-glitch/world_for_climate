@@ -1,6 +1,7 @@
 import os
 import sys
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -38,3 +39,31 @@ def test_warm_start_pairs_the_windows_and_the_memory_changes_the_free_run():
     assert model.memory.knock == set()  # restored
     with torch.no_grad():  # the same free run twice: the spin-up is deterministic
         assert torch.allclose(WarmStart(model, 3).rollout(batch, 2)[0], warm[0])
+
+
+def test_continuous_fill_snapshots_the_memory_at_the_initialisations(tmp_path):
+    from compare_memory import ContinuousFill, FilledStart
+    layout, stats, data = _tiny()
+    ds = make_synthetic_era5(num_days=6, num_lat=9, num_lon=16, levels=(500, 850))
+    short = GraphCastWindowDataset(ds, layout, stats, target_steps=2)
+    inits = [int(short.times[short.indices[k]].astype("datetime64[s]").astype("int64")) for k in (10, 14)]
+    model = _mem_model(layout, stats, data, {"channels": 4, "hidden": 8})
+    torch.manual_seed(1)
+    for p in model.memory.parameters():
+        p.data.normal_(0, 0.3)
+    start = str(short.times[0].astype("datetime64[s]") + np.timedelta64(6, "h"))
+    path = str(tmp_path / "pass.pt")
+    fill = ContinuousFill(model, ds, layout, stats, start, inits, chunk=4, path=path)
+    assert sorted(fill.snaps) == sorted(inits) and fill.resets == 0
+    assert [n for _, n in fill.segments] == [4, 4, 4, 2]  # 14 steps from the start to the last initialisation
+    for m in fill.snaps.values():
+        assert m.shape[1] == 4 and torch.isfinite(m).all()
+    assert not torch.allclose(fill.snaps[inits[0]], fill.snaps[inits[1]])
+    again = ContinuousFill(model, ds, layout, stats, start, inits, chunk=4, path=path)  # resumed from the file
+    assert torch.equal(again.snaps[inits[1]], fill.snaps[inits[1]])
+
+    batch = {k: v[None] for k, v in short[14].items()}
+    filled = FilledStart(model, fill.snaps).eval().rollout(batch, 2, members=2)
+    assert filled.shape == (2, 1, 2, len(layout.targets), 9, 16) and torch.isfinite(filled).all()
+    empty = FilledStart(model, {inits[1]: torch.zeros_like(fill.snaps[inits[1]])}).rollout(batch, 2)
+    assert not torch.allclose(filled[0], empty[0])  # the filled memory acts on the free run
