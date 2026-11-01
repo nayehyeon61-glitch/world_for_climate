@@ -76,7 +76,7 @@ def game_section(g: dict, title: str) -> List[str]:
         lines.append(f"| {name} | {r['budget']:g} | " + " | ".join(f"{r['mse'][i]:.3f}" for i in idx)
                      + f" | {free_mean(r, obs):.3f} | {_ci(ch['free']) if ch else 'reference'} | {r['blowups']} | "
                      + (f"{r['freq_entropy']:.2f}" if np.isfinite(r['freq_entropy']) else "-")
-                     + f" | {rho:+.2f} |" if np.isfinite(rho) else f" | - |")
+                     + (f" | {rho:+.2f} |" if np.isfinite(rho) else " | - |"))   # 11/01: precedence bug dropped the row
     lines += ["", "Headline RMSE (physical units) at 24 / 72 / 120 h:", "",
               "| run | " + " | ".join(HEAD[k] for k in g["keys"] if k in HEAD) + " |",
               "|---" * (1 + sum(k in HEAD for k in g["keys"])) + "|"]
