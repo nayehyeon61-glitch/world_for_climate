@@ -138,8 +138,11 @@ def test_dreamer_training_and_eval(setup, arm, tmp_path):
     hist2 = train_dreamer(model2, ctrl2, heads2, loader, cfg, progress=saved[0])
     assert len(hist2) == 2 and abs(hist2[1]["hidden"] - hist[1]["hidden"]) < 1e-5
     res = evaluate_memory_game(model, ctrl if cfg.train_actor else None, base, data, [0, 1], ["region"], 2,
-                               obs_prob=1.0)
+                               obs_prob=1.0, progress_path=str(tmp_path / "eval.progress"))
     ch = res["kinds"]["region"]["change"]
+    again = evaluate_memory_game(model, ctrl if cfg.train_actor else None, base, data, [0, 1], ["region"], 2,
+                                 obs_prob=1.0, progress_path=str(tmp_path / "eval.progress"))  # resumes
+    assert again["kinds"]["region"]["mse"] == res["kinds"]["region"]["mse"]
     assert "full_hidden" in ch and "game_rule_hidden" in ch and "nudging_hidden" not in ch
     if model.memory is not None and model.memory.cfg.adaptive:
         assert len(res["log10_tau_hours_zonal"]) == 8

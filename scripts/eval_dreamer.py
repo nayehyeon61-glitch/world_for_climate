@@ -91,7 +91,8 @@ def main():
     print(f"{len(indices)} initialisations ({first} .. {last}), kinds {args.kinds}, variants {variants}, "
           f"actor {'yes' if ctrl is not None else 'no'}, memory {cfg['model'].get('memory')}")
     res = evaluate_memory_game(model, ctrl, base, data, indices, args.kinds, dc.horizon, dc.obs_prob,
-                               args.device, variants=variants, region_fraction=dc.region_fraction, log=print)
+                               args.device, variants=variants, region_fraction=dc.region_fraction, log=print,
+                               progress_path=args.out + ".progress")
     res.update(checkpoint=args.checkpoint, base=args.base, split=args.split, period=[str(first), str(last)],
                inits=len(indices))
     for kind, r in res["kinds"].items():

@@ -634,7 +634,8 @@ REFERENCE = "nudging"
 def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset, indices: Sequence[int],
                          kinds: Sequence[str], horizon: int, obs_prob: float, device="cpu",
                          variants: Sequence[str] = tuple(VARIANTS), seed: int = 0,
-                         region_fraction: float = 0.25, log=None, cap: float = 10.0) -> Dict[str, object]:
+                         region_fraction: float = 0.25, log=None, cap: float = 10.0,
+                         progress_path: Optional[str] = None) -> Dict[str, object]:
     """Masked-game errors per kind and lead for the trained model (`model`,
     `ctrl`), its knock-outs and the baselines on the stage 9 model (`base`),
     paired over initialisations; changes are relative to nudging on `base`.
@@ -642,7 +643,10 @@ def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset,
     and is counted in "blowups"
     (`base` None: no baselines and no changes; the per-initialisation errors
     let a report pair runs with the same `indices` and `seed`). Also returns
-    the learned timescales (log10 hours) of the full model."""
+    the learned timescales (log10 hours) of the full model. With `progress_path`
+    every finished initialisation is saved there and an existing file is
+    continued (the evaluations outlive the 2 h background limit)."""
+    import os
     model.eval()
     if base is not None:
         base.eval()
@@ -650,11 +654,20 @@ def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset,
     out: Dict[str, object] = {"lead_h": [6 * (k + 1) for k in range(horizon)], "obs_prob": obs_prob,
                               "reference": REFERENCE, "variants": variants, "kinds": {}}
     tau_track: list = []
+    saved: Dict[str, dict] = {}
+    if progress_path is not None and os.path.exists(progress_path):
+        saved = torch.load(progress_path, weights_only=False)
+        tau_track = list(saved.pop("_tau_track", []))
+        if log is not None:
+            log("[memory game eval] resumed: " + ", ".join(f"{k} {len(v['labels'])}" for k, v in saved.items()))
     for kind in kinds:
-        rows: Dict[str, List[Tensor]] = {}
-        labels = []
-        blowups: Dict[str, int] = {}
+        prev = saved.get(kind, {"rows": {}, "labels": [], "blowups": {}})
+        rows: Dict[str, List[Tensor]] = {k: list(v) for k, v in prev["rows"].items()}
+        labels = list(prev["labels"])
+        blowups: Dict[str, int] = dict(prev["blowups"])
         for n, i in enumerate(indices):
+            if n < len(labels):
+                continue
             item = dataset[int(i)]
             batch = {k: v[None].to(device) for k, v in item.items()}
             gen = torch.Generator().manual_seed(seed + 1000 * n)
@@ -679,6 +692,11 @@ def evaluate_memory_game(model, ctrl: Optional[MemoryController], base, dataset,
                     m.memory.knock, m.memory.track = set(), None
                 rows.setdefault(f"{name}_hidden", []).append(h[0])
                 rows.setdefault(f"{name}_all", []).append(a[0])
+            if progress_path is not None:
+                saved[kind] = {"rows": {k: [x.cpu() for x in v] for k, v in rows.items()}, "labels": labels,
+                               "blowups": blowups}
+                torch.save({**saved, "_tau_track": tau_track}, progress_path + ".tmp")
+                os.replace(progress_path + ".tmp", progress_path)
             if log is not None and (n + 1) % 10 == 0:
                 log(f"[memory game eval] {kind}: {n + 1}/{len(indices)}")
         per = {k: torch.stack(v).cpu().numpy() for k, v in rows.items()}
