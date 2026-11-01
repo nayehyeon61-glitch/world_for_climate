@@ -21,6 +21,16 @@ import numpy as np
 ARMS = ("policy", "random", "bandit", "single", "noctx")
 LABEL = {"start": "N1-T (start)"}
 VARS = (("z500", "geopotential@500"), ("t850", "temperature@850"), ("t2m", "2m_temperature"))
+ERA_VARS = VARS + (("u10", "10m_u_component_of_wind"), ("v10", "10m_v_component_of_wind"))
+
+
+def drift(x, rng, n=4000):
+    """Second-half minus first-half mean of a per-decision series, with a bootstrap 95% interval."""
+    x = np.asarray(x, float)
+    h = len(x) // 2
+    a, b = x[:h], x[h:]
+    bs = [rng.choice(b, len(b)).mean() - rng.choice(a, len(a)).mean() for _ in range(n)]
+    return b.mean() - a.mean(), np.percentile(bs, 2.5), np.percentile(bs, 97.5)
 
 
 def boot(diff, n=2000, seed=0):
@@ -122,12 +132,15 @@ def main():
         ok = g_r[0] >= 0.05 and g_b[0] >= 0.05 and g_r[1] > 0 and g_b[1] > 0
         L.append(f"- **G1** policy >= 5% below random and bandit (SST held-out): vs random {pct(g_r)}, vs bandit "
                  f"{pct(g_b)} → {'supported' if ok else 'not supported'}")
-    if "single" in hists and "policy" in hists:
-        ks, kp = np.array(hists["single"]["kept"]), np.array(hists["policy"]["kept"])
-        drift = ks[len(ks) // 2:].mean() - ks[:len(ks) // 2].mean()
-        L.append(f"- **G2** single drifts to chaotic actions: forced share of its choices {ks[:len(ks) // 2].mean():.2f} → "
-                 f"{ks[len(ks) // 2:].mean():.2f} (policy {kp[:len(kp) // 2].mean():.2f} → {kp[len(kp) // 2:].mean():.2f}) "
-                 f"→ {'supported' if drift < 0 and ks[len(ks) // 2:].mean() < kp[len(kp) // 2:].mean() else 'not supported'}")
+    if "single" in hists:
+        rng = np.random.default_rng(0)
+        dr = {a: drift(hists[a]["kept"], rng) for a in ARMS if a in hists}
+        ds = dr["single"]
+        ok = ds[2] < 0 and all(ds[0] <= d[0] for d in dr.values())
+        L.append("- **G2** single drifts to chaotic actions (second-half minus first-half forced share of the chosen "
+                 "actions, 95% bootstrap interval): " + "; ".join(f"{a} {d[0]:+.3f} [{d[1]:+.3f}, {d[2]:+.3f}]"
+                                                             for a, d in dr.items())
+                 + f" → {'supported' if ok else 'not supported'} (single drifts, and most)")
     if g_c:
         L.append(f"- **G3** noctx >= 3% worse than policy: noctx vs policy {pct(g_c)} → "
                  f"{'supported' if g_c[0] <= -0.03 else 'not supported'}")
@@ -146,12 +159,12 @@ def main():
             def rm(d, v, h):
                 return next((r["rmse"] for r in d["model"] if r["variable"] == v and r["lead_h"] == h), np.nan)
             L += ["", "## ERA5 2020 (GraphCast protocol, 31 initialisations; + = better than " + ref_lab + ")", "",
-                  "| model | " + " | ".join(f"{s} {h} h" for s, _ in VARS for h in (24, 72, 120)) + " | worst |",
-                  "|---" * (2 + 3 * len(VARS)) + "|"]
+                  "| model | " + " | ".join(f"{s} {h} h" for s, _ in ERA_VARS for h in (24, 72, 120)) + " | worst |",
+                  "|---" * (2 + 3 * len(ERA_VARS)) + "|"]
             verdicts = []
             for lab, d in data.items():
                 cells, worst = [], 0.0
-                for s, v in VARS:
+                for s, v in ERA_VARS:
                     for h in (24, 72, 120):
                         x, r0 = rm(d, v, h), rm(data[ref_lab], v, h)
                         g = 1 - x / r0
