@@ -8,6 +8,9 @@ scripts/download_weatherbench2.py, regridded by WB2 to the evaluation grid).
 Both are evaluated on the same initialisations, lead times, ERA5 targets,
 climatology and latitude weights: RMSE (eq. 20), RMSE_trad (eq. 21),
 ACC (eq. 29) and RMSE / ACC skill scores of our model relative to GraphCast.
+
+Stage 16 rule R4 (N1 with a climate-game policy on its knobs, README_KO section 16):
+    --policy td3 --agent-dir runs/stage16/td3 --calib runs/stage16/calib.json
 """
 
 import argparse
@@ -80,6 +83,12 @@ def main():
                         help="save the scores after every batch (OUT.progress.pt) and continue from them")
     parser.add_argument("--coarsen", type=int, default=1,
                         help="coarsen the GraphCast forecasts to the model grid (4: 0.25 -> 1 deg)")
+    parser.add_argument("--policy", default=None, choices=["zero", "rand", "const", "td3", "ppo", "grad"],
+                        help="stage 16: run N1 with this climate-game policy on the knobs")
+    parser.add_argument("--agent-dir", default=None)
+    parser.add_argument("--calib", default=None, help="stage 16 K0 calibration (observation normalisation)")
+    parser.add_argument("--no-state", action="store_true")
+    parser.add_argument("--fixed-groups", nargs="*", default=[])
     args = parser.parse_args()
 
     cfg, state, stats = pipeline.load_checkpoint(args.checkpoint, args.device)
@@ -97,6 +106,15 @@ def main():
     train_ds, val_ds, _ = pipeline.build_datasets(cfg, layout, ds, stats)
     model = pipeline.build_model(cfg, layout, train_ds).to(args.device)
     model.load_state_dict(state)
+    if args.policy:
+        from climate_wm.train.climate_game import Controlled, GameConfig, Scorer, load_policy, norm_from, obs_dim
+        with open(args.calib) as f:
+            calib = json.load(f)
+        sc = Scorer(model)
+        path = os.path.join(args.agent_dir, "agent.pt") if args.agent_dir else None
+        game = GameConfig(state=not args.no_state, fixed_groups=tuple(args.fixed_groups))
+        model = Controlled(model, load_policy(args.policy, path, obs_dim(sc)), game, sc, norm_from(calib))
+        print(f"policy {args.policy} on the knobs ({args.agent_dir})")
     clim = pipeline.build_climatology(cfg, train_ds)
     gc = GraphCastForecasts(args.graphcast or os.path.join(args.data_dir, "graphcast.zarr"),
                             layout.targets, coarsen=args.coarsen)

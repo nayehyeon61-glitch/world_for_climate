@@ -5,8 +5,8 @@ import numpy as np
 import torch
 
 from climate_wm.models import knobs as K
-from climate_wm.train.climate_game import (CEM, GameConfig, Scorer, Windows, calibrate, evaluate, grad_loss,
-                                           load_policy, obs_dim, play, sparse_rewards, train_agent, Actor)
+from climate_wm.train.climate_game import (CEM, Controlled, GameConfig, Scorer, Windows, calibrate, evaluate,
+                                           grad_loss, load_policy, obs_dim, play, sparse_rewards, train_agent, Actor)
 from test_physics_core import _model, _tiny
 
 
@@ -105,3 +105,20 @@ def test_grad_control_reaches_the_actor_and_cem_keeps_its_best(tmp_path):
     assert torch.equal(cand[0], torch.zeros(len(K.KNOBS)))
     cem.tell(cand, torch.arange(6.0))
     assert torch.equal(cem.best[1], cand[5])
+
+
+def test_controlled_rollout_for_the_wb2_comparison():
+    model, win = _setup()
+    sc = Scorer(model)
+    batch = win.batch([0, 1])
+    cfg = GameConfig(days=2, steps_per_day=1)          # the tiny windows hold 2 steps: decide every step
+    with torch.no_grad():
+        ref = model.rollout(batch, 2)
+    zero = Controlled(model, lambda o, d: torch.zeros(o.shape[0], len(K.KNOBS)), cfg, sc)
+    assert torch.allclose(zero.eval().rollout(batch, 2), ref, atol=1e-5)
+    assert zero.layout is model.layout and len(zero.actions) == 2                     # delegates; 2 decisions
+    push = Controlled(model, lambda o, d: torch.full((o.shape[0], len(K.KNOBS)), 0.5 * (d + 1)), cfg, sc)
+    moved = push.rollout(batch, 2, members=2)
+    assert moved.shape == (2,) + ref.shape[1:]
+    assert not torch.allclose(moved[0], ref[0], atol=1e-6) and model.column_scale is None
+    assert [float(a[0, 0]) for a in push.actions] == [0.5, 1.0]                     # one decision per day

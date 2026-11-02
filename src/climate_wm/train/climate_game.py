@@ -202,6 +202,64 @@ def play(model, batch, policy: Callable[[Tensor, int], Tensor], cfg: GameConfig,
     return res
 
 
+def controlled_rollout(model, batch, steps: int, policy: Callable[[Tensor, int], Tensor], cfg: GameConfig,
+                       scorer: Scorer, norm: Optional[dict] = None, actions: Optional[list] = None) -> Tensor:
+    """Normalised predictions [B, L, C, H, W] with the policy on the knobs, deciding every day as in play()
+    (the observation is the last day's mean zonal state; the initial state on day 0). For the WB2 comparison."""
+    spd, b = cfg.steps_per_day, batch["targets"].shape[0]
+    mask = 1.0 - K.group_mask(cfg.fixed_groups) if cfg.fixed_groups else torch.ones(N_ACT)
+    state, ctx = model.begin(batch)
+    zm_last = scorer.zonal_inputs(batch)
+    doy = day_of_year(batch["init_time"])
+    prev = torch.zeros(b, N_ACT)
+    preds, acc, act = [], None, None
+    for k in range(steps):
+        if k % spd == 0:
+            obs = observation(scorer, zm_last, doy + k // spd, prev, cfg, norm)
+            act = policy(obs, k // spd).detach().float().cpu().clamp(-1, 1) * mask
+            if actions is not None:
+                actions.append(act)
+            acc = 0.0
+        K.apply(model, act.to(batch["targets"].device))
+        try:
+            state, precip = model.advance(state, ctx, k)
+        finally:
+            K.apply(model, None)
+        pred = model.predict(state, ctx, k, precip)
+        preds.append(pred)
+        acc = acc + scorer.zonal(torch.nan_to_num(pred.float(), 0.0, 0.0, 0.0)).cpu()
+        if k % spd == spd - 1:
+            ok = torch.isfinite(pred).flatten(1).all(1).cpu()
+            zm_last = torch.where(ok[:, None, None], acc / spd, zm_last.cpu())
+            prev = act
+    return torch.stack(preds, 1)
+
+
+class Controlled:
+    """A model whose rollout() runs with a game policy on the knobs (rule R4: WB2 skill with the policy on).
+    Everything else is the wrapped model's."""
+
+    def __init__(self, model, policy, cfg: GameConfig, scorer: Scorer, norm: Optional[dict] = None):
+        self.__dict__.update(wrapped=model, policy=policy, cfg=cfg, scorer=scorer, norm=norm, actions=[])
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["wrapped"], name)
+
+    def eval(self):
+        self.wrapped.eval()
+        return self
+
+    def to(self, *a, **k):
+        self.wrapped.to(*a, **k)
+        return self
+
+    @torch.no_grad()
+    def rollout(self, batch, steps: int, members: int = 1, **_) -> Tensor:
+        pred = controlled_rollout(self.wrapped, batch, steps, self.policy, self.cfg, self.scorer, self.norm,
+                                  self.actions)
+        return pred[None].expand(members, *pred.shape)
+
+
 def sparse_rewards(rew: Tensor, done: Tensor, lag: int) -> Tensor:
     """RAIN v2: the rewards of each `lag`-day block are delivered at its end (or at the end of the episode)."""
     out = torch.zeros_like(rew)
