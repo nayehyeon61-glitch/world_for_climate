@@ -176,6 +176,9 @@ class PhysicsWorldModel(nn.Module):
         self.energy_track: Optional[list] = None      # set to a list: per column call, [B, 6] energy terms
         # stage 15: with track_tendency, advance() keeps the mean column forcing of the step,
         # cat(Q, S, F_u, F_v) [B, 4 L, H, W] on the core grid, in last_tendency (differentiable)
+        # stage 16 (models/knobs.py): per-sample multipliers of the column outputs,
+        # {"Q": [B, L], "S": [B, L], "F": [B], "drag": [B]}; None = off
+        self.column_scale: Optional[Dict[str, Tensor]] = None
         self.track_tendency = False
         self.last_tendency: Optional[Tensor] = None
                                                        # (eval/energy.py; stage 13)
@@ -346,9 +349,17 @@ class PhysicsWorldModel(nn.Module):
                "F_u": y[:, 2 * n:3 * n] * SCALES["F"] * per_s,
                "F_v": y[:, 3 * n:4 * n] * SCALES["F"] * per_s,
                "P_b": y[:, 4 * n] * SCALES["P_b"] * per_s}
+        ks = self.column_scale
+        if ks is not None:  # stage 16 knobs, before the budget (precipitation follows the scaled sink)
+            out["Q"] = out["Q"] * ks["Q"].to(out["Q"].dtype)[:, :, None, None]
+            out["S"] = out["S"] * ks["S"].to(out["S"].dtype)[:, :, None, None]
+            for key in ("F_u", "F_v"):
+                out[key] = out[key] * ks["F"].to(out[key].dtype)[:, None, None, None]
         if self.cfg.column.budget:
             w = (self.dp_layer / self.dp_layer.sum())[None, :, None, None]
             cd = torch.nn.functional.softplus(y[:, 4 * n + 2]) * 1e-6  # C_D / depth, 1/m
+            if ks is not None:
+                cd = cd * ks["drag"].to(cd.dtype)[:, None, None]
             speed = torch.sqrt(u[:, -1] ** 2 + v[:, -1] ** 2 + 1e-6)
             low = torch.zeros(n, device=y.device)
             low[-3:] = 1.0  # drag acts on the lowest three levels
@@ -552,8 +563,19 @@ class PhysicsWorldModel(nn.Module):
         keys = list(state)
 
         track = self.track_tendency and self.column is not None
+        # stage 16 knobs as set now: re-applied inside the step so that a checkpoint's recomputation in
+        # the backward pass (after the caller has cleared them) runs the same graph
+        knob_state = (self.column_scale, core.diffusion_power, core.drag_scale)
 
         def six_hours(*flat):
+            saved = (self.column_scale, core.diffusion_power, core.drag_scale)
+            self.column_scale, core.diffusion_power, core.drag_scale = knob_state
+            try:
+                return _six_hours(*flat)
+            finally:
+                self.column_scale, core.diffusion_power, core.drag_scale = saved
+
+        def _six_hours(*flat):
             st = dict(zip(keys, flat))
             precip = 0.0
             forcing = None

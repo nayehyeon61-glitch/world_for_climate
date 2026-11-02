@@ -166,6 +166,11 @@ class PrimitiveCore(nn.Module):
         drag = (np.clip((sigma - 0.7) / 0.3, 0, None) / (cfg.surface_drag_days * 86400.0)
                 if cfg.surface_drag_days > 0 else 0 * sigma)
         buf("drag", drag)
+        # stage 16 (state-dependent parameter game, models/knobs.py): per-sample [B] knobs, None = off.
+        # diffusion_power p: the hyperdiffusion factor exp(-dt/tau lam^k) ** p (p = tau_0 / tau);
+        # drag_scale: multiplies the Rayleigh drag of the lowest levels
+        self.diffusion_power: Optional[Tensor] = None
+        self.drag_scale: Optional[Tensor] = None
 
     # ----------------------------------------------------------- helpers
     def _lev(self, mat: Tensor, x: Tensor) -> Tensor:
@@ -200,8 +205,11 @@ class PrimitiveCore(nn.Module):
             au = au - om * self._lev(self.dp, u)
             av = av - om * self._lev(self.dp, v)
         if self.cfg.surface_drag_days > 0:
-            au = au - self.drag[:, None, None] * u
-            av = av - self.drag[:, None, None] * v
+            drag = self.drag[:, None, None]
+            if self.drag_scale is not None:
+                drag = drag * self.drag_scale.to(drag.dtype)[:, None, None, None]
+            au = au - drag * u
+            av = av - drag * v
         if forcing is not None:
             au = au + forcing.get("F_u", 0.0)
             av = av + forcing.get("F_v", 0.0)
@@ -311,10 +319,17 @@ class PrimitiveCore(nn.Module):
                 if SIL3_B_IM[j]:
                     out[k] = out[k] + dt * SIL3_B_IM[j] * ln[j][k]
         for k in FIELDS:
-            out[k] = self.sh.truncate(out[k] * self.diffusion)
+            out[k] = self.sh.truncate(out[k] * self._diffusion_factor(out[k]))
         out["div"] = out["div"] * self.div_damping
         out.update(fixed)
         return out
+
+    def _diffusion_factor(self, c: Tensor) -> Tensor:
+        if self.diffusion_power is None:
+            return self.diffusion
+        p = self.diffusion_power.to(self.diffusion.dtype)
+        d = self.diffusion[None] ** p[:, None]                                  # [B, N]
+        return d.reshape((d.shape[0],) + (1,) * (c.dim() - 2) + (d.shape[-1],))
 
     # ------------------------------------------------------- data <-> state
     def state_from_grid(self, u: Tensor, v: Tensor, temp: Tensor, q: Tensor, z: Tensor) -> State:
