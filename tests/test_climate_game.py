@@ -54,8 +54,12 @@ def test_play_rewards_blowups_and_sparse_delivery():
     # the terminal day adds the episode distance; the reference scales the reward
     ep2 = play(model, batch, zero, cfg, sc, ref={"day": [2.0], "term": 2.0})
     assert torch.allclose(ep2["rew"], ep["rew"] / 2, atol=1e-6)
-    boom = play(model, batch, zero, GameConfig(days=1, steps_per_day=2, cap=-1.0), sc)
-    assert (boom["blown_day"] == 0).all() and torch.equal(boom["rew"], torch.full((1, 2), -10.0))
+    boom = play(model, batch, zero, GameConfig(days=3, steps_per_day=1, cap=-1.0), sc)
+    # blown on day 0: penalty 10 + the cost cap 3 for the 3 remaining days and the terminal term; then no steps
+    assert (boom["blown_day"] == 0).all() and torch.equal(boom["rew"][0], torch.full((2,), -22.0))
+    assert (boom["rew"][1:] == 0).all() and not boom["valid"][1:].any() and torch.isnan(boom["err"][1:]).all()
+    # staying alive always pays: the worst living episode costs less than any death
+    assert 3.0 * (3 + 1) < 22.0
     rew = torch.tensor([[-1.0], [-2.0], [-3.0], [-4.0], [-5.0]])
     done = torch.tensor([[False], [False], [False], [True], [False]])
     assert sparse_rewards(rew, done, 2)[:, 0].tolist() == [0.0, -3.0, 0.0, -7.0, 0.0]

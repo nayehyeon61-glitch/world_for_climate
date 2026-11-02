@@ -45,6 +45,8 @@ class GameConfig:
     smooth_days: int = 5
     penalty: float = 10.0
     cap: float = 10.0               # all-variable normalised MSE of a 6 h step that counts as a blow-up
+    cost_cap: float = 3.0           # a day costs at most this (in K0 units); a blow-up also pays it for every
+                                    # remaining day and the terminal term, so staying alive always pays
     action_cost: float = 0.01
     terminal_weight: float = 1.0
     sparse_lag: int = 0             # > 0: rewards delivered summed every `sparse_lag` days (RAIN v2)
@@ -147,9 +149,19 @@ def play(model, batch, policy: Callable[[Tensor, int], Tensor], cfg: GameConfig,
     prev = torch.zeros(b, N_ACT)
     alive = torch.ones(b, dtype=torch.bool)
     blown_day = torch.full((b,), -1)
-    diffs, out = [], {k: [] for k in ("obs", "act", "rew", "valid", "done", "err")}
+    diffs, whole, out = [], [], {k: [] for k in ("obs", "act", "rew", "valid", "done", "err")}
     for d in range(days):
         obs = observation(scorer, zm_last, doy + d, prev, cfg, norm)
+        if not alive.any():          # everyone blew up: no more steps, nothing more to earn or lose
+            out["obs"].append(obs.cpu())
+            out["act"].append(torch.zeros(b, N_ACT))
+            out["rew"].append(torch.zeros(b))
+            out["valid"].append(alive.clone())
+            out["done"].append(torch.zeros(b, dtype=torch.bool))
+            out["err"].append(torch.full((b,), float("nan")))
+            diffs.append(torch.zeros_like(diffs[-1]))
+            whole.append(torch.zeros(b, dtype=torch.bool))
+            continue
         raw = policy(obs, d).detach().float().cpu()
         act = raw.clamp(-1, 1) * mask
         K.apply(model, act.to(batch["targets"].device))
@@ -169,16 +181,18 @@ def play(model, batch, policy: Callable[[Tensor, int], Tensor], cfg: GameConfig,
         finally:
             K.apply(model, None)
         zm_p, zm_t = acc_p / spd, acc_t / spd
-        diffs.append(torch.where(alive[:, None, None], zm_p - zm_t, torch.zeros_like(zm_p)))
+        whole.append(alive & ~blew)       # the day a run blows up does not count in its bias
+        diffs.append(torch.where(whole[-1][:, None, None], zm_p - zm_t, torch.zeros_like(zm_p)))
         lo = max(0, d - cfg.smooth_days + 1)
         e = scorer.error(torch.stack(diffs[lo:]).mean(0))
         r_ref = ref["day"][min(d, len(ref["day"]) - 1)] if ref else 1.0
-        rew = -e / r_ref - cfg.action_cost * act.square().mean(1)
+        rew = -(e / r_ref).clamp(max=cfg.cost_cap) - cfg.action_cost * act.square().mean(1)
         if d == days - 1:
             t_ref = ref["term"] if ref else 1.0
-            rew = rew - cfg.terminal_weight * scorer.error(torch.stack(diffs).mean(0)) / t_ref
+            rew = rew - cfg.terminal_weight * (scorer.error(torch.stack(diffs).mean(0)) / t_ref).clamp(max=cfg.cost_cap)
         newly = blew & alive
-        rew = torch.where(newly, torch.full_like(rew, -cfg.penalty), rew)
+        death = cfg.penalty + cfg.cost_cap * (days - d + cfg.terminal_weight)
+        rew = torch.where(newly, torch.full_like(rew, -death), rew)
         rew = torch.where(alive, rew, torch.zeros_like(rew))
         out["obs"].append(obs.cpu())
         out["act"].append(raw)
@@ -195,7 +209,7 @@ def play(model, batch, policy: Callable[[Tensor, int], Tensor], cfg: GameConfig,
     res["next_obs"] = torch.cat([res["obs"][1:], next_last[None]])
     if cfg.sparse_lag > 0:
         res["rew"] = sparse_rewards(res["rew"], res["done"], cfg.sparse_lag)
-    n_alive = torch.stack([v.float() for v in out["valid"]]).sum(0).clamp_min(1)[:, None, None]
+    n_alive = torch.stack(whole).float().sum(0).clamp_min(1)[:, None, None]
     res["bias"] = scorer.bias_phys(torch.stack(diffs).sum(0) / n_alive)
     res["bias"]["all"] = scorer.error(torch.stack(diffs).sum(0) / n_alive)
     res["blown_day"] = blown_day
@@ -561,11 +575,17 @@ def calibrate(model, windows: Windows, cfg: GameConfig, scorer: Scorer, n: int =
         log(f"[calibrate] {s + len(b['targets'])}/{len(idx)} windows, blown {int((ep['blown_day'] >= 0).sum())}")
     err = torch.cat(errs, 1)
     f = torch.cat(feats)
-    day = [float(np.nanmean(err[d].numpy())) for d in range(err.shape[0])]
-    day = [max(x, 1e-6) if np.isfinite(x) else 1.0 for x in day]
+    day, last = [], None
+    for d in range(err.shape[0]):     # days with few survivors keep the last well-sampled value
+        e = err[d].numpy()
+        ok = np.isfinite(e)
+        if ok.sum() >= max(2, len(e) // 4):
+            last = max(float(e[ok].mean()), 1e-6)
+        day.append(last if last is not None else 1.0)
     t = torch.cat(terms)
+    bd = torch.cat(blown)
     return {"day": day, "term": max(float(np.nanmean(t.numpy())), 1e-6),
-            "blown": int((torch.cat(blown) >= 0).sum()), "windows": int(len(idx)),
+            "blown": int((bd >= 0).sum()), "windows": int(len(idx)), "blown_days": bd.tolist(),
             "feat_mean": f.mean(0).tolist(), "feat_std": f.std(0).clamp_min(1e-3).tolist()}
 
 
@@ -630,7 +650,7 @@ def train_agent(kind: str, model, windows: Windows, cfg: GameConfig, scorer: Sco
                     ok = math.isfinite(gn)
                     if ok:
                         opt.step()
-            row = {"iter": it + 1, "loss": float(loss) if ok else float("nan"), "skipped": not ok}
+            row = {"iter": it + 1, "loss": float(loss.detach()) if ok else float("nan"), "skipped": not ok}
         else:
             if kind == "td3":
                 pol = lambda o, d: agent.act(o, explore=True)

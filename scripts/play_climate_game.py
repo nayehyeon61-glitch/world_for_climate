@@ -12,7 +12,8 @@
         --calib runs/stage16/calib.json --checkpoint ... --data ... --out runs/stage16/eval_td3.json
 
 Policies for eval: zero (K0), rand, const (CEM mean), td3, ppo, grad. Cause ablations:
---fixed-groups (knob groups held at the default), --no-state (Knostate), --sparse-lag 5 (RAIN v2 reward).
+--fixed-groups (knob groups held at the default), --no-state (Knostate), --sparse-lag 5 (RAIN v2 reward);
+--set column.energy_max_flux=500 = the stage 13 E1 energy bound as a non-learning blow-up control.
 Train windows: 00 UTC initialisations of 2018-19 (N1 was trained on 2015-17); test: 2020.
 """
 from __future__ import annotations
@@ -36,7 +37,8 @@ SPLITS = {"train": ("2018-01-01", "2019-12-31"), "test": ("2020-01-01", "2020-12
 
 def build(args, steps: int, split: str):
     cfg, state, stats = pipeline.load_checkpoint(args.checkpoint, "cpu")
-    pipeline.apply_overrides(cfg, [f"data.path={args.data}", "data.time_range=null", "data.load_into_memory=false"])
+    pipeline.apply_overrides(cfg, [f"data.path={args.data}", "data.time_range=null", "data.load_into_memory=false",
+                                   *args.set])
     layout = pipeline.build_layout(cfg)
     ds = pipeline.open_dataset(cfg)
     lo, hi = SPLITS[split]
@@ -78,6 +80,8 @@ def main() -> None:
     ap.add_argument("--penalty", type=float, default=10.0)
     ap.add_argument("--threads", type=int, default=1, help="1: more threads stall under the other lanes (45 s vs 0.6 s per 6 h)")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                    help="model config overrides, e.g. column.energy_max_flux=500 (the stage 13 E1 bound control)")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     log = lambda s: print(s, flush=True)
