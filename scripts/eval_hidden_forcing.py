@@ -10,6 +10,8 @@ the nature run from the same date; every model re-observes h = 0/1/5/10/30 days 
 (the 1982-84 nature pass), then runs 5 days free, with the memory kernel on and knocked out. `--shown`
 models also run with the anomaly in the action channel. Writes hidden.json (rows, resumable per point)
 and probe.pt (the filled memory states with the anomaly on the core grid, for the T5 probe).
+`--signal-only` writes signal.json instead: the anomaly's footprint in the truth (anomaly branch minus
+nature run) per h and lead, the ceiling of any memory gain (scripts/report_hidden_forcing.py).
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ import _path  # noqa: F401
 import numpy as np
 import torch
 
-from climate_wm.eval.hidden_forcing import HiddenConfig, hidden_forcing_eval, probe_r2
+from climate_wm.eval.hidden_forcing import HiddenConfig, forced_signal, hidden_forcing_eval, probe_r2
 from train_speedy_game import build
 
 
@@ -43,6 +45,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--signal-only", action="store_true",
+                    help="only the forced signal (anomaly branch minus nature per h and lead) -> signal.json")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     args.work = args.work or os.path.join(args.data, "work")
@@ -66,6 +70,14 @@ def main() -> None:
     idx = np.linspace(0, len(points) - 1, args.points).astype(int)
     points = [points[i] for i in idx]
     print(f"{len(points)} branch points: {[p.date().isoformat() for p in points]}")
+    if args.signal_only:
+        sig = forced_signal(model, world, points, cfg, device=args.device)
+        with open(os.path.join(args.out, "signal.json"), "w") as f:
+            json.dump({"rows": sig}, f)
+        for r in sig:
+            print(f"[signal] {r['init'][:10]} h={r['h']}d: all 24/72/120 h {r['all'][3]:.4f}/{r['all'][11]:.4f}/"
+                  f"{r['all'][-1]:.4f}, t850 near patch {r['t850'][3]:.2f}/{r['t850'][11]:.2f}/{r['t850'][-1]:.2f} K")
+        return
     js, pt = os.path.join(args.out, "hidden.json"), os.path.join(args.out, "probe.pt")
     done = None
     if os.path.exists(js) and os.path.exists(pt):

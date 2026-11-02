@@ -147,7 +147,7 @@ def hidden_forcing_eval(models: Dict[str, object], world, points: Sequence[dt.da
                         save: Optional[Callable[[dict], None]] = None) -> dict:
     """Rows per (point, truth, model, variant, h): free-run scores, blow-up; and the filled memory
     with the anomaly footprint on the core grid for the probe. `shown` labels also run with the
-    anomaly in the action channel (on the anomaly branch). Resumable per point via `done`."""
+    anomaly in the action channel (on the anomaly branch). Resumable per (point, truth) via `done`."""
     res = done or {"rows": [], "probe": [], "points": []}
     rng = np.random.default_rng(cfg.seed)
     hmax = max(cfg.histories_days)
@@ -158,6 +158,7 @@ def hidden_forcing_eval(models: Dict[str, object], world, points: Sequence[dt.da
     lat, lon = np.asarray(world.lat), np.asarray(world.lon)
     shown = set(shown)
     anomalies = [hidden_anomaly(rng, cfg) for _ in points]
+    truths_done = res.setdefault("truths", [])          # finer resume: (point, truth) pairs already scored
     for i, t0 in enumerate(points):
         if t0.isoformat() in res["points"]:
             continue
@@ -167,6 +168,8 @@ def hidden_forcing_eval(models: Dict[str, object], world, points: Sequence[dt.da
         branches = {"anomaly": world.branch(t0, hidden_act, days, tag="hidden"), "nature": world.branch(t0, null, days)}
         mem0 = None
         for truth, ds in branches.items():
+            if f"{t0.isoformat()}|{truth}" in truths_done:
+                continue
             hid = world.window(ds, t0, steps, null, device)
             if snaps is not None:
                 mem0 = snaps.get(int(hid["init_time"][0]))   # the filled memory at t0, as begin_filled
@@ -201,10 +204,41 @@ def hidden_forcing_eval(models: Dict[str, object], world, points: Sequence[dt.da
                         log(f"[hidden] {t0:%Y-%m-%d} {truth} {lab}{' shown' if is_shown else ''} {variant} h={h}d: "
                             f"all 120 h {a:.3f}, t850 near patch {row.get('t850', [np.nan])[-1]:.2f} K"
                             f"{' (blown)' if blown else ''}")
+            truths_done.append(f"{t0.isoformat()}|{truth}")
+            if save is not None:
+                save(res)
         res["points"].append(t0.isoformat())
         if save is not None:
             save(res)
     return res
+
+
+@torch.no_grad()
+def forced_signal(model, world, points: Sequence[dt.datetime], cfg: HiddenConfig, device="cpu",
+                  tag: str = "hsignal") -> List[dict]:
+    """How big the hidden forcing is in the truth: anomaly branch minus nature run, per history h and free
+    lead, in the units of the rows (all-variable weighted MSE, normalised; footprint-weighted t850 / t2m
+    RMS, K). The anomalies are those of `hidden_forcing_eval` (same seed and points). A model that knows
+    nothing of the anomaly has error^2 ~ e_nature^2 + signal^2 on the anomaly branch; knowing it perfectly
+    removes the signal^2, which bounds the memory's possible gain (the ceiling in report_hidden_forcing)."""
+    rng = np.random.default_rng(cfg.seed)
+    steps = STEPS_PER_DAY * max(cfg.histories_days) + cfg.free_steps
+    days = int(math.ceil(steps / STEPS_PER_DAY)) + 1
+    null = Action("none", Intervention())
+    keys = [c.key for c in world.layout.targets]
+    lat, lon = np.asarray(world.lat), np.asarray(world.lon)
+    anomalies = [hidden_anomaly(rng, cfg) for _ in points]
+    out = []
+    for iv, t0 in zip(anomalies, points):
+        foot = footprint(iv, lat, lon)
+        a = world.window(world.branch(t0, Action("hidden_sst", iv), days, tag=tag), t0, steps, null, device)
+        n = world.window(world.branch(t0, null, days), t0, steps, null, device)
+        a, n = a["targets"].cpu().numpy()[0], n["targets"].cpu().numpy()[0]
+        for h in cfg.histories_days:
+            fill = STEPS_PER_DAY * h
+            out.append({"init": t0.isoformat(), "h": h, "patches": [list(p) for p in iv.patches],
+                        **scores(model, a[fill:fill + cfg.free_steps], n[fill:fill + cfg.free_steps], lat, foot, keys)})
+    return out
 
 
 def probe_r2(records: List[dict], ridge: float = 1.0) -> Dict[Tuple[str, int], float]:

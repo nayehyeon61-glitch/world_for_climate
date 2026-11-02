@@ -4,7 +4,8 @@ import datetime as dt
 import numpy as np
 import torch
 
-from climate_wm.eval.hidden_forcing import HiddenConfig, fill_then_free, hidden_anomaly, hidden_forcing_eval, probe_r2
+from climate_wm.eval.hidden_forcing import (HiddenConfig, fill_then_free, forced_signal, hidden_anomaly,
+                                           hidden_forcing_eval, probe_r2)
 from climate_wm.sim.intervention_game import action_field
 from test_action_channels import _with_action
 from test_physics_core import _tiny
@@ -68,6 +69,27 @@ def test_hidden_forcing_eval_rows_probe_and_resume():
     assert all(np.isfinite(r["all"]).all() for r in res["rows"])
     r2 = probe_r2(res["probe"])
     assert set(r2) == {("mem", 0), ("mem", 1)}
-    again = hidden_forcing_eval({"mem": mem, "markov": markov}, world, points, cfg, shown={"mem"},
-                                log=lambda s: None, done=copy.deepcopy(saved[0]))
-    assert len(again["rows"]) == len(res["rows"]) and again["points"] == res["points"]
+    assert len(saved) == 2 * 3 and saved[0]["truths"] == ["2018-01-01T00:00:00|anomaly"]   # saved per truth
+    for half in (saved[0], saved[1]):           # resume after the anomaly branch, and after the whole point
+        again = hidden_forcing_eval({"mem": mem, "markov": markov}, world, points, cfg, shown={"mem"},
+                                    log=lambda s: None, done=copy.deepcopy(half))
+        assert len(again["rows"]) == len(res["rows"]) and again["points"] == res["points"]
+        assert [(r["init"], r["truth"], r["variant"], r["h"]) for r in again["rows"]] == \
+            [(r["init"], r["truth"], r["variant"], r["h"]) for r in res["rows"]]
+
+
+def test_forced_signal_is_the_anomaly_footprint_in_the_truth():
+    layout, stats, data = _tiny()
+    model = _with_action(layout, stats, data)
+    world = StubHiddenWorld(layout, data)
+    cfg = HiddenConfig(histories_days=(0, 1), free_steps=2, cap=1e6)
+    points = [dt.datetime(2018, 1, 1), dt.datetime(2018, 1, 6)]
+    sig = forced_signal(model, world, points, cfg)
+    assert [(r["init"][:10], r["h"]) for r in sig] == [("2018-01-01", 0), ("2018-01-01", 1),
+                                                         ("2018-01-06", 0), ("2018-01-06", 1)]
+    # the stub warms every target by 0.2 x the anomaly field: a positive, lead-independent signal
+    assert all(len(r["all"]) == 2 and min(r["all"]) > 0 for r in sig)
+    assert all(np.allclose(r["all"], r["all"][0]) for r in sig)
+    # the anomalies are hidden_forcing_eval's (same seed): its first point's patches
+    rng = np.random.default_rng(cfg.seed)
+    assert sig[0]["patches"] == [list(p) for p in hidden_anomaly(rng, cfg).patches]
