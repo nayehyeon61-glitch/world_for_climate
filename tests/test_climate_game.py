@@ -88,6 +88,13 @@ def test_agents_train_resume_and_evaluate(tmp_path):
     assert len(again["rows"]) == 2                                                     # resumed from .progress
     const = load_policy("const", str(tmp_path / "cem" / "agent.pt"), obs_dim(sc))
     assert const(torch.zeros(3, obs_dim(sc)), 0).shape == (3, len(K.KNOBS))
+    base = torch.load(str(tmp_path / "cem" / "agent.pt"), weights_only=False)["agent"]["mean"]
+    out = str(tmp_path / "td3res")                     # the residual policy starts at the constant
+    h = train_agent("td3res", model, win, cfg, sc, calib, out, iters=1, batch=2, log=lambda s: None, base=base)
+    res_pol = load_policy("td3res", os.path.join(out, "agent.pt"), obs_dim(sc))
+    assert torch.allclose(res_pol(torch.zeros(2, obs_dim(sc)), 0), base.clamp(-0.95, 0.95).expand(2, -1), atol=0.05)
+    h = train_agent("td3res", model, win, cfg, sc, calib, out, iters=2, batch=2, log=lambda s: None, base=base)
+    assert [r["iter"] for r in h["hist"]] == [1, 2]
     fixed = play(model, win.batch([0]), lambda o, d: torch.ones(1, len(K.KNOBS)),
                  GameConfig(days=1, steps_per_day=2, fixed_groups=("heating", "moistening", "momentum")), sc)
     assert fixed["act"].abs().sum() > 0          # the raw action is recorded; the held groups are masked in play

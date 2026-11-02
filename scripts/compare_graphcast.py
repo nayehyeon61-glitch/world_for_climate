@@ -83,7 +83,7 @@ def main():
                         help="save the scores after every batch (OUT.progress.pt) and continue from them")
     parser.add_argument("--coarsen", type=int, default=1,
                         help="coarsen the GraphCast forecasts to the model grid (4: 0.25 -> 1 deg)")
-    parser.add_argument("--policy", default=None, choices=["zero", "rand", "const", "td3", "ppo", "grad"],
+    parser.add_argument("--policy", default=None, choices=["zero", "rand", "const", "td3", "td3res", "ppo", "grad"],
                         help="stage 16: run N1 with this climate-game policy on the knobs")
     parser.add_argument("--agent-dir", default=None)
     parser.add_argument("--calib", default=None, help="stage 16 K0 calibration (observation normalisation)")

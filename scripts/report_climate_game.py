@@ -21,12 +21,14 @@ from climate_wm.models.knobs import KNOBS
 
 POLICIES = [("K0", "default knobs"), ("K0_E1", "default knobs + stage 13 E1 energy bound"), ("Krand", "random knobs"), ("Kconst", "best constant (CEM)"),
             ("td3", "TD3"), ("ppo", "PPO"), ("Kgrad", "gradient through N1"),
-            ("td3_nostate", "TD3 without the state (Knostate)"), ("td3_sparse5", "TD3, sparse reward lag 5")]
+            ("td3_res", "TD3 residual around Kconst"), ("td3res_nostate", "TD3 residual without the state (Knostate)"),
+            ("td3res_sparse5", "TD3 residual, sparse reward lag 5")]
 GROUPS = ("heating", "moistening", "momentum", "diffusion")
+KNOCKOUTS = (("td3_res", "td3res_no"), ("Kconst", "Kconst_no"), ("td3", "td3_no"))   # policy, eval prefix
 UNITS = {"temperature": ("T (K)", 1.0), "u_component_of_wind": ("u (m/s)", 1.0),
          "specific_humidity": ("q (g/kg)", 1000.0), "2m_temperature": ("t2m (K)", 1.0),
          "mean_sea_level_pressure": ("msl (hPa)", 0.01)}
-RL = ("td3", "ppo")
+RL = ("td3", "ppo", "td3_res")
 
 
 def load(path):
@@ -97,7 +99,7 @@ def main() -> None:
     ap.add_argument("--compare", nargs="*", default=[], help="NAME=compare_graphcast json (R4); N1 first")
     args = ap.parse_args()
     ev = {name: load(os.path.join(args.runs, "eval", f"{name}.json")) for name, _ in POLICIES}
-    ko = {g: load(os.path.join(args.runs, "eval", f"td3_no_{g}.json")) for g in GROUPS}
+    ko = {(pol, g): load(os.path.join(args.runs, "eval", f"{pre}_{g}.json")) for pol, pre in KNOCKOUTS for g in GROUPS}
     k0 = ev["K0"]
     if k0 is None:
         raise SystemExit("K0 evaluation missing")
@@ -136,25 +138,37 @@ def main() -> None:
                  f"{fmt(paired_gain(e, ev['Kconst'])) if name != 'Kconst' else '0'} | {phys} |")
     L.append("")
 
-    L += ["## Gain vs K0 per variable (%)", "", "| policy | " + " | ".join(UNITS[v][0] for v in UNITS) + " |",
-          "|---|" + "---|" * len(UNITS)]
+    # K0 blows up in (nearly) every 30-day run, so per-variable bias gains are read against Kconst then
+    ref = "K0" if blown(k0) <= len(k0["rows"]) - 3 or ev["Kconst"] is None else "Kconst"
+    L += [f"## Bias gain vs {ref} per variable (%)", "",
+          *([f"K0 stayed finite in {len(k0['rows']) - blown(k0)} of {len(k0['rows'])} runs, too few to pair; "
+             "the reference is Kconst.", ""] if ref != "K0" else []),
+          "| policy | " + " | ".join(UNITS[v][0] for v in UNITS) + " |", "|---|" + "---|" * len(UNITS)]
     for name, _ in POLICIES[1:]:
-        if ev[name] is not None:
-            L.append(f"| {name} | " + " | ".join(fmt(paired_gain(ev[name], k0, v)) for v in UNITS) + " |")
+        if ev[name] is not None and name != ref:
+            L.append(f"| {name} | " + " | ".join(fmt(paired_gain(ev[name], ev[ref], v)) for v in UNITS) + " |")
     L.append("")
 
-    full = paired_gain(ev["td3"], k0)
-    if any(ko.values()) and full is not None:
-        L += ["## Knob-group knock-outs (TD3 with one group held at the default)", "",
-              "| held group | blown | gain vs K0 (%) | share of the TD3 gain lost |", "|---|---|---|---|",
-              f"| none | {blown(ev['td3'])} | {fmt(full)} | 0 |"]
+    for pol, _ in KNOCKOUTS:
+        if ev[pol] is None or not any(ko[(pol, g)] for g in GROUPS):
+            continue
+        full = paired_daily(ev[pol], k0)
+        L += [f"## Knob-group knock-outs ({pol} with one group held at the default)", "",
+              "Survival is the main effect; the daily distance vs the full policy is paired over the days both "
+              "were alive (- = holding the group costs accuracy).", "",
+              "| held group | blown | alive days mean | daily distance gain vs K0 (%) | vs the full policy (%) | "
+              "share of the gain vs K0 lost |", "|---|---|---|---|---|---|",
+              f"| none | {blown(ev[pol])}/{len(ev[pol]['rows'])} | {alive_days(ev[pol]).mean():.1f} | {fmt(full)} | 0 | 0 |"]
         for g in GROUPS:
-            if ko[g] is None:
-                L.append(f"| {g} | pending | | |")
+            e = ko[(pol, g)]
+            if e is None:
+                L.append(f"| {g} | pending | | | | |")
                 continue
-            gg = paired_gain(ko[g], k0)
-            lost = "-" if gg is None or abs(full["gain"]) < 1e-9 else f"{1 - gg['gain'] / full['gain']:+.2f}"
-            L.append(f"| {g} | {blown(ko[g])} | {fmt(gg)} | {lost} |")
+            gg = paired_daily(e, k0)
+            lost = "-" if gg is None or full is None or abs(full["gain"]) < 1e-9 else \
+                f"{1 - gg['gain'] / full['gain']:+.2f}"
+            L.append(f"| {g} | {blown(e)}/{len(e['rows'])} | {alive_days(e).mean():.1f} | {fmt(gg)} | "
+                     f"{fmt(paired_daily(e, ev[pol]))} | {lost} |")
         L.append("")
 
     L += ["## Knob settings (mean over initialisations and days; multiplier 1 + 0.5 a, diffusion time x 2^a)", "",
@@ -173,7 +187,7 @@ def main() -> None:
 
     L += ["## Training", "", "| agent | iterations | first 5: return / blown | last 5: return / blown |",
           "|---|---|---|---|"]
-    for name in ("td3", "ppo", "cem", "grad", "td3_nostate", "td3_sparse5"):
+    for name in ("td3", "ppo", "cem", "grad", "td3_res", "td3res_nostate", "td3res_sparse5"):
         h = load(os.path.join(args.runs, name, "train_history.json"))
         if not h:
             continue
@@ -206,6 +220,9 @@ def main() -> None:
         if gc:
             L.append(f"- R2 gain vs Kconst >= +5% (the state matters): {fmt(gc)} -> "
                      f"{'supported' if gc['gain'] >= 5 else 'not supported'}")
+        if ev["td3_res"] is not None and ev["td3res_nostate"] is not None:
+            gs = paired_daily(ev["td3_res"], ev["td3res_nostate"])
+            L.append(f"- R2 cause check, the same residual learner with vs without the state: {fmt(gs)}")
         b_rl, b_0 = blown(ev[best]), blown(k0)
         L.append(f"- R3 blow-ups at most half of K0's: {b_rl} vs {b_0} -> "
                  f"{'supported' if b_rl <= b_0 / 2 else 'not supported'}")

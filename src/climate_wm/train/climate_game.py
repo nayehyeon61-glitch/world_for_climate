@@ -316,13 +316,30 @@ class Actor(nn.Module):
         return torch.tanh(self.net(obs))
 
 
+class ResidualActor(Actor):
+    """A state-dependent correction around a constant setting (the CEM mean, Kconst):
+    a = tanh(atanh(base) + scale * tanh(net(obs))). It starts at the constant (last layer ~0) and stays
+    inside (-1, 1) without a clamp, so the gradient does not die at the bound; `scale` bounds the
+    correction in pre-tanh units (base 0, scale 1: |a| <= 0.76). The base is held at |a| <= 0.95."""
+
+    def __init__(self, d_obs: int, hidden: int = 64, base: Optional[Tensor] = None, scale: float = 1.0):
+        super().__init__(d_obs, hidden)
+        b = torch.zeros(N_ACT) if base is None else torch.as_tensor(base, dtype=torch.float32).reshape(N_ACT)
+        self.register_buffer("base", torch.atanh(b.clamp(-0.95, 0.95)))      # pre-tanh
+        self.register_buffer("scale", torch.tensor(float(scale)))
+
+    def forward(self, obs: Tensor) -> Tensor:
+        return torch.tanh(self.base + self.scale * torch.tanh(self.net(obs)))
+
+
 class TD3:
     def __init__(self, d_obs: int, hidden: int = 64, lr: float = 1e-3, gamma: float = 0.9, tau: float = 0.01,
                  policy_noise: float = 0.2, noise_clip: float = 0.5, explore: float = 0.3, delay: int = 2,
-                 batch: int = 128, updates: int = 32, capacity: int = 100_000, seed: int = 0):
+                 batch: int = 128, updates: int = 32, capacity: int = 100_000, seed: int = 0,
+                 actor: Optional[nn.Module] = None):
         g = torch.Generator().manual_seed(seed)
         torch.manual_seed(seed)
-        self.actor = Actor(d_obs, hidden)
+        self.actor = actor if actor is not None else Actor(d_obs, hidden)
         self.critics = nn.ModuleList([mlp(d_obs + N_ACT, 1, hidden) for _ in range(2)])
         self.actor_t, self.critics_t = copy.deepcopy(self.actor), copy.deepcopy(self.critics)
         self.opt_a = torch.optim.Adam(self.actor.parameters(), lr=lr)
@@ -602,13 +619,19 @@ def save_atomic(obj, path: str) -> None:
 
 def train_agent(kind: str, model, windows: Windows, cfg: GameConfig, scorer: Scorer, calib: dict, out: str,
                 iters: int, batch: int = 8, seed: int = 0, lr: Optional[float] = None,
-                log: Callable[[str], None] = print) -> dict:
-    """td3 | ppo | cem | grad. Resumable: out/progress.pt after every iteration; out/agent.pt at the end."""
+                log: Callable[[str], None] = print, base: Optional[Tensor] = None) -> dict:
+    """td3 | td3res | ppo | cem | grad. Resumable: out/progress.pt after every iteration; out/agent.pt at
+    the end. td3res = TD3 with a ResidualActor around `base` (the CEM mean: does the state add to Kconst?),
+    with a smaller exploration noise (0.2) since it starts at a setting that survives."""
     os.makedirs(out, exist_ok=True)
     ref, norm = {"day": calib["day"], "term": calib["term"]}, norm_from(calib)
     d_obs = obs_dim(scorer)
     if kind == "td3":
         agent = TD3(d_obs, seed=seed, **({"lr": lr} if lr else {}))
+    elif kind == "td3res":
+        torch.manual_seed(seed)
+        agent = TD3(d_obs, seed=seed, explore=0.2, actor=ResidualActor(d_obs, base=base),
+                    **({"lr": lr} if lr else {}))
     elif kind == "ppo":
         agent = PPO(d_obs, seed=seed, **({"lr": lr} if lr else {}))
     elif kind == "cem":
@@ -653,16 +676,14 @@ def train_agent(kind: str, model, windows: Windows, cfg: GameConfig, scorer: Sco
                         opt.step()
             row = {"iter": it + 1, "loss": float(loss.detach()) if ok else float("nan"), "skipped": not ok}
         else:
-            if kind == "td3":
-                pol = lambda o, d: agent.act(o, explore=True)
-            elif kind == "ppo":
+            if kind in ("td3", "td3res", "ppo"):
                 pol = lambda o, d: agent.act(o, explore=True)
             else:
                 cand = agent.ask(len(idx))
                 pol = lambda o, d: cand
             ep = play(model, b, pol, cfg, scorer, ref, norm)
             ret = returns(ep)
-            if kind == "td3":
+            if kind in ("td3", "td3res"):
                 agent.observe(ep)
                 st = agent.update()
             elif kind == "ppo":
@@ -686,7 +707,7 @@ def train_agent(kind: str, model, windows: Windows, cfg: GameConfig, scorer: Sco
 
 
 def load_policy(kind: str, path: Optional[str], d_obs: int, seed: int = 0) -> Callable[[Tensor, int], Tensor]:
-    """Deterministic evaluation policies: zero (K0), rand, const (CEM best mean), td3 / ppo / grad (actor)."""
+    """Deterministic evaluation policies: zero (K0), rand, const (CEM mean), td3 / td3res / ppo / grad (actor)."""
     if kind == "zero":
         return lambda o, d: torch.zeros(o.shape[0], N_ACT)
     if kind == "rand":
@@ -696,7 +717,7 @@ def load_policy(kind: str, path: Optional[str], d_obs: int, seed: int = 0) -> Ca
     if kind == "const":
         a = sd["mean"].clone()
         return lambda o, d: a.expand(o.shape[0], N_ACT)
-    actor = Actor(d_obs)
+    actor = ResidualActor(d_obs) if kind == "td3res" else Actor(d_obs)      # the base comes with the weights
     actor.load_state_dict(sd["actor"] if "actor" in sd else sd)
     actor.eval()
     return lambda o, d: actor(o).detach()

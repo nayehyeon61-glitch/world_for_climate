@@ -11,7 +11,8 @@
     python scripts/play_climate_game.py eval --policy td3 --agent-dir runs/stage16/td3 --days 30 \
         --calib runs/stage16/calib.json --checkpoint ... --data ... --out runs/stage16/eval_td3.json
 
-Policies for eval: zero (K0), rand, const (CEM mean), td3, ppo, grad. Cause ablations:
+Policies for eval: zero (K0), rand, const (CEM mean), td3, td3res, ppo, grad. td3res = TD3 with a
+residual actor around the CEM mean (train with --agent td3res --base-agent runs/stage16/cem/agent.pt). Cause ablations:
 --fixed-groups (knob groups held at the default), --no-state (Knostate), --sparse-lag 5 (RAIN v2 reward);
 --set column.energy_max_flux=500 = the stage 13 E1 energy bound as a non-learning blow-up control.
 Train windows: 00 UTC initialisations of 2018-19 (N1 was trained on 2015-17); test: 2020.
@@ -63,8 +64,10 @@ def main() -> None:
     ap.add_argument("--data", required=True, help="WB2 zarr with 2018-2020 (e.g. wb2_2020/era5.zarr)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--calib", default=None)
-    ap.add_argument("--agent", choices=["td3", "ppo", "cem", "grad"], default="td3")
-    ap.add_argument("--policy", choices=["zero", "rand", "const", "td3", "ppo", "grad"], default="zero")
+    ap.add_argument("--agent", choices=["td3", "td3res", "ppo", "cem", "grad"], default="td3")
+    ap.add_argument("--policy", choices=["zero", "rand", "const", "td3", "td3res", "ppo", "grad"], default="zero")
+    ap.add_argument("--base-agent", default=None,
+                    help="td3res: the CEM agent.pt whose mean (Kconst) the residual policy starts from")
     ap.add_argument("--agent-dir", default=None)
     ap.add_argument("--days", type=int, default=None, help="episode days (train 15, grad 5, eval 30)")
     ap.add_argument("--iters", type=int, default=40)
@@ -108,9 +111,13 @@ def main() -> None:
         cfg = game_config(args, days)
         if days < len(calib["day"]):
             calib = dict(calib, day=calib["day"][:days])
+        base = None
+        if args.agent == "td3res":
+            base = torch.load(args.base_agent, weights_only=False)["agent"]["mean"]
+            log(f"residual around {args.base_agent}: {np.round(base.numpy(), 2).tolist()}")
         log(f"train {args.agent}: {len(win)} windows, {days}-day episodes, batch {args.batch}, {args.iters} iterations")
         train_agent(args.agent, model, win, cfg, Scorer(model), calib, args.out, args.iters, args.batch,
-                    args.seed, args.lr, log=log)
+                    args.seed, args.lr, log=log, base=base)
         return
     days = args.days or 30
     model, win = build(args, 4 * days, "test")
