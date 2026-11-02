@@ -53,7 +53,7 @@ def build(args, steps: int, split: str):
 
 def game_config(args, days: int) -> GameConfig:
     return GameConfig(days=days, sparse_lag=args.sparse_lag, state=not args.no_state,
-                      fixed_groups=tuple(args.fixed_groups), cap=args.cap, penalty=args.penalty)
+                      fixed_groups=tuple(args.fixed_groups), cap=args.cap, penalty=args.penalty, spans=args.spans)
 
 
 def main() -> None:
@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--fixed-groups", nargs="*", default=[], choices=["heating", "moistening", "momentum", "diffusion"])
     ap.add_argument("--cap", type=float, default=10.0)
     ap.add_argument("--penalty", type=float, default=10.0)
+    ap.add_argument("--spans", default="v1", choices=["v1", "v2"],
+                    help="knob ranges (models/knobs.py SPAN_PRESETS); eval takes the agent's own when it has one")
     ap.add_argument("--threads", type=int, default=1, help="1: more threads stall under the other lanes (45 s vs 0.6 s per 6 h)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
@@ -115,6 +117,11 @@ def main() -> None:
     cfg = game_config(args, days)
     sc = Scorer(model)
     path = os.path.join(args.agent_dir, "agent.pt") if args.agent_dir else None
+    if path:   # the knob ranges the agent was trained with
+        trained = torch.load(path, weights_only=False).get("cfg", {}).get("spans", "v1")
+        if trained != cfg.spans:
+            log(f"spans: the agent was trained with {trained}, using it (not {cfg.spans})")
+            cfg = dataclasses.replace(cfg, spans=trained)
     policy = load_policy(args.policy, path, obs_dim(sc), args.seed)
     log(f"eval {args.policy}: {len(win)} test windows, {args.inits} initialisations, {days} days")
     res = evaluate(model, win, policy, cfg, sc, calib, args.out, n=args.inits, batch=args.batch, log=log)

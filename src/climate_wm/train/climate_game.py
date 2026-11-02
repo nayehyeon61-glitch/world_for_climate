@@ -52,6 +52,7 @@ class GameConfig:
     sparse_lag: int = 0             # > 0: rewards delivered summed every `sparse_lag` days (RAIN v2)
     state: bool = True              # False: the policy sees only the day of year (Knostate)
     fixed_groups: tuple = ()        # knob groups held at the default (a = 0)
+    spans: str = "v1"               # knob ranges (models/knobs.py SPAN_PRESETS)
 
 
 # ---------------------------------------------------------------- scoring
@@ -164,7 +165,7 @@ def play(model, batch, policy: Callable[[Tensor, int], Tensor], cfg: GameConfig,
             continue
         raw = policy(obs, d).detach().float().cpu()
         act = raw.clamp(-1, 1) * mask
-        K.apply(model, act.to(batch["targets"].device))
+        K.apply(model, act.to(batch["targets"].device), cfg.spans)
         acc_p = acc_t = 0.0
         blew = torch.zeros(b, dtype=torch.bool)
         try:
@@ -234,7 +235,7 @@ def controlled_rollout(model, batch, steps: int, policy: Callable[[Tensor, int],
             if actions is not None:
                 actions.append(act)
             acc = 0.0
-        K.apply(model, act.to(batch["targets"].device))
+        K.apply(model, act.to(batch["targets"].device), cfg.spans)
         try:
             state, precip = model.advance(state, ctx, k)
         finally:
@@ -469,7 +470,7 @@ class CEM:
     """The best constant setting (Kconst): a diagonal Gaussian over a in [-1, 1]^10, refitted to the
     elite of each generation (one generation = one batch of episodes, one constant per sample)."""
 
-    def __init__(self, sigma: float = 0.5, elite: float = 0.4, smooth: float = 0.7, floor: float = 0.05,
+    def __init__(self, sigma: float = 0.5, elite: float = 0.4, smooth: float = 0.7, floor: float = 0.15,
                  seed: int = 0):
         self.mean = torch.zeros(N_ACT)
         self.std = torch.full((N_ACT,), sigma)
@@ -515,7 +516,7 @@ def grad_loss(model, batch, actor: Actor, cfg: GameConfig, scorer: Scorer, ref: 
     for d in range(days):
         obs = observation(scorer, zm_last.cpu(), doy + d, prev, cfg, norm).detach()
         act = actor(obs) * mask
-        K.apply(model, act.to(batch["targets"].device))
+        K.apply(model, act.to(batch["targets"].device), cfg.spans)
         acc_p = acc_t = 0.0
         try:
             for j in range(spd):

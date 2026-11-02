@@ -39,6 +39,10 @@ def test_knobs_default_is_the_model_and_each_knob_acts():
     assert st["Q"].tolist() == [[1.5, 1.5, 1.5, 1.5]] and st["S"].tolist() == [[0.5, 0.5, 0.5, 0.5]]
     assert float(st["drag"]) == 1.25 and float(st["diffusion_power"]) == 0.5        # tau doubled
     assert K.group_mask(["momentum"]).tolist() == [0.0] * 7 + [1.0, 1.0, 0.0]
+    v2 = K.settings(torch.tensor([[-1.0] * 10]), [50, 300, 700, 1000], "v2")       # narrow moistening knobs
+    assert torch.allclose(v2["S"], torch.full((1, 4), 0.9)) and torch.allclose(v2["Q"], torch.full((1, 4), 0.5))
+    assert float(v2["diffusion_power"]) == 2.0                                          # tau halved
+    assert torch.equal(K.span_of(None), K.span_of("v1"))
 
 
 def test_play_rewards_blowups_and_sparse_delivery():

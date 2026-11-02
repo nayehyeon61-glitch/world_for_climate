@@ -112,7 +112,8 @@ def main():
             calib = json.load(f)
         sc = Scorer(model)
         path = os.path.join(args.agent_dir, "agent.pt") if args.agent_dir else None
-        game = GameConfig(state=not args.no_state, fixed_groups=tuple(args.fixed_groups))
+        spans = torch.load(path, weights_only=False).get("cfg", {}).get("spans", "v1") if path else "v1"
+        game = GameConfig(state=not args.no_state, fixed_groups=tuple(args.fixed_groups), spans=spans)
         model = Controlled(model, load_policy(args.policy, path, obs_dim(sc)), game, sc, norm_from(calib))
         print(f"policy {args.policy} on the knobs ({args.agent_dir})")
     clim = pipeline.build_climatology(cfg, train_ds)
