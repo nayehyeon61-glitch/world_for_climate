@@ -32,7 +32,10 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-KNOCKOUTS = ("memory", "innovation", "readout", "spread", "adaptive", "long")
+KNOCKOUTS = ("memory", "innovation", "readout", "spread", "adaptive", "long", "frozen")
+# "frozen" (stage 15.5): m keeps its current value (no recurrence, no innovation) while the tendency
+# network still reads it; with m = 0 it is the Markov version of the same column (the "memory" knock-out
+# also drops the tendency network's m-independent part, which SPEEDY-adapted models rely on).
 
 
 @dataclasses.dataclass
@@ -132,6 +135,8 @@ class MemoryKernel(nn.Module):
         """One step of the recurrence (one column-physics call)."""
         if "memory" in self.knock:
             return torch.zeros_like(m)
+        if "frozen" in self.knock:
+            return m
         tau = self.tau(x)
         if self.track is not None:
             lt = torch.log10(tau.detach().float() / 3600.0)  # [B, H, W, K]
@@ -171,7 +176,7 @@ class MemoryKernel(nn.Module):
     # ---------------------------------------------------------- observations
     def absorb(self, m: Tensor, forecast_g: Tensor, innov_g: Tensor, observed_g: Tensor) -> Tensor:
         """m after a re-observation; inputs [B, C_dyn, H, W] on the Gaussian grid."""
-        if not self.cfg.innovation or self.knock & {"innovation", "memory"}:
+        if not self.cfg.innovation or self.knock & {"innovation", "memory", "frozen"}:
             return m
         k = self.short
         if self.cfg.adaptive:
