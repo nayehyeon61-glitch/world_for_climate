@@ -1,0 +1,47 @@
+# Stage 12: active observation. The frozen stage 10 memory model (D-noactor) plays the
+# observation game: after each 6 h forecast an agent picks which equal-area patches of the
+# sphere to observe (budget 75% = 18 of 24, i.e. 6 patches stay hidden: the frozen model's
+# posterior blows up when 75% or 50% is hidden, see README_KO §12 amendment), the posterior
+# takes them in, the rest is forecast + readout. Run every stage 12 job under the stage 13 E1
+# bound: --set model.column.energy_max_flux=500 model.column.energy_no_work=true
+# Design and rules A1-A6: docs/results/README_KO.md §12. data_dir holds era5.zarr (2017-12 .. 2021-01).
+#
+#   python scripts/train_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt \
+#       --config configs/active_obs_wb2.yaml --data-dir DATA --out runs/stage12_P
+#   arms (--set):  P        the policy with the memory's maps (readout, state, timescale) and the state
+#                  P-nomem  policy.use_memory=false  (no memory maps; also the fair policy for N1)
+#                  P-age    policy.use_state=false policy.use_memory=false  (age, latitude and step only)
+#   python scripts/eval_active_obs.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt \
+#       --base runs/physics_n1/checkpoint.pt --policy runs/stage12_P/policy.pt \
+#       --config configs/active_obs_wb2.yaml --data-dir DATA --mode game --out runs/stage12_P/game_2020.json
+#   ... --mode climate --inits 8 --out runs/stage12_P/climate_2020.json
+data:
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2017-12-01", "2021-01-15"]
+  train: {start: "2018-01-01T06:00", end: "2019-12-31T18:00"}
+  val: {start: "2020-01-01", end: "2020-12-31T12:00"}
+eval:
+  climatology_zarr: "{data_dir}/climatology.zarr"
+
+policy:                 # train/active_obs.ObsPolicyConfig
+  bands: 4              # equal-area latitude bands (edges -90, -30, 0, 30, 90)
+  sectors: 6            # 60 deg longitude sectors -> 24 patches
+  budget: 0.75          # patches observed per observation time (18 of 24; 25% hides 75% and blows up)
+  hidden: 64
+  use_state: true       # the forecast's 6 h change per variable group, per patch
+  use_memory: true      # the memory's readout, state and timescale per patch
+  max_horizon: 8
+  temperature: 1.0
+
+active:                 # train/active_obs.ActiveConfig
+  steps: 100
+  members: 8            # sampled episodes per start (group-normalised reward-to-go)
+  horizon: 10           # 60 h
+  obs_steps: 6          # choices after the first six forecasts (36 h), then 24 h free
+  budget: 0.75
+  lr: 1.0e-3
+  warmup_steps: 10
+  grad_clip: 1.0
+  cap: 10.0             # a blown-up member scores this from then on
+  entropy: 0.0
+  log_every: 5

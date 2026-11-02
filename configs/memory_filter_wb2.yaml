@@ -1,0 +1,27 @@
+# Stage 10.2: continuous-filter training of the stage 10 memory model on 2018-2019 (train/memory_filter.py).
+# Start from runs/stage10_Dnoactor/checkpoint.pt; its memory config is kept and the fields below are added.
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2017-12-01", "2021-01-15"]
+  load_into_memory: false
+  train: {start: "2018-01-01T06:00", end: "2019-12-31T18:00"}
+  val: {start: "2020-01-01", end: "2020-12-31T12:00"}
+eval:
+  climatology_zarr: "{data_dir}/climatology.zarr"
+  init_hours: [0, 12]
+memory:
+  long_channels: 4            # L: slow channels 1 month .. 2 years; L0: 0 (the training change alone)
+  long_tau_hours: [720.0, 17520.0]
+filter:
+  fill_steps: 4               # 24 h re-observed every step
+  free_steps: 8               # 48 h free
+  epochs: 1                   # 2018-2019 once: 243 windows of 72 h
+  lr_model: 1.0e-4
+  lr_new: 1.0e-3
+  warmup_windows: 10
+  grad_clip: 1.0
+  cap: 10.0
+  train_model: true
+  log_every: 10
+  save_every: 10

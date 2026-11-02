@@ -1,0 +1,84 @@
+{
+ "experiment": "wb2_64x32_theory_continuous",
+ "checkpoint": "/tmp/claude-0/-home-claude/8817c18a-98ff-5ca4-b084-959138521b1a/scratchpad/runs/theory_cont/checkpoint.pt",
+ "lead_hours": 6.0,
+ "codebook_size": 0,
+ "physics_codes": 0,
+ "max_steps": 3,
+ "self_explainability": {
+  "pairs": 183,
+  "loss_persistence": 0.7642492055892944,
+  "loss_by_length": [
+   0.7642492055892944,
+   0.6889958381652832,
+   0.6571084260940552,
+   0.6493298411369324
+  ],
+  "loss_selected": 0.649699866771698,
+  "loss_floor": 0.530206561088562,
+  "explained_fraction": 0.4847910702228546,
+  "latent_by_length": [
+   0.03563247248530388,
+   0.03110436163842678,
+   0.0292928759008646,
+   0.028837447986006737
+  ],
+  "latent_selected": 0.028599802404642105,
+  "mean_length": 2.6925840377807617,
+  "mean_length_per_shell": [
+   2.8304710388183594,
+   2.9687743186950684,
+   2.6465001106262207,
+   2.546708345413208,
+   2.470465898513794
+  ],
+  "length_histogram": [
+   0.004787926096469164,
+   0.04363778233528137,
+   0.20577673614025116,
+   0.7457975745201111
+  ],
+  "corr_length_activity": 0.07107429206371307
+ },
+ "analog_transfer": {
+  "pairs": 183,
+  "loss_transfer": 0.644587516784668,
+  "loss_persistence": 0.7349057793617249,
+  "loss_delta": 1.0285035371780396,
+  "loss_random": 0.6519759297370911,
+  "loss_oracle": 0.6302556991577148,
+  "transfer_latent": 0.029069239273667336,
+  "persistence_latent": 0.034159623086452484,
+  "delta_latent": 0.05843662470579147,
+  "random_latent": 0.029592840000987053,
+  "oracle_latent": 0.027844121679663658,
+  "win_vs_delta": 1.0,
+  "win_vs_persistence": 1.0,
+  "win_vs_random": 0.7868852615356445,
+  "transfer_gain": 0.8612474203109741,
+  "delta_gain": -2.9588115215301514
+ },
+ "length_ood": {
+  "lead_hours": 12.0,
+  "by_steps": {
+   "3": {
+    "loss_persistence": 1.3984394073486328,
+    "loss_selected": 1.0130611658096313,
+    "loss_full": 1.012809157371521,
+    "loss_floor": 0.5532997250556946,
+    "latent_selected": 0.05996740236878395,
+    "mean_length": 2.9466822147369385,
+    "explained_fraction": 0.4522773027420044
+   },
+   "6": {
+    "loss_persistence": 1.3984394073486328,
+    "loss_selected": 0.953406572341919,
+    "loss_full": 0.9538695812225342,
+    "loss_floor": 0.5532997250556946,
+    "latent_selected": 0.05637425184249878,
+    "mean_length": 5.154879093170166,
+    "explained_fraction": 0.5230502486228943
+   }
+  }
+ }
+}

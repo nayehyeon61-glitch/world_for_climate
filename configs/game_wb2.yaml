@@ -1,0 +1,46 @@
+# Stage 7: prediction as a game on a frozen world model (World Models: V and M
+# frozen, only the controller C learns). The controller modulates the latent
+# GNN features per (shell, patch); the game hides part of the input.
+#   base model: trained on 2015-2017 (e.g. runs/wb2_pyramid_nodrop)
+#   game (controller training): 2018-2019        held-out test: 2020
+# data_dir holds era5.zarr (2017-12 .. 2021-01), as for configs/refine_wb2.yaml.
+#
+#   python scripts/play_game.py --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt \
+#       --config configs/game_wb2.yaml --data-dir DATA --mode rl --out runs/game_c1
+#   python scripts/play_game.py ... --mode grad --out runs/game_c1_grad          # gradient control
+#   python scripts/play_game.py ... --set control.use_state=false --out runs/game_c1_open
+#   python scripts/eval_game.py --checkpoint runs/wb2_pyramid_nodrop/checkpoint.pt \
+#       --config configs/game_wb2.yaml --data-dir DATA C1=runs/game_c1/controller.pt ...
+data:
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2017-12-01", "2021-01-15"]
+  train: {start: "2018-01-01T06:00", end: "2019-12-31T18:00"}
+  val: {start: "2020-01-01", end: "2020-12-31T12:00"}
+eval:
+  climatology_zarr: "{data_dir}/climatology.zarr"
+
+game:
+  mode: rl              # rl | grad (the control: same controller, exact gradient)
+  steps: 100           # 100 x 6 steps = the compute of 150 x 4
+  batch_size: 2
+  lr: 1.0e-3
+  warmup_steps: 10
+  members: 4            # GRPO group size
+  explore: 0.5          # policy std (action units)
+  horizon: 6            # 36 h sequences x_t -> x_t+1 -> ... (reward-to-go per step)
+  mask_kinds: [variables, shell, region]
+  mask_rate: 1.0        # 0: the no-mask game
+  region_fraction: 0.25
+  obs_prob: 0.5         # observational dropout in time: re-observe the masked truth with this chance
+  nudge: null           # re-observation: null = restart from the observed part (hidden at the mean);
+                        # 0.5 = nudging arm (C1nudge / n3nudge: keep the forecast, pull observed points halfway)
+  masked_weight: 0.5
+  log_every: 10
+
+control:
+  rank: 4
+  patch_splits: 0       # 12 patches
+  hidden: 64
+  action_scale: 0.1
+  use_state: true       # false: open loop
+  use_diagnostics: true

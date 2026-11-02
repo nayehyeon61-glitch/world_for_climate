@@ -1,0 +1,40 @@
+# Stage 13 E2 / E3: train an energy corrector of the column tendencies on a frozen checkpoint
+# (models/energy_corrector.py, train/memory_filter.train_filter with new_prefix "corrector.").
+#   E2: python scripts/train_energy_corrector.py --checkpoint runs/stage10_Dnoactor/checkpoint.pt \
+#         --config configs/energy_corrector_wb2.yaml --data-dir DATA2020 --out runs/stage13_E2 \
+#         --set model.column.energy_max_flux=500 model.column.energy_no_work=true
+#   E3 (soft): --set corrector.neutral=false corrector.soft_weight=1.0 --out runs/stage13_E3   (no E1 bound)
+#   local control: --set corrector.kind=mlp
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2017-12-01", "2021-01-15"]
+  load_into_memory: false
+  train: {start: "2018-01-01T06:00", end: "2019-12-31T18:00"}
+  val: {start: "2020-01-01", end: "2020-12-31T12:00"}
+eval:
+  climatology_zarr: "{data_dir}/climatology.zarr"
+  init_hours: [0, 12]
+corrector:
+  enabled: true
+  kind: sfno                  # sfno (non-local) | mlp (per column)
+  hidden: 16
+  layers: 2
+  modes: 16
+  inputs: state_tendency      # tendency: the corrector sees only the column output
+  neutral: true               # E2 hard projection; E3: false + soft_weight
+  soft_weight: 0.0
+  soft_bound: 500.0
+filter:
+  fill_steps: 4               # 24 h re-observed every step (the memory fills; nudging for N1)
+  free_steps: 8               # 48 h free
+  epochs: 1                   # 2018-2019 once: 243 windows of 72 h
+  lr_model: 1.0e-4
+  lr_new: 1.0e-3
+  warmup_windows: 10
+  grad_clip: 1.0
+  cap: 10.0
+  train_model: false          # the base model is frozen; only the corrector learns
+  new_prefix: "corrector."
+  log_every: 10
+  save_every: 10

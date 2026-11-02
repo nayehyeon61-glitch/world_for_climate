@@ -1,0 +1,59 @@
+# P2a: 1 deg pre-training on the full hourly archive, one 96 GB GPU.
+# The archive is coarsened 0.25 -> 1 deg on the fly (conservative, factor 4);
+# no derived copy is written. Before a long run:
+#   python scripts/benchmark_step.py --config configs/p2_1deg_96gb.yaml --device cuda
+#   python scripts/train.py --config configs/p2_1deg_96gb.yaml --device cuda --resume
+experiment: p2_1deg_lie_diffusion_chain
+output_dir: runs/p2_1deg
+
+data:
+  source: era5_hourly
+  era5_config: configs/era5_lustre_hourly.yaml
+  archive: {coarsen: 4}                     # 721 x 1440 -> 181 x 360
+  time_range: ["1979-01-01", "2019-01-15"]
+  train: {start: "1979-01-01T06:00", end: "2017-12-31T18:00"}   # GraphCast training years
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}           # GraphCast test year
+  stats_samples: 1024
+  stats_workers: 16
+  stats_path: runs/p2_1deg/stats.json       # computed once, reused on resume
+
+task:
+  name: graphcast_13_no_w
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null   # surface | 1000-850 | 700-500 | 400-200 | 150-50 hPa
+
+model:
+  transition: lie_diffusion
+  history: 2
+  mesh: {mesh_splits: 5, latent_splits: 5, patch_splits: 2, break_symmetry: true}  # 10,242 nodes, 162 patches
+  gnn: {hidden_dim: 256, vector_dim: 32, latent_scalars: 64, latent_vectors: 16,
+        hidden_layers: 1, encoder_layers: 2, latent_layers: 2, decoder_layers: 2}
+  lie: {layers: 4, shell_coupling: chain}
+  diffusion: {layers: 6, cond_dim: 256, num_steps_denoising: 3}
+  residual_layers: 2
+
+benchmark: {resolution: 1.0}
+
+train:
+  batch_size: 2
+  num_workers: 16          # parallel Lustre readers (each sample reads ~3 frames at 0.25 deg)
+  prefetch_factor: 4
+  log_every: 100
+  engine: {amp: bf16, accum_steps: 2, grad_checkpointing: false, save_every: 1000}
+  stages:
+    - {name: repr, steps: 20000, lr: 1.0e-3, warmup_steps: 1000, weights: {rec: 1.0}}
+    - {name: dynamics, steps: 60000, lr: 5.0e-4, warmup_steps: 1000, rollout_steps: 2,
+       weights: {forecast: 1.0, latent: 0.1, rec: 0.5, geo: 1.0e-3, joint: 1.0e-3}}
+    - {name: stochastic, steps: 30000, lr: 3.0e-4, warmup_steps: 500, rollout_steps: 1,
+       weights: {gen: 1.0}}
+
+eval:
+  lead_steps: 40           # 6 h .. 240 h
+  members: 8
+  batch_size: 1
+  init_hours: [0, 12]
+  # WeatherBench-2 0.25 deg climatology, read lazily and coarsened to 1 deg
+  climatology_zarr: gs://weatherbench2/datasets/era5-hourly-climatology/1990-2017_6h_1440x721.zarr
+  climatology_load: false
+  climatology_coarsen: 4
