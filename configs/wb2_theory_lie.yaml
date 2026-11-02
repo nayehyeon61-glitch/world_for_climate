@@ -1,0 +1,50 @@
+# Learning-to-Theorize stage on the WeatherBench-2 64 x 32 model (arm C, VQ-Lie).
+# The encoder / decoder / Lie transition come from the trained lie_diffusion run;
+# only the programmer and the so(3) codebook learn, explaining each 6 h change by
+# the shortest accurate program of codebook primitives per (shell, patch).
+#
+#   python scripts/train.py --config configs/wb2_theory_lie.yaml --data-dir DATA \
+#       --init-from runs/wb2_64x32/checkpoint.pt
+#   python scripts/eval_transfer.py --checkpoint runs/wb2_theory_lie/checkpoint.pt --data-dir DATA
+experiment: wb2_64x32_theory_vq_lie
+output_dir: runs/wb2_theory_lie
+
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2015-01-01", "2019-01-15"]
+  load_into_memory: true
+  train: {start: "2015-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 256
+
+task:
+  name: graphcast_13
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null
+
+model:
+  transition: lie_program
+  history: 2
+  mesh: {mesh_splits: 3, latent_splits: 3, patch_splits: 1, break_symmetry: true}
+  gnn: {hidden_dim: 64, vector_dim: 16, latent_scalars: 32, latent_vectors: 8,
+        hidden_layers: 1, encoder_layers: 2, latent_layers: 1, decoder_layers: 2}
+  lie: {layers: 2, shell_coupling: chain}
+  theory: {codebook_size: 16, max_steps: 3, lambda_mdl: 1.0, commitment: 0.25,
+           entropy_weight: 0.1, ema_decay: 0.99, dead_code_steps: 200}
+
+train:
+  batch_size: 2
+  num_workers: 0
+  log_every: 25
+  stages:
+    - {name: theory, steps: 1500, lr: 5.0e-4, warmup_steps: 50,
+       weights: {rec: 1.0, latent: 1.0, vq: 1.0, entropy: 0.1}}
+
+eval:
+  lead_steps: 2                   # 6 h pairs (+ 12 h pairs for the length test)
+  members: 1
+  batch_size: 1
+  init_hours: [0, 12]
+  climatology_zarr: "{data_dir}/climatology.zarr"

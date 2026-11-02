@@ -1,0 +1,28 @@
+# GraphCast task alignment (research design section 3). Task names map to
+# climate_wm.data.graphcast_mapping.TASKS, which mirror
+# weathernext/weathernext1_graph/graphcast.py:
+#   graphcast              TASK              37 levels, 0.25 deg (paper model)
+#   graphcast_13           TASK_13           13 levels (GraphCast_small task)
+#   graphcast_operational  TASK_13_PRECIP_OUT 13 levels, no precip input
+#   graphcast_13_no_w      plan B: TASK_13 without vertical_velocity (our ERA5)
+#   graphcast_operational_no_w
+#
+# Inputs  : X[t-6h], X[t] = target variables (+ precip unless *_operational)
+#           + forcings (toa_incident_solar_radiation, year/day progress sin/cos)
+#           + static (geopotential_at_surface, land_sea_mask)
+# Forcings: the same forcing variables at the target time t+6h
+# Targets : 2m_temperature, mean_sea_level_pressure, 10m_u/v_component_of_wind,
+#           total_precipitation_6hr, and temperature, geopotential,
+#           u/v_component_of_wind, [vertical_velocity], specific_humidity
+#           on every pressure level
+# Rollout : 6h steps up to 240h (40 steps)
+task:
+  name: graphcast_13_no_w
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  timestep: 6h
+  input_duration: 12h
+evaluation:
+  lead_hours: [6, 24, 72, 120, 240]
+  metrics: [rmse_eq20, rmse_trad_eq21, acc_eq29, rmse_skill_score, acc_skill_score]
+  climatology: ERA5 1993-2016, day-of-year x hour (WeatherBench-2 zarr)
+  init_hours_vs_hres: [6, 18]

@@ -1,0 +1,46 @@
+# P1: GraphCast-aligned 13-level task on real ERA5 (plan B without w).
+# 1.0 deg (181 x 360, GraphCast_small resolution) is the first target; for
+# 0.25 deg (721 x 1440) set mesh_splits: 6 and plan distributed training (P4).
+experiment: p1_graphcast13_no_w
+output_dir: runs/p1
+
+data:
+  source: era5
+  era5_config: configs/era5_source.yaml
+  train: {start: "1979-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01T06:00", end: "2018-12-31T18:00"}
+  stats_samples: 512
+
+task:
+  name: graphcast_13_no_w
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null   # surface | 1000-850 | 700-500 | 400-200 | 150-50 hPa
+
+model:
+  transition: lie_diffusion
+  history: 2
+  mesh: {mesh_splits: 5, latent_splits: 4, patch_splits: 2, break_symmetry: true}
+  gnn: {hidden_dim: 256, vector_dim: 32, latent_scalars: 64, latent_vectors: 16,
+        hidden_layers: 1, encoder_layers: 4, latent_layers: 4, decoder_layers: 4}
+  lie: {layers: 4, shell_coupling: chain}
+  diffusion: {layers: 8, cond_dim: 256, num_steps_denoising: 3}
+  residual_layers: 4
+
+train:
+  batch_size: 4
+  num_workers: 8
+  log_every: 50
+  stages:
+    - {name: repr, steps: 50000, lr: 1.0e-3, warmup_steps: 1000, weights: {rec: 1.0}}
+    - {name: dynamics, steps: 100000, lr: 3.0e-4, warmup_steps: 1000, rollout_steps: 4,
+       weights: {forecast: 1.0, latent: 0.1, rec: 0.5, geo: 1.0e-3, joint: 1.0e-3}}
+    - {name: stochastic, steps: 100000, lr: 1.0e-4, warmup_steps: 100, rollout_steps: 2,
+       weights: {gen: 1.0}}
+
+eval:
+  lead_steps: 40          # 6h .. 240h
+  members: 8
+  batch_size: 1
+  init_hours: [0, 6, 12, 18]
+  climatology_zarr: null  # e.g. WeatherBench-2 ERA5 1990-2017 hourly climatology

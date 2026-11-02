@@ -1,0 +1,56 @@
+# Stage 5 arm G2: G1 + physical diagnostics of the observed state as encoder
+# inputs (hydrostatic and geostrophic residuals, N^2, saturation deficit,
+# divergence / vorticity, t2m - T1000; eval/physics_diag.py).
+#
+#   python scripts/train.py --config configs/wb2_g2.yaml --data-dir DATA
+experiment: wb2_64x32_g2_diagnostics
+output_dir: runs/wb2_g2
+
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2015-01-01", "2019-01-15"]
+  load_into_memory: true
+  train: {start: "2015-01-01T06:00", end: "2017-12-31T18:00"}
+  val: {start: "2018-01-01", end: "2018-12-31T12:00"}
+  stats_samples: 256
+
+task:
+  name: graphcast_13
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+
+shells: null
+
+model:
+  transition: pyramid_diffusion
+  history: 2
+  mesh: {mesh_splits: 3, latent_splits: 3, patch_splits: 1, break_symmetry: true,
+         pyramid_levels: [1, 2, 3], pyramid_detail_level: 2}
+  gnn: {hidden_dim: 64, vector_dim: 16, latent_scalars: 32, latent_vectors: 8,
+        hidden_layers: 1, encoder_layers: 2, latent_layers: 1, decoder_layers: 2}
+  lie: {layers: 2, shell_coupling: independent}
+  pyramid: {level_weights: [1.0, 0.5, 0.25], skip_dropout: 0.5, level_layers: 1}
+  diffusion: {layers: 3, cond_dim: 64, num_steps_denoising: 3}
+  residual_layers: 2
+  composite: {enabled: true, vert: true, families: [radiation, mixing, surface, condensation],
+              mixing_rank: 4, max_shift: 0.5, splitting: strang, diag_gates: true, coef_init: 0.1}
+  diagnostics: {enabled: true}
+
+train:
+  batch_size: 2
+  num_workers: 0
+  log_every: 25
+  engine: {save_every: 100}        # resumable mid-stage (2 h background job limit)
+  stages:
+    - {name: repr, steps: 600, lr: 1.0e-3, warmup_steps: 50, weights: {rec: 1.0}}
+    - {name: dynamics, steps: 1000, lr: 5.0e-4, warmup_steps: 50, rollout_steps: 2,
+       weights: {forecast: 1.0, latent: 0.1, rec: 0.5, geo: 1.0e-3, joint: 1.0e-3, fib: 1.0e-3}}
+    - {name: stochastic, steps: 500, lr: 3.0e-4, warmup_steps: 50, rollout_steps: 1,
+       weights: {gen: 1.0}}
+
+eval:
+  lead_steps: 20                  # 6h .. 120h
+  members: 4
+  batch_size: 1
+  init_hours: [0, 12]
+  climatology_zarr: "{data_dir}/climatology.zarr"

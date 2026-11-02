@@ -1,0 +1,38 @@
+# Stage 14 (감자 18:07 KST 11/01 "기억을 더 채운 다음 강화 구조"): adapt the E2 memory model
+# (runs/stage13_E2: N1 + 16-channel memory + energy-neutral SFNO corrector + E1 bound) to the SPEEDY world
+# with the continuous filter (train/memory_filter.py: 24 h re-observed + 48 h free per 72 h window, memory
+# carried across windows, every parameter trained), with the action channels (zero here) and SPEEDY's
+# daily-mean insolation. Run with scripts/train_energy_corrector.py and
+#   --set model.action_channels=3 model.solar=daily_mean data.path=$S/speedy_wb2/nature.zarr
+data:
+  source: zarr
+  path: "{data_dir}/nature.zarr"
+  time_range: ["1982-01-01", "1985-01-01"]
+  load_into_memory: false
+  train: {start: "1982-01-01T12:00", end: "1983-12-31T18:00"}   # first init with two input frames (nature starts 06:00)
+  val: {start: "1984-01-01", end: "1984-12-31T12:00"}
+eval:
+  climatology_zarr: null
+corrector:                    # E2, unchanged
+  enabled: true
+  kind: sfno
+  hidden: 16
+  layers: 2
+  modes: 16
+  inputs: state_tendency
+  neutral: true
+  soft_weight: 0.0
+  soft_bound: 500.0
+filter:
+  fill_steps: 4
+  free_steps: 8
+  epochs: 1                   # 1982-1983 once: 243 windows of 72 h
+  lr_model: 1.0e-4            # column, surface head, memory kernel
+  lr_new: 1.0e-4              # corrector (already trained on ERA5)
+  warmup_windows: 10
+  grad_clip: 1.0
+  cap: 10.0
+  train_model: true
+  new_prefix: "corrector."
+  log_every: 10
+  save_every: 10

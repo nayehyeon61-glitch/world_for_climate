@@ -1,0 +1,44 @@
+# Stage 8 phase 1: transition-cost topology on the frozen P-nodrop latents
+# (scripts/eval_topology.py, eval/topology.py, models/commute_time.py).
+# Heads learn on 2015-17, every test uses 2018. Data: the stage 1 WeatherBench-2 subset.
+
+data:
+  source: zarr
+  path: "{data_dir}/era5.zarr"
+  time_range: ["2015-01-01", "2019-01-15"]
+  load_into_memory: false    # a side job next to training: stream from disk
+
+topology:
+  train_end: "2018-01-01"
+  test_end: "2019-01-01"
+  patch_splits: 0            # 12 patches
+  batch_size: 4
+  threads: 1
+  wm_stride: 24              # world model error every 6 days of 2018
+  wm_steps: 12               # 72 h
+  n_clusters: 64             # Markov state model
+  leads: [4, 12, 20]         # analog forecasts at 24, 72, 120 h
+  pca_dim: 128
+  topo_dim: 16               # persistence and regimes in the top-16 principal directions
+  analogs: 10
+  n_boot: 200
+
+head:                        # models/commute_time.CommuteConfig, shared by the arms
+  dim: 16
+  hidden: 128
+  beta: 0.1
+  gamma: 1.0
+  steps: 3000
+  batch_size: 256
+  lr: 1.0e-3
+
+arms:
+  psi_ct: {}                         # CTWM, forcing as action
+  psi_iso: {regulariser: vicreg}     # isotropic spread: loses the 1/lambda scaling
+  psi_shuffle: {pairs: shuffle}      # random pairs: no dynamics (negative control)
+  psi_beta0: {beta: 0.0}             # cause analysis: slowness
+  psi_beta1: {beta: 1.0}
+  psi_dim8: {dim: 8}                 # dimension
+  psi_dim32: {dim: 32}
+  psi_noaction: {use_action: false}  # forcing as action
+  psi_patch: {mode: patch, dim: 8}   # regional heads (shared weights)

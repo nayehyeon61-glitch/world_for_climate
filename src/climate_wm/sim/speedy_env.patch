@@ -1,0 +1,714 @@
+diff --git a/source/convection.f90 b/source/convection.f90
+index a8c668b..77b0d81 100644
+--- a/source/convection.f90
++++ b/source/convection.f90
+@@ -9,12 +9,12 @@ module convection
+     implicit none
+ 
+     private
+-    public get_convection_tendencies
++    public get_convection_tendencies, trcnv
+ 
+     ! Constants for convection
+     real(p), parameter :: psmin  = 0.8 !! Minimum (normalised) surface pressure for the occurrence
+                                        !! of convection
+-    real(p), parameter :: trcnv  = 6.0 !! Time of relaxation (in hours) towards reference state
++    real(p)            :: trcnv  = 6.0 !! Time of relaxation (in hours) towards reference state
+     real(p), parameter :: rhbl   = 0.9 !! Relative humidity threshold in the boundary layer
+     real(p), parameter :: rhil   = 0.7 !! Relative humidity threshold in intermeduate layers for
+                                        !! secondary mass flux
+diff --git a/source/coupler.f90 b/source/coupler.f90
+index e05d49f..8c19517 100755
+--- a/source/coupler.f90
++++ b/source/coupler.f90
+@@ -12,6 +12,7 @@ contains
+     subroutine initialize_coupler
+         use land_model, only: land_model_init, couple_land_atm
+         use sea_model, only: sea_model_init, couple_sea_atm
++        use env_control, only: apply_sst_patch
+ 
+         ! Initialize land model constants
+         call land_model_init
+@@ -24,16 +25,19 @@ contains
+ 
+         ! Initialize sea and ice model variables
+         call couple_sea_atm(0)
++        call apply_sst_patch
+     end subroutine
+ 
+     !> Exchange fluxes between atmosphere and land/sea.
+     subroutine couple_sea_land(day)
+         use land_model, only: couple_land_atm
+         use sea_model, only: couple_sea_atm
++        use env_control, only: apply_sst_patch
+ 
+         integer, intent(in) :: day !! The current day of the model integration (starting from 0)
+ 
+         call couple_land_atm(day)
+         call couple_sea_atm(day)
++        call apply_sst_patch
+     end subroutine
+ end module
+diff --git a/source/env_control.f90 b/source/env_control.f90
+new file mode 100644
+index 0000000..54155ec
+--- /dev/null
++++ b/source/env_control.f90
+@@ -0,0 +1,388 @@
++!> Environment control for the climate world-model experiments (stage 14).
++!  Restart files, interventions (solar factor, CO2 absorptivity, SST patches,
++!  convection relaxation time, surface drag) and extra surface output
++!  (accumulated precipitation, near-surface fields, SST, insolation).
++module env_control
++    use types, only: p, sp
++    use params, only: ix, il, kx, mx, nx, ntr, nsteps, delt
++    use netcdf
++
++    implicit none
++
++    private
++    public read_control, write_restart, read_restart, apply_sst_patch
++    public save_surface, accumulate_step, output_surface, write_static
++    public save_tendencies, output_tendencies
++    public restart_in, restart_out, static_out
++    public heat_scale, moist_scale, mom_scale
++
++    integer, parameter :: max_patch = 8
++
++    character(len=256) :: restart_in = ''   !! Restart file to start from ('' = rest state)
++    character(len=256) :: restart_out = ''  !! Restart file written at the end of the run
++    character(len=256) :: static_out = ''   !! Static fields file written at initialization
++    real(p) :: solar_factor = 1.0           !! Multiplies the solar constant
++    real(p) :: co2_factor = 1.0             !! Multiplies the CO2-band absorptivity
++    real(p) :: conv_factor = 1.0            !! Multiplies the convective relaxation time
++    real(p) :: drag_factor = 1.0            !! Multiplies the surface drag coefficients
++    real(p) :: heat_scale = 1.0             !! Stage 15.4 cut: multiplies the physics temperature tendency
++    real(p) :: moist_scale = 1.0            !! Stage 15.4 cut: multiplies the physics humidity tendency
++    real(p) :: mom_scale = 1.0              !! Stage 15.4 cut: multiplies the physics wind tendency
++    integer :: n_patch = 0                  !! Number of SST anomaly patches
++    real(p) :: patch_lon(max_patch) = 0.0   !! Patch centre longitude (degrees east)
++    real(p) :: patch_lat(max_patch) = 0.0   !! Patch centre latitude (degrees north)
++    real(p) :: patch_radius(max_patch) = 10.0 !! Patch e-folding radius (degrees of arc)
++    real(p) :: patch_amp(max_patch) = 0.0   !! Patch amplitude (K)
++
++    real(p) :: prec_acc(ix,il) = 0.0        !! Accumulated precipitation since the last output (mm)
++    real(p) :: t0_sav(ix,il) = 0.0, u0_sav(ix,il) = 0.0, v0_sav(ix,il) = 0.0, ts_sav(ix,il) = 0.0
++    real(p) :: patch_field(ix,il) = 0.0     !! Sum of the SST patches (K), before masks
++
++    ! Stage 15 (simulator as teacher): per-process physics tendencies, averaged over the output interval
++    logical :: tend_out = .false.           !! Write yyyymmddhhmm_tend.nc at every output time
++    integer, parameter :: n_tend = 10
++    real(p) :: tend_acc(ix,il,kx,n_tend) = 0.0  !! Sums of the per-process tendencies since the last output
++    integer :: n_tend_acc = 0                !! Number of physics calls in tend_acc
++    ! Stage 15 episode group B: spatially correlated perturbation of the restart state
++    integer :: perturb_seed = 0             !! 0 = no perturbation
++    real(p) :: perturb_t = 0.0              !! rms temperature perturbation (K)
++    real(p) :: perturb_vor = 0.0            !! rms vorticity perturbation (1/s)
++    real(p) :: perturb_ps = 0.0             !! rms log surface pressure perturbation
++    real(p) :: perturb_scale = 8.0          !! e-folding total wavenumber of the perturbation spectrum
++
++contains
++    !> Reads the &control namelist and applies the parameter interventions.
++    subroutine read_control
++        use shortwave_radiation, only: solc, ablco2
++        use convection, only: trcnv
++        use surface_fluxes, only: cdl, cds
++        namelist /control/ restart_in, restart_out, static_out, solar_factor, co2_factor, &
++            & conv_factor, drag_factor, n_patch, patch_lon, patch_lat, patch_radius, patch_amp, tend_out, &
++            & perturb_seed, perturb_t, perturb_vor, perturb_ps, perturb_scale, heat_scale, moist_scale, mom_scale
++        logical :: exists
++
++        inquire(file="namelist.nml", exist=exists)
++        if (exists) then
++            open(10, file="namelist.nml")
++            read(10, nml=control)
++            close(10)
++        end if
++
++        solc = solc*solar_factor
++        ablco2 = ablco2*co2_factor
++        trcnv = trcnv*conv_factor
++        cdl = cdl*drag_factor
++        cds = cds*drag_factor
++        write (*,'(A,4F8.3,I3)') 'control: solar co2 conv drag factors, patches = ', &
++            & solar_factor, co2_factor, conv_factor, drag_factor, n_patch
++        if (n_patch > max_patch) stop 'n_patch > max_patch'
++        if (len_trim(restart_in) > 0) write (*,'(A,A)') 'control: restart from ', trim(restart_in)
++        ! the patch field needs the model geometry, so it is built on first use
++    end subroutine
++
++    !> Builds the SST patch field (needs the model geometry).
++    subroutine build_patches
++        use geometry, only: radang
++        integer :: i, j, n
++        real(p) :: pi, lat, lon, cosd, d
++        logical, save :: built = .false.
++
++        if (built) return
++        built = .true.
++        pi = 4.0*atan(1.0)
++        patch_field = 0.0
++        do n = 1, n_patch
++            do j = 1, il
++                lat = radang(j)
++                do i = 1, ix
++                    lon = (i - 1)*2.0*pi/ix
++                    cosd = sin(lat)*sin(patch_lat(n)*pi/180.0) + cos(lat)*cos(patch_lat(n)*pi/180.0)&
++                        & *cos(lon - patch_lon(n)*pi/180.0)
++                    d = acos(max(-1.0_p, min(1.0_p, cosd)))*180.0/pi
++                    patch_field(i,j) = patch_field(i,j) + patch_amp(n)*exp(-(d/patch_radius(n))**2)
++                end do
++            end do
++        end do
++    end subroutine
++
++    !> Adds the SST patches to the SST seen by the atmosphere (open sea only).
++    subroutine apply_sst_patch
++        use sea_model, only: sst_am, sice_am, fmask_s
++        if (n_patch <= 0) return
++        call build_patches
++        where (fmask_s > 0.0) sst_am = sst_am + patch_field*(1.0 - sice_am)
++    end subroutine
++
++    !> Keeps the near-surface diagnostics of the last physics call.
++    subroutine save_surface(t0, u0, v0, ts)
++        real(p), intent(in) :: t0(ix,il), u0(ix,il), v0(ix,il), ts(ix,il)
++        t0_sav = t0
++        u0_sav = u0
++        v0_sav = v0
++        ts_sav = ts
++    end subroutine
++
++    !> Accumulates precipitation over one leapfrog step (g/m2/s * s = 1e-3 mm).
++    subroutine accumulate_step
++        use auxiliaries, only: precnv, precls
++        prec_acc = prec_acc + (precnv + precls)*delt*1.0e-3
++    end subroutine
++
++    !> Writes the surface fields of this output time to yyyymmddhhmm_sfc.nc.
++    subroutine output_surface(timestep)
++        use date, only: model_datetime
++        use geometry, only: radang
++        use sea_model, only: sst_am
++        use shortwave_radiation, only: fsol
++        use auxiliaries, only: olr, tsr
++        integer, intent(in) :: timestep
++        character(len=19) :: file_name = 'yyyymmddhhmm_sfc.nc'
++        integer :: ncid, londim, latdim, timedim, lonvar, latvar, timevar, k, n
++        integer :: varid(9)
++        character(len=8), parameter :: names(9) = (/ 'tp      ', 't2m     ', 'u10     ', &
++            & 'v10     ', 'skt     ', 'sst     ', 'tisr    ', 'olr     ', 'tsr     ' /)
++        real(sp) :: field(ix,il)
++
++        write (file_name(1:4),'(i4.4)') model_datetime%year
++        write (file_name(5:6),'(i2.2)') model_datetime%month
++        write (file_name(7:8),'(i2.2)') model_datetime%day
++        write (file_name(9:10),'(i2.2)') model_datetime%hour
++        write (file_name(11:12),'(i2.2)') model_datetime%minute
++
++        call check(nf90_create(file_name, nf90_clobber, ncid))
++        call check(nf90_def_dim(ncid, "time", nf90_unlimited, timedim))
++        call check(nf90_def_dim(ncid, "lon", ix, londim))
++        call check(nf90_def_dim(ncid, "lat", il, latdim))
++        call check(nf90_def_var(ncid, "time", nf90_real4, timedim, timevar))
++        call check(nf90_def_var(ncid, "lon", nf90_real4, londim, lonvar))
++        call check(nf90_def_var(ncid, "lat", nf90_real4, latdim, latvar))
++        do n = 1, 9
++            call check(nf90_def_var(ncid, trim(names(n)), nf90_real4, (/ londim, latdim, timedim /), &
++                & varid(n)))
++        end do
++        call check(nf90_put_att(ncid, varid(1), "units", "mm since previous output"))
++        call check(nf90_enddef(ncid))
++        call check(nf90_put_var(ncid, timevar, timestep*24.0/real(nsteps,sp), (/ 1 /)))
++        call check(nf90_put_var(ncid, lonvar, (/ (3.75*k, k = 0, ix-1) /), (/ 1 /)))
++        call check(nf90_put_var(ncid, latvar, (/ (radang(k)*90.0/asin(1.0), k = 1, il) /), (/ 1 /)))
++        do n = 1, 9
++            select case (n)
++            case (1); field = real(prec_acc, sp)
++            case (2); field = real(t0_sav, sp)
++            case (3); field = real(u0_sav, sp)
++            case (4); field = real(v0_sav, sp)
++            case (5); field = real(ts_sav, sp)
++            case (6); field = real(sst_am, sp)
++            case (7); field = real(fsol, sp)
++            case (8); field = real(olr, sp)
++            case (9); field = real(tsr, sp)
++            end select
++            call check(nf90_put_var(ncid, varid(n), field, (/ 1, 1, 1 /)))
++        end do
++        call check(nf90_close(ncid))
++        prec_acc = 0.0
++    end subroutine
++
++    !> Adds the per-process tendencies of one physics call (T: K/s, q: g/kg/s, u, v: m/s^2).
++    subroutine save_tendencies(tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, qt_lsc, qt_pbl, ut_pbl, vt_pbl)
++        real(p), dimension(ix,il,kx), intent(in) :: tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, &
++            & qt_lsc, qt_pbl, ut_pbl, vt_pbl
++        if (.not. tend_out) return
++        tend_acc(:,:,:,1) = tend_acc(:,:,:,1) + tt_cnv
++        tend_acc(:,:,:,2) = tend_acc(:,:,:,2) + tt_lsc
++        tend_acc(:,:,:,3) = tend_acc(:,:,:,3) + tt_rsw
++        tend_acc(:,:,:,4) = tend_acc(:,:,:,4) + tt_rlw
++        tend_acc(:,:,:,5) = tend_acc(:,:,:,5) + tt_pbl
++        tend_acc(:,:,:,6) = tend_acc(:,:,:,6) + qt_cnv
++        tend_acc(:,:,:,7) = tend_acc(:,:,:,7) + qt_lsc
++        tend_acc(:,:,:,8) = tend_acc(:,:,:,8) + qt_pbl
++        tend_acc(:,:,:,9) = tend_acc(:,:,:,9) + ut_pbl
++        tend_acc(:,:,:,10) = tend_acc(:,:,:,10) + vt_pbl
++        n_tend_acc = n_tend_acc + 1
++    end subroutine
++
++    !> Writes the mean per-process tendencies since the last output to yyyymmddhhmm_tend.nc
++    !  (sigma levels, top to bottom as in the model).
++    subroutine output_tendencies(timestep)
++        use date, only: model_datetime
++        use geometry, only: radang, fsg
++        integer, intent(in) :: timestep
++        character(len=20) :: file_name = 'yyyymmddhhmm_tend.nc'
++        integer :: ncid, londim, latdim, levdim, timedim, lonvar, latvar, levvar, timevar, k, n
++        integer :: varid(n_tend)
++        character(len=8), parameter :: names(n_tend) = (/ 'tt_cnv  ', 'tt_lsc  ', 'tt_rsw  ', &
++            & 'tt_rlw  ', 'tt_pbl  ', 'qt_cnv  ', 'qt_lsc  ', 'qt_pbl  ', 'ut_pbl  ', 'vt_pbl  ' /)
++        real(sp) :: field(ix,il,kx)
++
++        if (.not. tend_out) return
++        write (file_name(1:4),'(i4.4)') model_datetime%year
++        write (file_name(5:6),'(i2.2)') model_datetime%month
++        write (file_name(7:8),'(i2.2)') model_datetime%day
++        write (file_name(9:10),'(i2.2)') model_datetime%hour
++        write (file_name(11:12),'(i2.2)') model_datetime%minute
++
++        call check(nf90_create(file_name, nf90_clobber, ncid))
++        call check(nf90_def_dim(ncid, "time", nf90_unlimited, timedim))
++        call check(nf90_def_dim(ncid, "lon", ix, londim))
++        call check(nf90_def_dim(ncid, "lat", il, latdim))
++        call check(nf90_def_dim(ncid, "lev", kx, levdim))
++        call check(nf90_def_var(ncid, "time", nf90_real4, timedim, timevar))
++        call check(nf90_def_var(ncid, "lon", nf90_real4, londim, lonvar))
++        call check(nf90_def_var(ncid, "lat", nf90_real4, latdim, latvar))
++        call check(nf90_def_var(ncid, "lev", nf90_real4, levdim, levvar))
++        do n = 1, n_tend
++            call check(nf90_def_var(ncid, trim(names(n)), nf90_real4, (/ londim, latdim, levdim, timedim /), &
++                & varid(n)))
++        end do
++        call check(nf90_put_att(ncid, nf90_global, "units", "tt: K/s, qt: g/kg/s, ut/vt: m/s2; mean since previous output"))
++        call check(nf90_enddef(ncid))
++        call check(nf90_put_var(ncid, timevar, timestep*24.0/real(nsteps,sp), (/ 1 /)))
++        call check(nf90_put_var(ncid, lonvar, (/ (3.75*k, k = 0, ix-1) /), (/ 1 /)))
++        call check(nf90_put_var(ncid, latvar, (/ (radang(k)*90.0/asin(1.0), k = 1, il) /), (/ 1 /)))
++        call check(nf90_put_var(ncid, levvar, real(fsg, sp), (/ 1 /)))
++        do n = 1, n_tend
++            field = real(tend_acc(:,:,:,n)/max(n_tend_acc, 1), sp)
++            call check(nf90_put_var(ncid, varid(n), field, (/ 1, 1, 1, 1 /)))
++        end do
++        call check(nf90_close(ncid))
++        tend_acc = 0.0
++        n_tend_acc = 0
++    end subroutine
++
++    !> Writes orography (m), land fraction and sea fraction to static_out.
++    subroutine write_static
++        use boundaries, only: phis0
++        use land_model, only: fmask_l
++        use sea_model, only: fmask_s
++        use physical_constants, only: grav
++        use geometry, only: radang
++        integer :: ncid, londim, latdim, lonvar, latvar, v1, v2, v3, k
++        if (len_trim(static_out) == 0) return
++        call check(nf90_create(trim(static_out), nf90_clobber, ncid))
++        call check(nf90_def_dim(ncid, "lon", ix, londim))
++        call check(nf90_def_dim(ncid, "lat", il, latdim))
++        call check(nf90_def_var(ncid, "lon", nf90_real4, londim, lonvar))
++        call check(nf90_def_var(ncid, "lat", nf90_real4, latdim, latvar))
++        call check(nf90_def_var(ncid, "orography", nf90_real4, (/ londim, latdim /), v1))
++        call check(nf90_def_var(ncid, "land_fraction", nf90_real4, (/ londim, latdim /), v2))
++        call check(nf90_def_var(ncid, "sea_fraction", nf90_real4, (/ londim, latdim /), v3))
++        call check(nf90_enddef(ncid))
++        call check(nf90_put_var(ncid, lonvar, (/ (3.75*k, k = 0, ix-1) /)))
++        call check(nf90_put_var(ncid, latvar, (/ (radang(k)*90.0/asin(1.0), k = 1, il) /)))
++        call check(nf90_put_var(ncid, v1, real(phis0/grav, sp)))
++        call check(nf90_put_var(ncid, v2, real(fmask_l, sp)))
++        call check(nf90_put_var(ncid, v3, real(fmask_s, sp)))
++        call check(nf90_close(ncid))
++    end subroutine
++
++    !> Writes the full model state (both leapfrog levels, land and sea states).
++    subroutine write_restart
++        use date, only: model_datetime
++        use prognostics, only: vor, div, t, ps, tr, phi
++        use land_model, only: stl_lm, stl_am
++        use sea_model, only: sst_om, sst_am, sstan_am, sice_om, sice_am, tice_om, tice_am, &
++            & ssti_om, sstan3, fmask_s
++        real(p) :: sst_nopatch(ix,il)
++        if (len_trim(restart_out) == 0) return
++        sst_nopatch = sst_am
++        if (n_patch > 0) then
++            call build_patches
++            where (fmask_s > 0.0) sst_nopatch = sst_am - patch_field*(1.0 - sice_am)
++        end if
++        open(20, file=trim(restart_out), access='stream', form='unformatted', status='replace')
++        write (20) model_datetime%year, model_datetime%month, model_datetime%day, &
++            & model_datetime%hour, model_datetime%minute
++        write (20) vor, div, t, ps, tr, phi
++        write (20) stl_lm, stl_am
++        write (20) sst_om, sst_nopatch, sstan_am, sice_om, sice_am, tice_om, tice_am, ssti_om, sstan3
++        close(20)
++        write (*,'(A,A)') 'control: wrote restart ', trim(restart_out)
++    end subroutine
++
++    !> Reads the state written by write_restart (after the first step was initialised).
++    subroutine read_restart
++        use date, only: model_datetime
++        use prognostics, only: vor, div, t, ps, tr, phi
++        use land_model, only: stl_lm, stl_am
++        use sea_model, only: sst_om, sst_am, sstan_am, sice_om, sice_am, tice_om, tice_am, &
++            & ssti_om, sstan3
++        integer :: yy, mm, dd, hh, mi
++        if (len_trim(restart_in) == 0) return
++        open(21, file=trim(restart_in), access='stream', form='unformatted', status='old')
++        read (21) yy, mm, dd, hh, mi
++        if (yy /= model_datetime%year .or. mm /= model_datetime%month .or. &
++            & dd /= model_datetime%day .or. hh /= model_datetime%hour .or. &
++            & mi /= model_datetime%minute) stop 'restart date differs from start_datetime'
++        read (21) vor, div, t, ps, tr, phi
++        read (21) stl_lm, stl_am
++        read (21) sst_om, sst_am, sstan_am, sice_om, sice_am, tice_om, tice_am, ssti_om, sstan3
++        close(21)
++        call perturb_state
++        ! the restart holds the SST without the patches of this run
++        call apply_sst_patch
++    end subroutine
++
++    !> Adds a smooth random perturbation (red spectrum exp(-l(l+1)/(L(L+1))), L = perturb_scale,
++    !  no global mean, two vertical patterns blended along sigma) to t, vor and log ps,
++    !  both leapfrog time levels.
++    subroutine perturb_state
++        use prognostics, only: vor, t, ps
++        use spectral, only: grid_to_spec, spec_to_grid, el2
++        use physical_constants, only: rearth
++        real(p) :: w(mx,nx), a, b
++        complex(p) :: pat(mx,nx,2)
++        integer :: k, nseed, i
++        integer, allocatable :: seeds(:)
++        if (perturb_seed == 0) return
++        call random_seed(size=nseed)
++        allocate(seeds(nseed))
++        seeds = (/ (perturb_seed*7919 + 104729*i, i = 1, nseed) /)
++        call random_seed(put=seeds)
++        w = exp(-el2*rearth**2/(perturb_scale*(perturb_scale + 1.0)))
++        ! temperature
++        call patterns(pat)
++        do k = 1, kx
++            a = cos(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            b = sin(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            t(:,:,k,1) = t(:,:,k,1) + perturb_t*(a*pat(:,:,1) + b*pat(:,:,2))
++            t(:,:,k,2) = t(:,:,k,2) + perturb_t*(a*pat(:,:,1) + b*pat(:,:,2))
++        end do
++        ! vorticity
++        call patterns(pat)
++        do k = 1, kx
++            a = cos(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            b = sin(0.5*3.14159265*real(k-1, p)/real(kx-1, p))
++            vor(:,:,k,1) = vor(:,:,k,1) + perturb_vor*(a*pat(:,:,1) + b*pat(:,:,2))
++            vor(:,:,k,2) = vor(:,:,k,2) + perturb_vor*(a*pat(:,:,1) + b*pat(:,:,2))
++        end do
++        ! log surface pressure
++        call patterns(pat)
++        ps(:,:,1) = ps(:,:,1) + perturb_ps*pat(:,:,1)
++        ps(:,:,2) = ps(:,:,2) + perturb_ps*pat(:,:,1)
++        write (*,'(A,I8,3ES10.2)') 'control: perturbed state, seed and rms t vor ps = ', perturb_seed, &
++            & perturb_t, perturb_vor, perturb_ps
++    contains
++        !> Two independent filtered random fields with unit grid rms and zero mean, in spectral space.
++        subroutine patterns(out)
++            complex(p), intent(out) :: out(mx,nx,2)
++            real(p) :: g(ix,il), rms
++            integer :: j
++            do j = 1, 2
++                call random_number(g)
++                out(:,:,j) = grid_to_spec(g - 0.5)*w
++                out(1,1,j) = (0.0, 0.0)
++                g = spec_to_grid(out(:,:,j), 1)
++                rms = sqrt(sum(g**2)/size(g))
++                out(:,:,j) = out(:,:,j)/max(rms, 1.0e-12)
++            end do
++        end subroutine
++    end subroutine
++
++    subroutine check(status)
++        integer, intent(in) :: status
++        if (status /= nf90_noerr) then
++            print *, trim(nf90_strerror(status))
++            stop 'netcdf error in env_control'
++        end if
++    end subroutine
++end module
+diff --git a/source/gfortran.makefile b/source/gfortran.makefile
+index 215d00c..faa5f4f 100644
+--- a/source/gfortran.makefile
++++ b/source/gfortran.makefile
+@@ -31,6 +31,7 @@ FILES= \
+ 	   date.o \
+ 	   diagnostics.o \
+ 	   dynamical_constants.o \
++	   env_control.o \
+ 	   forcing.o \
+ 	   fourier.o \
+ 	   geometry.o \
+@@ -72,12 +73,15 @@ base_target: $(FILES) speedy.o
+ clean:
+ 	rm -f *.o *.mod
+ 
+-speedy.o               : params.o date.o input_output.o shortwave_radiation.o time_stepping.o\
++speedy.o               : params.o date.o input_output.o shortwave_radiation.o time_stepping.o env_control.o\
+                          diagnostics.o
+ auxiliaries.o          : params.o types.o
+ boundaries.o           : physical_constants.o params.o input_output.o spectral.o types.o
+ convection.o           : params.o physical_constants.o types.o
+-coupler.o              : land_model.o sea_model.o
++coupler.o              : land_model.o sea_model.o env_control.o
++env_control.o          : params.o types.o shortwave_radiation.o convection.o surface_fluxes.o\
++                         geometry.o sea_model.o land_model.o auxiliaries.o date.o prognostics.o\
++                         boundaries.o physical_constants.o
+ date.o                 : types.o
+ dynamical_constants.o  : types.o
+ fourier.o              : params.o geometry.o fftpack.o types.o
+@@ -87,7 +91,7 @@ horizontal_diffusion.o : params.o dynamical_constants.o types.o
+ humidity.o             : params.o types.o
+ implicit.o             : params.o dynamical_constants.o physical_constants.o geometry.o\
+                          horizontal_diffusion.o matrix_inversion.o types.o
+-initialization.o       : coupler.o params.o date.o input_output.o time_stepping.o boundaries.o\
++initialization.o       : env_control.o coupler.o params.o date.o input_output.o time_stepping.o boundaries.o\
+                          spectral.o sea_model.o physics.o geopotential.o prognostics.o forcing.o
+ forcing.o              : dynamical_constants.o shortwave_radiation.o params.o \
+                          physical_constants.o boundaries.o date.o land_model.o mod_radcon.o\
+@@ -99,14 +103,14 @@ large_scale_condensation.o : params.o physical_constants.o types.o
+ legendre.o             : params.o physical_constants.o geometry.o types.o
+ matrix_inversion.o     : types.o
+ diagnostics.o          : params.o spectral.o types.o
+-prognostics.o          : params.o dynamical_constants.o physical_constants.o geometry.o\
++prognostics.o          : geopotential.o params.o dynamical_constants.o physical_constants.o geometry.o\
+                          boundaries.o diagnostics.o spectral.o input_output.o types.o
+ input_output.o         : params.o  physical_constants.o date.o spectral.o geometry.o types.o
+ interpolation.o        : params.o date.o types.o
+ physical_constants.o   : params.o types.o
+ mod_radcon.o           : params.o types.o
+ params.o               : types.o
+-physics.o              : params.o coupler.o physical_constants.o boundaries.o land_model.o\
++physics.o              : env_control.o params.o coupler.o physical_constants.o boundaries.o land_model.o\
+                          sea_model.o sppt.o convection.o large_scale_condensation.o surface_fluxes.o\
+                          vertical_diffusion.o shortwave_radiation.o longwave_radiation.o humidity.o\
+                          geometry.o auxiliaries.o types.o
+diff --git a/source/initialization.f90 b/source/initialization.f90
+index 62cd8f6..adec213 100755
+--- a/source/initialization.f90
++++ b/source/initialization.f90
+@@ -24,11 +24,13 @@ contains
+         use boundaries, only: initialize_boundaries
+         use prognostics, only: initialize_prognostics
+         use forcing, only: set_forcing
++        use env_control, only: read_control, read_restart, write_static
+ 
+         call print_speedy_title
+ 
+         ! Initialize model parameters
+         call initialize_params
++        call read_control
+ 
+         ! Initialize date
+         call initialize_date
+@@ -79,6 +81,10 @@ contains
+ 
+         ! Do the initial (2nd-order) time step, initialize the semi-implicit scheme
+         call first_step
++
++        ! Overwrite the state with a restart file, if given
++        call read_restart
++        call write_static
+     end subroutine
+ 
+     !> Prints SPEEDY.f90 banner.
+diff --git a/source/land_model.f90 b/source/land_model.f90
+index 7595d3e..b7989cc 100755
+--- a/source/land_model.f90
++++ b/source/land_model.f90
+@@ -8,7 +8,7 @@ module land_model
+     implicit none
+ 
+     private
+-    public stl_am, snowd_am, soilw_am
++    public stl_am, snowd_am, soilw_am, stl_lm
+     public land_model_init, couple_land_atm
+     public fmask_l
+     public land_coupling_flag
+diff --git a/source/physics.f90 b/source/physics.f90
+index ac8113b..350ceea 100755
+--- a/source/physics.f90
++++ b/source/physics.f90
+@@ -41,6 +41,7 @@ contains
+     !> Compute physical parametrization tendencies for u, v, t, q and add them
+     !  to the dynamical grid-point tendencies
+     subroutine get_physical_tendencies(vor, div, t, q, phi, psl, utend, vtend, ttend, qtend)
++        use env_control, only: save_surface, save_tendencies, heat_scale, moist_scale, mom_scale
+         use auxiliaries, only: precnv, precls, cbmf, tsr, ssrd, ssr, slrd, slr, olr, slru, ustr, &
+             & vstr, shf, evap, hfluxn
+         use physical_constants, only: sigh, grdsig, grdscp, cp
+@@ -76,8 +77,9 @@ contains
+         real(p), dimension(ix,il,kx) :: ug, vg, tg, qg, phig, utend_dyn, vtend_dyn, ttend_dyn, qtend_dyn
+         real(p), dimension(ix,il,kx) :: se, rh, qsat
+         real(p), dimension(ix,il) :: psg, ts, tskin, u0, v0, t0, cloudc, clstr, cltop, prtop
+-        real(p), dimension(ix,il,kx) :: tt_cnv, qt_cnv, tt_lsc, qt_lsc, tt_rsw, tt_rlw, ut_pbl, vt_pbl,&
++        real(p), dimension(ix,il,kx) :: tt_cnv, qt_cnv, tt_lsc, qt_lsc, tt_rlw, ut_pbl, vt_pbl,&
+             & tt_pbl, qt_pbl
++        real(p), dimension(ix,il,kx), save :: tt_rsw = 0.0
+         integer :: iptop(ix,il), icltop(ix,il,2), icnv(ix,il), i, j, k
+         real(p) :: sppt_pattern(ix,il,kx)
+ 
+@@ -134,8 +136,8 @@ contains
+         ! Large-scale condensation
+         call get_large_scale_condensation_tendencies(psg, qg, qsat, iptop, precls, tt_lsc, qt_lsc)
+ 
+-        ttend = ttend + tt_cnv + tt_lsc
+-        qtend = qtend + qt_cnv + qt_lsc
++        ttend = ttend + heat_scale*tt_cnv + heat_scale*tt_lsc
++        qtend = qtend + moist_scale*qt_cnv + moist_scale*qt_lsc
+ 
+         ! =========================================================================
+         ! Radiation (shortwave and longwave) and surface fluxes
+@@ -169,6 +171,8 @@ contains
+         call get_surface_fluxes(psg, ug, vg, tg, qg, rh, phig, phis0, fmask_l, sst_am, &
+                 & ssrd, slrd, ustr, vstr, shf, evap, slru, hfluxn, ts, tskin, u0, v0, t0, .true.)
+ 
++        call save_surface(t0, u0, v0, tskin)
++
+         ! Recompute sea fluxes in case of anomaly coupling
+         if (sea_coupling_flag > 0) then
+            call get_surface_fluxes(psg, ug, vg, tg, qg, rh, phig, phis0, fmask_l, ssti_om, &
+@@ -183,7 +187,7 @@ contains
+             tt_rlw(:,:,k) = tt_rlw(:,:,k)*rps*grdscp(k)
+         end do
+ 
+-        ttend = ttend + tt_rsw + tt_rlw
++        ttend = ttend + heat_scale*tt_rsw + heat_scale*tt_rlw
+ 
+         ! =========================================================================
+         ! Planetary boundary later interactions with lower troposphere
+@@ -199,10 +203,14 @@ contains
+         tt_pbl(:,:,kx) = tt_pbl(:,:,kx)  + shf(:,:,3)*rps*grdscp(kx)
+         qt_pbl(:,:,kx) = qt_pbl(:,:,kx) + evap(:,:,3)*rps*grdsig(kx)
+ 
+-        utend = utend + ut_pbl
+-        vtend = vtend + vt_pbl
+-        ttend = ttend + tt_pbl
+-        qtend = qtend + qt_pbl
++        call save_tendencies(tt_cnv, tt_lsc, tt_rsw, tt_rlw, tt_pbl, qt_cnv, qt_lsc, qt_pbl, ut_pbl, vt_pbl)
++
++        ! Stage 15.4 cuts (the saved tendencies above are the unscaled process tendencies;
++        ! a scale of 1 keeps the original summation order, so default runs stay bit-identical)
++        utend = utend + mom_scale*ut_pbl
++        vtend = vtend + mom_scale*vt_pbl
++        ttend = ttend + heat_scale*tt_pbl
++        qtend = qtend + moist_scale*qt_pbl
+ 
+         ! Add SPPT noise
+         if (sppt_on) then
+diff --git a/source/sea_model.f90 b/source/sea_model.f90
+index 117890c..f9638fa 100755
+--- a/source/sea_model.f90
++++ b/source/sea_model.f90
+@@ -8,6 +8,7 @@ module sea_model
+     public sea_model_init, couple_sea_atm
+     public fmask_s
+     public sstcl_ob, sst_am, sice_am, tice_am, ssti_om
++    public sst_om, sice_om, tice_om, sstan_am, sstan3
+     public sea_coupling_flag, sst_anomaly_coupling_flag
+ 
+     ! Constant parameters and fields in sea/ice model
+@@ -270,7 +271,8 @@ contains
+ 
+         ! SST anomaly
+         if (sst_anomaly_coupling_flag.gt.0) then
+-            if (model_datetime%day.eq.1.and.day.gt.0) call obs_ssta
++            if (model_datetime%day.eq.1.and.model_datetime%hour.eq.0.and. &
++                & model_datetime%minute.eq.0.and.day.gt.0) call obs_ssta
+             call forint (2,sstan3,sstan_ob)
+         end if
+ 
+@@ -374,7 +376,7 @@ contains
+         sstan3(:,:,2) = sstan3(:,:,3)
+ 
+         ! Compute next month given initial SST year
+-        next_month = (start_datetime%year - issty0) * 12 + model_datetime%month
++        next_month = (model_datetime%year - issty0) * 12 + model_datetime%month + 1
+ 
+         ! Read next month SST anomalies
+         sstan3(:,:,3) = load_boundary_file("sea_surface_temperature_anomaly.nc", "ssta", &
+diff --git a/source/shortwave_radiation.f90 b/source/shortwave_radiation.f90
+index 561923c..d20ffb0 100644
+--- a/source/shortwave_radiation.f90
++++ b/source/shortwave_radiation.f90
+@@ -6,12 +6,12 @@ module shortwave_radiation
+     implicit none
+ 
+     private
+-    public ablco2
++    public ablco2, solc, fsol
+     public get_shortwave_rad_fluxes, get_zonal_average_fields, clouds
+     public increase_co2, compute_shortwave
+ 
+     ! Shortwave radiation and cloud constants
+-    real(p), parameter :: solc    = 342.0 !! Solar constant (area averaged) in W/m^2
++    real(p)            :: solc    = 342.0 !! Solar constant (area averaged) in W/m^2
+     real(p), parameter :: rhcl1   = 0.30  !! Relative humidity threshold corresponding to
+                                           !! cloud cover = 0
+     real(p), parameter :: rhcl2   = 1.00  !! Relative humidity correponding to cloud cover = 1
+diff --git a/source/speedy.f90 b/source/speedy.f90
+index 0dc0f6d..2851255 100755
+--- a/source/speedy.f90
++++ b/source/speedy.f90
+@@ -14,6 +14,7 @@ program speedy
+     use diagnostics, only: check_diagnostics
+     use prognostics, only: vor, div, t, ps, tr, phi
+     use forcing, only: set_forcing
++    use env_control, only: accumulate_step, output_surface, output_tendencies, write_restart
+ 
+     implicit none
+ 
+@@ -36,6 +37,7 @@ program speedy
+ 
+         ! Perform one leapfrog time step
+         call step(2, 2, 2*delt)
++        call accumulate_step
+ 
+         ! Check model diagnostics
+         call check_diagnostics(vor(:,:,:,2), div(:,:,:,2), t(:,:,:,2), model_step)
+@@ -47,9 +49,15 @@ program speedy
+         call newdate
+ 
+         ! Output
+-        if (mod(model_step-1, nsteps_out) == 0) call output(model_step-1,  vor, div, t, ps, tr, phi)
++        if (mod(model_step-1, nsteps_out) == 0) then
++            call output(model_step-1,  vor, div, t, ps, tr, phi)
++            call output_surface(model_step-1)
++            call output_tendencies(model_step-1)
++        end if
+ 
+         ! Exchange data with coupler
+         call couple_sea_land(1+model_step/nsteps)
+     end do
++
++    call write_restart
+ end
+diff --git a/source/surface_fluxes.f90 b/source/surface_fluxes.f90
+index 5859e11..af00b2a 100755
+--- a/source/surface_fluxes.f90
++++ b/source/surface_fluxes.f90
+@@ -6,7 +6,7 @@ module surface_fluxes
+     implicit none
+ 
+     private
+-    public get_surface_fluxes, set_orog_land_sfc_drag
++    public get_surface_fluxes, set_orog_land_sfc_drag, cdl, cds
+ 
+     !  Constants for surface fluxes
+     real(p) :: fwind0 = 0.95 !! Ratio of near-sfc wind to lowest-level wind

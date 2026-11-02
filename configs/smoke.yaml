@@ -1,0 +1,42 @@
+# P0 smoke test (research design section 11): synthetic ERA5-like data on a
+# 33 x 64 grid with 3 pressure levels. Checks the full pipeline end to end;
+# it is NOT a GraphCast-aligned performance experiment.
+experiment: smoke_p0
+output_dir: runs/smoke
+
+data:
+  source: synthetic
+  synthetic: {num_days: 40, num_lat: 33, num_lon: 64, levels: [250, 500, 850], seed: 0}
+  train: {start: "2016-01-01", end: "2016-01-28T18:00"}
+  val: {start: "2016-01-30", end: "2016-02-07"}
+  stats_samples: 48
+
+task:
+  name: graphcast_13_no_w        # plan B: no vertical velocity
+  pressure_levels: [250, 500, 850]
+
+shells: null                     # default: surface + pressure-range shells
+
+model:
+  transition: lie_diffusion      # euclidean | lie | lie_residual | lie_diffusion | euclidean_diffusion
+  history: 2                     # latent frames = GraphCast inputs X[t-6h], X[t]
+  mesh: {mesh_splits: 3, latent_splits: 2, patch_splits: 0, break_symmetry: true}
+  gnn: {hidden_dim: 32, vector_dim: 8, latent_scalars: 16, latent_vectors: 4,
+        encoder_layers: 1, latent_layers: 1, decoder_layers: 1}
+  lie: {layers: 1, shell_coupling: chain}   # independent | chain (liquid centipede)
+  diffusion: {layers: 2, cond_dim: 64, num_steps_denoising: 3}
+
+train:
+  batch_size: 2
+  log_every: 10
+  stages:
+    - {name: repr, steps: 30, lr: 2.0e-3, rollout_steps: 1, weights: {rec: 1.0}}
+    - {name: dynamics, steps: 30, lr: 1.0e-3, rollout_steps: 2,
+       weights: {forecast: 1.0, latent: 0.1, rec: 0.5, geo: 1.0e-3, joint: 1.0e-3}}
+    - {name: stochastic, steps: 30, lr: 1.0e-3, rollout_steps: 2, weights: {gen: 1.0}}
+
+eval:
+  lead_steps: 4                  # 6h .. 24h
+  members: 4
+  batch_size: 2
+  init_hours: null               # GraphCast vs HRES uses [6, 18]
